@@ -3,36 +3,22 @@ mod bindings {
         path: "../wit",
         world: "http-api",
         generate_all,
+        async: [
+            "import:wasmcloud:messaging/consumer@0.3.0#request",
+            "import:wasmcloud:messaging/consumer@0.3.0#publish",
+            "export:wasi:http/handler@0.3.0#handle",
+        ],
     });
 }
 
-use anyhow::Context as _;
+use bindings::exports::wasi::http::handler::Guest as Handler;
+use bindings::wasi::http::types::{ErrorCode, Fields, Request, Response};
 use bindings::wasmcloud::messaging::consumer;
 use serde::Deserialize;
-use wstd::http::{Body, Request, Response, StatusCode};
-use wstd::time::Duration;
 
 static UI_HTML: &str = include_str!("../ui.html");
 
-#[wstd::http_server]
-async fn main(req: Request<Body>) -> anyhow::Result<Response<Body>> {
-    match req.uri().path() {
-        "/" => home(req).await,
-        "/task" => create_task(req).await,
-        _ => Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body("Not found\n".into())
-            .map_err(Into::into),
-    }
-}
-
-async fn home(_req: Request<Body>) -> anyhow::Result<Response<Body>> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/html")
-        .body(UI_HTML.into())
-        .map_err(Into::into)
-}
+struct Component;
 
 #[derive(Deserialize)]
 struct TaskRequest {
@@ -40,31 +26,59 @@ struct TaskRequest {
     payload: String,
 }
 
-async fn create_task(mut req: Request<Body>) -> anyhow::Result<Response<Body>> {
-    let task_request: TaskRequest = req
-        .body_mut()
-        .json()
-        .await
-        .context("failed to parse body")?;
+fn respond(status: u16, content_type: Option<&str>, body: Vec<u8>) -> Response {
+    let fields = Fields::new();
+    if let Some(content_type) = content_type {
+        let _ = fields.append("content-type", content_type.as_bytes());
+    }
 
-    // The worker name selects the subject (`tasks.{worker}`), which routes to
-    // the worker subscribed to it (see `.wash/config.yaml`).
+    let (mut body_tx, body_rx) = bindings::wit_stream::new();
+    let (trailers_tx, trailers_rx) = bindings::wit_future::new(|| Ok(None));
+    wit_bindgen::spawn_local(async move {
+        if !body.is_empty() {
+            body_tx.write_all(body).await;
+        }
+        drop(body_tx);
+        let _ = trailers_tx.write(Ok(None)).await;
+    });
+
+    let (response, _result) = Response::new(fields, Some(body_rx), trailers_rx);
+    let _ = response.set_status_code(status);
+    response
+}
+
+async fn create_task(request: Request) -> Result<Response, ErrorCode> {
+    let (body_result_tx, body_result_rx) = bindings::wit_future::new(|| Ok(()));
+    let (body, _trailers) = Request::consume_body(request, body_result_rx);
+    let body = body.collect().await;
+    drop(body_result_tx);
+
+    let task_request: TaskRequest = serde_json::from_slice(&body)
+        .map_err(|error| ErrorCode::InternalError(Some(error.to_string())))?;
     let subject = format!(
         "tasks.{}",
         task_request.worker.unwrap_or_else(|| "leet".to_string())
     );
 
-    let body = task_request.payload.into_bytes();
-    let request_timeout = Duration::from_secs(5).as_millis() as u32;
-
-    match consumer::request(&subject, &body, request_timeout) {
-        Ok(resp) => Response::builder()
-            .status(StatusCode::OK)
-            .body(resp.body.into())
-            .map_err(Into::into),
-        Err(err) => Response::builder()
-            .status(StatusCode::BAD_GATEWAY)
-            .body(err.into())
-            .map_err(Into::into),
+    match consumer::request(subject, task_request.payload.into_bytes(), 5_000).await {
+        Ok(response) => Ok(respond(200, None, response.body)),
+        Err(error) => Ok(respond(502, None, error.into_bytes())),
     }
+}
+
+impl Handler for Component {
+    async fn handle(request: Request) -> Result<Response, ErrorCode> {
+        let path = request.get_path_with_query().unwrap_or_default();
+        match path.split('?').next().unwrap_or_default() {
+            "/" => Ok(respond(200, Some("text/html"), UI_HTML.as_bytes().to_vec())),
+            "/task" => create_task(request).await,
+            _ => Ok(respond(404, None, b"Not found\n".to_vec())),
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+mod export {
+    use super::{Component, bindings};
+    bindings::export!(Component with_types_in bindings);
 }

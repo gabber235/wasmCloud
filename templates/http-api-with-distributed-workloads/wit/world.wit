@@ -1,15 +1,16 @@
 package wasmcloud:template@0.1.0;
 
-// wasi:http/incoming-handler is exported via wstd's #[http_server] proc macro,
-// so it does not appear explicitly in this world definition.
 world http-api {
-  import wasmcloud:messaging/consumer@0.2.0;
+  import wasi:http/types@0.3.0;
+  import wasi:clocks/types@0.3.0;
+  import wasmcloud:messaging/types@0.3.0;
+  import wasmcloud:messaging/consumer@0.3.0;
+  export wasi:http/handler@0.3.0;
 }
 
 world task {
-  import wasmcloud:messaging/consumer@0.2.0;
-  // Per-component config (workload defaults + this worker's overrides),
-  // read via wasi:config/store. See .wash/config.yaml.
+  import wasmcloud:messaging/types@0.3.0;
+  import wasmcloud:messaging/consumer@0.3.0;
   import wasi:config/store@0.2.0-rc.1;
-  export wasmcloud:messaging/handler@0.2.0;
+  export wasmcloud:messaging/handler@0.3.0;
 }

@@ -9,9 +9,6 @@ mod bindings {
 use bindings::wasi::config::store;
 use bindings::wasmcloud::messaging::consumer;
 use bindings::wasmcloud::messaging::types::BrokerMessage;
-#[allow(unused)]
-use wstd::prelude::*;
-
 struct Component;
 
 /// Per-worker behavior, read from `wasi:config/store`. Values come from the
@@ -43,7 +40,7 @@ mod export {
 }
 
 impl bindings::exports::wasmcloud::messaging::handler::Guest for Component {
-    fn handle_message(msg: BrokerMessage) -> Result<(), String> {
+    async fn handle_message(msg: BrokerMessage) -> Result<(), String> {
         let Some(subject) = msg.reply_to else {
             return Err("missing reply_to".to_string());
         };
@@ -58,7 +55,7 @@ impl bindings::exports::wasmcloud::messaging::handler::Guest for Component {
             reply_to: None,
         };
 
-        consumer::publish(&reply)
+        consumer::publish(reply).await
     }
 }
 
