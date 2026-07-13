@@ -11,6 +11,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 wit-bindgen = { workspace = true }
-wstd = { workspace = true }
-anyhow = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }

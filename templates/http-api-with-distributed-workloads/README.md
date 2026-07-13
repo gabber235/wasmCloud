@@ -2,8 +2,10 @@
 
 A wasmCloud template demonstrating an HTTP API with distributed workloads via
 [`wasmcloud:messaging`][messaging]. An HTTP API receives requests and delegates
-processing to background worker components over the messaging interface, with
-each worker subscribed to its own subject.
+processing to background worker components over native-async
+`wasmcloud:messaging@0.3.0`, with each worker subscribed to its own subject.
+The API uses a `wasi:http/handler@0.3.0` async entrypoint, giving its awaited
+messaging request a concurrent component-model task context.
 
 [messaging]: https://github.com/wasmCloud/wasmCloud/tree/main/wit/messaging
 
@@ -93,7 +95,7 @@ The request has a 5-second timeout for the worker to respond.
 ├── Cargo.toml                 # cargo workspace root
 │
 ├── http-api/                  # HTTP front-end component
-│   ├── src/lib.rs             # wstd HTTP server + messaging consumer usage
+│   ├── src/lib.rs             # P3 HTTP handler + async messaging consumer
 │   ├── ui.html                # branded task-submission UI
 │   └── ...
 │
@@ -169,15 +171,19 @@ This template demonstrates both sides of the `wasmcloud:messaging` interface:
 | `wasmcloud:messaging/consumer` | import | Send messages (`request`, `publish`) |
 | `wasmcloud:messaging/handler` | export | Receive messages (`handle-message`) |
 
-All three components import `consumer` — `http-api` to dispatch tasks via
-`request()`, the workers to publish replies via `publish()`. Each worker exports
-`handler` and subscribes to its own subject.
+All three components import `consumer@0.3.0` — `http-api` awaits `request()`,
+while workers await `publish()` for replies. Each worker exports the async
+`handler@0.3.0` and subscribes to its own subject. Native async calls yield
+instead of blocking the component executor.
 
 ## Build Wasm binaries
 
 ```bash
 wash build
 ```
+
+The P3 HTTP WIT entrypoint supplies async task context; builds still target
+`wasm32-wasip2` and require no P1 adapter.
 
 Artifacts:
 - `target/wasm32-wasip2/release/http_api.wasm`
@@ -189,14 +195,18 @@ Artifacts:
 ```wit
 // wit/world.wit
 world http-api {
-  import wasmcloud:messaging/consumer@0.2.0;
-  // wasi:http/incoming-handler is exported via wstd's #[http_server] macro.
+  import wasi:http/types@0.3.0;
+  import wasi:clocks/types@0.3.0;
+  import wasmcloud:messaging/types@0.3.0;
+  import wasmcloud:messaging/consumer@0.3.0;
+  export wasi:http/handler@0.3.0;
 }
 
 world task {
-  import wasmcloud:messaging/consumer@0.2.0;
+  import wasmcloud:messaging/types@0.3.0;
+  import wasmcloud:messaging/consumer@0.3.0;
   import wasi:config/store@0.2.0-rc.1;
-  export wasmcloud:messaging/handler@0.2.0;
+  export wasmcloud:messaging/handler@0.3.0;
 }
 ```
 
@@ -218,7 +228,8 @@ spec:
         - namespace: wasi
           package: http
           interfaces:
-            - incoming-handler
+            - handler
+          version: 0.3.0
           config:
             host: your-domain.example.com    # HTTP Host header used for routing
       components:
