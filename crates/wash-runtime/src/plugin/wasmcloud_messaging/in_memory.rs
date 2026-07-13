@@ -10,6 +10,7 @@ use anyhow::Context;
 use opentelemetry::KeyValue;
 use tokio::sync::{Notify, RwLock, oneshot};
 use tracing::{Instrument, debug, instrument, trace, warn};
+use wasmtime::component::Accessor;
 
 const PLUGIN_MESSAGING_MEMORY_ID: &str = "wasmcloud-messaging-memory";
 const MAX_QUEUE_SIZE: usize = 10000;
@@ -21,12 +22,12 @@ type Inbox = Arc<RwLock<VecDeque<types::BrokerMessage>>>;
 mod bindings {
     crate::wasmtime::component::bindgen!({
         world: "messaging",
-        imports: { default: async | trappable | tracing },
+        imports: { default: store | async | trappable | tracing },
         exports: { default: async | tracing },
     });
 }
 
-use bindings::wasmcloud::messaging::consumer::Host;
+use bindings::wasmcloud::messaging::consumer::{Host, HostWithStore};
 use bindings::wasmcloud::messaging::types;
 
 use crate::plugin::WorkloadTracker;
@@ -37,6 +38,40 @@ use crate::plugin::WorkloadTracker;
 #[derive(Default)]
 struct WorkloadData {
     pending_requests: Arc<RwLock<HashMap<String, oneshot::Sender<types::BrokerMessage>>>>,
+}
+
+type PendingRequests = Arc<RwLock<HashMap<String, oneshot::Sender<types::BrokerMessage>>>>;
+
+struct PendingRequestGuard {
+    key: String,
+    pending_requests: PendingRequests,
+}
+
+impl PendingRequestGuard {
+    fn new(key: String, pending_requests: PendingRequests) -> Self {
+        Self {
+            key,
+            pending_requests,
+        }
+    }
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending_requests) = self.pending_requests.try_write() {
+            pending_requests.remove(&self.key);
+            return;
+        }
+
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let key = self.key.clone();
+        let pending_requests = self.pending_requests.clone();
+        runtime.spawn(async move {
+            pending_requests.write().await.remove(&key);
+        });
+    }
 }
 
 /// Per-component tracking data. Each handler component has its own subject
@@ -162,17 +197,29 @@ impl Default for InMemoryMessaging {
     }
 }
 
-impl<'a> Host for ActiveCtx<'a> {
+fn plugin_and_workload<T>(
+    store: &Accessor<T, SharedCtx>,
+) -> wasmtime::Result<(Arc<InMemoryMessaging>, String)> {
+    store.with(|mut access| {
+        let view = access.get();
+        Ok((
+            view.try_get_plugin::<InMemoryMessaging>(PLUGIN_MESSAGING_MEMORY_ID)?,
+            view.workload_id.to_string(),
+        ))
+    })
+}
+
+impl Host for ActiveCtx<'_> {}
+
+impl<T> HostWithStore<T> for SharedCtx {
     #[instrument(name = "wasmcloud.messaging.request", skip_all, fields(subject = %subject, timeout_ms))]
     async fn request(
-        &mut self,
+        store: &Accessor<T, Self>,
         subject: String,
         body: Vec<u8>,
         timeout_ms: u32,
     ) -> wasmtime::Result<Result<types::BrokerMessage, String>> {
-        let plugin = self.try_get_plugin::<InMemoryMessaging>(PLUGIN_MESSAGING_MEMORY_ID)?;
-
-        let workload_id = self.ctx.workload_id.to_string();
+        let (plugin, workload_id) = plugin_and_workload(store)?;
 
         let pending_requests = {
             let lock = plugin.tracker.read().await;
@@ -193,6 +240,8 @@ impl<'a> Host for ActiveCtx<'a> {
             let mut lock = pending_requests.write().await;
             lock.insert(reply_to.clone(), tx);
         }
+        let _pending_request_guard =
+            PendingRequestGuard::new(reply_to.clone(), pending_requests.clone());
 
         // Create the request message with reply_to set
         let msg = types::BrokerMessage {
@@ -204,7 +253,6 @@ impl<'a> Host for ActiveCtx<'a> {
         debug!(subject = %msg.subject, reply_to = %msg.reply_to.as_deref().unwrap_or("<none>"), "Sending request");
         // Route the request to subscribers of its subject.
         if let Err(e) = route_to_subscribers(&plugin, &workload_id, &msg).await {
-            pending_requests.write().await.remove(&reply_to);
             return Ok(Err(e));
         }
 
@@ -218,10 +266,6 @@ impl<'a> Host for ActiveCtx<'a> {
                 Ok(Err("request channel closed without response".to_string()))
             }
             Err(_) => {
-                // Timeout - clean up the pending request
-                let mut req_lock = pending_requests.write().await;
-                // Clean up the pending request since we're failing
-                req_lock.remove(&reply_to);
                 warn!("request timed out after {timeout_ms}ms");
                 Ok(Err(format!("request timed out after {timeout_ms}ms")))
             }
@@ -229,10 +273,11 @@ impl<'a> Host for ActiveCtx<'a> {
     }
 
     #[instrument(name = "wasmcloud.messaging.publish", skip_all, fields(subject = %msg.subject, reply_to = %msg.reply_to.as_deref().unwrap_or("<none>")))]
-    async fn publish(&mut self, msg: types::BrokerMessage) -> wasmtime::Result<Result<(), String>> {
-        let plugin = self.try_get_plugin::<InMemoryMessaging>(PLUGIN_MESSAGING_MEMORY_ID)?;
-
-        let workload_id = self.ctx.workload_id.to_string();
+    async fn publish(
+        store: &Accessor<T, Self>,
+        msg: types::BrokerMessage,
+    ) -> wasmtime::Result<Result<(), String>> {
+        let (plugin, workload_id) = plugin_and_workload(store)?;
         let pending_requests = {
             let lock = plugin.tracker.read().await;
             match lock.get_workload_data(&workload_id) {
@@ -274,9 +319,9 @@ impl HostPlugin for InMemoryMessaging {
     fn world(&self) -> WitWorld {
         WitWorld {
             imports: HashSet::from([WitInterface::from(
-                "wasmcloud:messaging/consumer,types@0.2.0",
+                "wasmcloud:messaging/consumer,types@0.3.0",
             )]),
-            exports: HashSet::from([WitInterface::from("wasmcloud:messaging/handler@0.2.0")]),
+            exports: HashSet::from([WitInterface::from("wasmcloud:messaging/handler@0.3.0")]),
         }
     }
 
@@ -480,21 +525,28 @@ impl HostPlugin for InMemoryMessaging {
                                 ],
                                 &mut store,
                                 async move |store| {
-                                    proxy
-                                        .wasmcloud_messaging_handler()
-                                        .call_handle_message(store, &msg)
-                                        .instrument(span)
+                                    let call = store
+                                        .run_concurrent(async move |accessor| {
+                                            proxy
+                                                .wasmcloud_messaging_handler()
+                                                .call_handle_message(accessor, msg)
+                                                .instrument(span)
+                                                .await
+                                        })
                                         .await
-                                        .map_err(Into::into)
+                                        .map_err(anyhow::Error::from)?;
+
+                                    call.map_err(anyhow::Error::from)
                                 }
                             ).await;
 
                             match result {
-                                Ok(_) => {
-                                    debug!("Message handled successfully");
+                                Ok(Ok(())) => debug!("message handled successfully"),
+                                Ok(Err(message)) => {
+                                    warn!(error = %message, "handler rejected message");
                                 }
-                                Err(e) => {
-                                    warn!("Error handling message: {e}");
+                                Err(error) => {
+                                    warn!(error = %error, "handler invocation failed");
                                 }
                             };
                         });
@@ -541,7 +593,38 @@ impl HostPlugin for InMemoryMessaging {
 
 #[cfg(test)]
 mod tests {
-    use super::{subject_matches, subscriptions_match};
+    use std::{collections::HashMap, sync::Arc, time::Duration};
+
+    use tokio::sync::{RwLock, oneshot};
+
+    use super::{PendingRequestGuard, subject_matches, subscriptions_match};
+
+    #[tokio::test]
+    async fn dropped_pending_request_is_removed() {
+        let pending_requests = Arc::new(RwLock::new(HashMap::new()));
+        let (sender, _receiver) = oneshot::channel();
+        pending_requests
+            .write()
+            .await
+            .insert("_INBOX.cancelled".to_string(), sender);
+
+        let guard =
+            PendingRequestGuard::new("_INBOX.cancelled".to_string(), pending_requests.clone());
+        let write_lock = pending_requests.write().await;
+        drop(guard);
+        drop(write_lock);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if pending_requests.read().await.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending request cleanup timed out");
+    }
 
     #[test]
     fn exact_and_literal_tokens() {

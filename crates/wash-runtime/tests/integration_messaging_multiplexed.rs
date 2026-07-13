@@ -22,10 +22,18 @@ use testcontainers::{
     runners::AsyncRunner,
 };
 
-use wash_runtime::plugin::wasmcloud_messaging::{
-    BrokerMessage, MultiplexedMessaging, NatsMsgProvider,
+use wash_runtime::{
+    engine::Engine,
+    host::{
+        HostApi, HostBuilder,
+        http::{DevRouter, HttpServer},
+    },
+    plugin::wasmcloud_messaging::{BrokerMessage, MultiplexedMessaging, NatsMsgProvider},
+    types::{Component, LocalResources, Workload, WorkloadStartRequest, WorkloadState},
+    wit::WitInterface,
 };
-use wash_runtime::wit::WitInterface;
+
+const MULTIPLEXED_WASM: &[u8] = include_bytes!("wasm/messaging_multiplexed.wasm");
 
 fn msg_iface(name: &str, url: &str) -> WitInterface {
     WitInterface {
@@ -34,7 +42,7 @@ fn msg_iface(name: &str, url: &str) -> WitInterface {
         interfaces: ["consumer".to_string(), "types".to_string()]
             .into_iter()
             .collect(),
-        version: None,
+        version: Some(semver::Version::new(0, 3, 0)),
         config: HashMap::from([
             ("backend".to_string(), "nats".to_string()),
             ("url".to_string(), url.to_string()),
@@ -177,5 +185,101 @@ async fn multiplexed_messaging_routes_each_import_to_its_cluster() -> Result<()>
     assert_eq!(reply.body, b"pong".to_vec());
     responder_handle.abort();
 
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (NATS); run with `cargo test --include-ignored`"]
+async fn real_guest_routes_named_async_imports() -> Result<()> {
+    let (_nats_a, url_a) = start_nats().await?;
+    let (_nats_b, url_b) = start_nats().await?;
+    let verify_a = async_nats::connect(&url_a).await?;
+    let verify_b = async_nats::connect(&url_b).await?;
+    let mut sub_a = verify_a.subscribe("team.events").await?;
+    let mut sub_b = verify_b.subscribe("team.events").await?;
+    sync(&verify_a).await?;
+    sync(&verify_b).await?;
+
+    let responder = async_nats::connect(&url_a).await?;
+    let mut requests = responder.subscribe("team-a.rpc").await?;
+    sync(&responder).await?;
+    let responder_handle = tokio::spawn(async move {
+        if let Some(msg) = requests.next().await
+            && let Some(reply) = msg.reply
+        {
+            let _ = responder.publish(reply, b"pong".to_vec().into()).await;
+            let _ = responder.flush().await;
+        }
+    });
+
+    let engine = Engine::builder().build()?;
+    let http = HttpServer::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
+    let addr = http.addr();
+    let plugin = MultiplexedMessaging::new().with_provider(Arc::new(NatsMsgProvider));
+    let host = HostBuilder::new()
+        .with_engine(engine)
+        .with_http_handler(Arc::new(http))
+        .with_plugin(Arc::new(plugin))?
+        .build()?
+        .start()
+        .await?;
+    let req = WorkloadStartRequest {
+        workload_id: uuid::Uuid::new_v4().to_string(),
+        workload: Workload {
+            namespace: "test".to_string(),
+            name: "messaging-multiplexed".to_string(),
+            annotations: HashMap::new(),
+            service: None,
+            components: vec![Component {
+                name: "messaging-multiplexed".to_string(),
+                digest: None,
+                bytes: bytes::Bytes::from_static(MULTIPLEXED_WASM),
+                local_resources: LocalResources::default(),
+                pool_size: 1,
+                max_invocations: 100,
+            }],
+            host_interfaces: vec![
+                WitInterface {
+                    namespace: "wasi".to_string(),
+                    package: "http".to_string(),
+                    interfaces: ["handler".to_string()].into_iter().collect(),
+                    version: Some(semver::Version::new(0, 3, 0)),
+                    config: HashMap::from([(
+                        "host".to_string(),
+                        "messaging-multiplexed".to_string(),
+                    )]),
+                    name: None,
+                },
+                msg_iface("team-a", &url_a),
+                msg_iface("team-b", &url_b),
+            ],
+            volumes: vec![],
+        },
+    };
+    let started = host.workload_start(req).await?;
+    assert_eq!(
+        started.workload_status.workload_state,
+        WorkloadState::Running,
+        "{}",
+        started.workload_status.message
+    );
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}/"))
+        .header("HOST", "messaging-multiplexed")
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.bytes().await?;
+    assert!(
+        status.is_success(),
+        "expected success, got {status}: {body:?}"
+    );
+    assert_eq!(body.as_ref(), b"pong");
+    assert_eq!(next_msg(&mut sub_a).await?.payload.as_ref(), b"from-a");
+    assert_eq!(next_msg(&mut sub_b).await?.payload.as_ref(), b"from-b");
+    expect_silent(&mut sub_a).await?;
+    expect_silent(&mut sub_b).await?;
+    responder_handle.await?;
     Ok(())
 }

@@ -6,17 +6,18 @@ use futures::stream::StreamExt;
 use opentelemetry::KeyValue;
 use tokio::sync::RwLock;
 use tracing::{Instrument, debug, instrument, trace, warn};
+use wasmtime::component::Accessor;
 use wasmtime::error::Context as _;
 
 mod bindings {
     crate::wasmtime::component::bindgen!({
         world: "messaging",
-        imports: { default: async | trappable | tracing },
+        imports: { default: store | async | trappable | tracing },
         exports: { default: async | tracing },
     });
 }
 
-use bindings::wasmcloud::messaging::consumer::Host;
+use bindings::wasmcloud::messaging::consumer::{Host, HostWithStore};
 use bindings::wasmcloud::messaging::types;
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
@@ -90,15 +91,25 @@ impl NatsMessaging {
     }
 }
 
-impl<'a> Host for ActiveCtx<'a> {
+fn plugin<T>(store: &Accessor<T, SharedCtx>) -> wasmtime::Result<Arc<NatsMessaging>> {
+    store.with(|mut access| {
+        access
+            .get()
+            .try_get_plugin::<NatsMessaging>(PLUGIN_MESSAGING_ID)
+    })
+}
+
+impl Host for ActiveCtx<'_> {}
+
+impl<T> HostWithStore<T> for SharedCtx {
     #[instrument(name = "wasmcloud.messaging.request", skip_all, fields(subject = %subject, timeout_ms))]
     async fn request(
-        &mut self,
+        store: &Accessor<T, Self>,
         subject: String,
         body: Vec<u8>,
         timeout_ms: u32,
     ) -> wasmtime::Result<Result<types::BrokerMessage, String>> {
-        let plugin = self.try_get_plugin::<NatsMessaging>(PLUGIN_MESSAGING_ID)?;
+        let plugin = plugin(store)?;
 
         let timeout_duration = std::time::Duration::from_millis(timeout_ms as u64);
         let request_future = plugin.client.request(subject, body.into());
@@ -123,8 +134,11 @@ impl<'a> Host for ActiveCtx<'a> {
     }
 
     #[instrument(name = "wasmcloud.messaging.publish", skip_all, fields(subject = %msg.subject, reply_to = %msg.reply_to.as_deref().unwrap_or("<none>")))]
-    async fn publish(&mut self, msg: types::BrokerMessage) -> wasmtime::Result<Result<(), String>> {
-        let plugin = self.try_get_plugin::<NatsMessaging>(PLUGIN_MESSAGING_ID)?;
+    async fn publish(
+        store: &Accessor<T, Self>,
+        msg: types::BrokerMessage,
+    ) -> wasmtime::Result<Result<(), String>> {
+        let plugin = plugin(store)?;
 
         let subject = msg.subject;
 
@@ -157,10 +171,10 @@ impl HostPlugin for NatsMessaging {
     fn world(&self) -> WitWorld {
         WitWorld {
             imports: HashSet::from([WitInterface::from(
-                "wasmcloud:messaging/consumer,types@0.2.0",
+                "wasmcloud:messaging/consumer,types@0.3.0",
             )]),
 
-            exports: HashSet::from([WitInterface::from("wasmcloud:messaging/handler@0.2.0")]),
+            exports: HashSet::from([WitInterface::from("wasmcloud:messaging/handler@0.3.0")]),
         }
     }
 
@@ -449,21 +463,28 @@ impl HostPlugin for NatsMessaging {
                                 ],
                                 &mut store,
                                 async move |store| {
-                                    proxy
-                                        .wasmcloud_messaging_handler()
-                                        .call_handle_message(store, &msg)
-                                        .instrument(span)
+                                    let call = store
+                                        .run_concurrent(async move |accessor| {
+                                            proxy
+                                                .wasmcloud_messaging_handler()
+                                                .call_handle_message(accessor, msg)
+                                                .instrument(span)
+                                                .await
+                                        })
                                         .await
-                                        .map_err(Into::into)
+                                        .map_err(anyhow::Error::from)?;
+
+                                    call.map_err(anyhow::Error::from)
                                 }
                             ).await;
 
                             match result {
-                                Ok(_) => {
-                                    debug!("Message handled successfully");
+                                Ok(Ok(())) => debug!("message handled successfully"),
+                                Ok(Err(message)) => {
+                                    warn!(error = %message, "handler rejected message");
                                 }
-                                Err(e) => {
-                                    warn!("Error handling message: {e}");
+                                Err(error) => {
+                                    warn!(error = %error, "handler invocation failed");
                                 }
                             };
                         });

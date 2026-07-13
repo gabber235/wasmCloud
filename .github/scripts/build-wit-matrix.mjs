@@ -31,7 +31,7 @@ import { basename } from 'node:path';
 const BUILD_DIR = 'wit-build';
 const REQUIRED_NAMESPACE = 'wasmcloud';
 const REGISTRY_PATH = 'ghcr.io/wasmcloud/interfaces';
-// `package wasmcloud:messaging@0.2.0;` — canonicalized by wasm-tools,
+// `package wasmcloud:messaging@0.3.0;` — canonicalized by wasm-tools,
 // so source-file comments / whitespace can't affect this.
 const HEADER_RE = /^package ([^:]+):([^@]+)@([^;]+);/;
 

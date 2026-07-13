@@ -1,0 +1,10 @@
+package wasmcloud:messaging-requester@0.1.0;
+
+world messaging-requester {
+    import wasi:http/types@0.3.0;
+    import wasi:clocks/types@0.3.0;
+    import wasi:random/random@0.3.0;
+    import wasmcloud:messaging/consumer@0.3.0;
+
+    export wasi:http/handler@0.3.0;
+}
