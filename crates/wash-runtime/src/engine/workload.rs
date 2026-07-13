@@ -3726,22 +3726,22 @@ mod tests {
         let exports = vec![
             (
                 Arc::from("task-leet") as Arc<str>,
-                vec!["wasmcloud:messaging/handler@0.2.0".to_string()],
+                vec!["wasmcloud:messaging/handler@0.3.0".to_string()],
             ),
             (
                 Arc::from("task-reverse") as Arc<str>,
-                vec!["wasmcloud:messaging/handler@0.2.0".to_string()],
+                vec!["wasmcloud:messaging/handler@0.3.0".to_string()],
             ),
         ];
         let (map, ambiguous) = build_export_map(&exports);
-        assert!(!map.contains_key("wasmcloud:messaging/handler@0.2.0"));
-        assert!(ambiguous.contains("wasmcloud:messaging/handler@0.2.0"));
+        assert!(!map.contains_key("wasmcloud:messaging/handler@0.3.0"));
+        assert!(ambiguous.contains("wasmcloud:messaging/handler@0.3.0"));
     }
 
     #[test]
     fn build_export_map_three_exporters_stay_ambiguous() {
         // A third exporter must not accidentally re-register the interface.
-        let iface = "wasmcloud:messaging/handler@0.2.0".to_string();
+        let iface = "wasmcloud:messaging/handler@0.3.0".to_string();
         let exports = vec![
             (Arc::from("a") as Arc<str>, vec![iface.clone()]),
             (Arc::from("b") as Arc<str>, vec![iface.clone()]),

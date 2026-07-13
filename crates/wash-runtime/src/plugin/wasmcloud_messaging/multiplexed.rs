@@ -17,6 +17,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use tracing::instrument;
+use wasmtime::component::Accessor;
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::WorkloadItem;
@@ -33,10 +34,10 @@ pub use nats::{NatsMsgBackend, NatsMsgProvider};
 mod bindings {
     crate::wasmtime::component::bindgen!({
         world: "messaging",
-        imports: { default: async | trappable | tracing },
+        imports: { default: store | async | trappable | tracing },
         exports: { default: async | tracing },
         named_imports: {
-            "wasmcloud:messaging/consumer": super::MsgId,
+            "wasmcloud:messaging/consumer@0.3.0": super::MsgId,
         },
     });
 }
@@ -62,10 +63,12 @@ pub trait MsgBackend: Send + Sync {
     async fn publish(&self, msg: BrokerMessage) -> Result<(), String>;
 }
 
-impl<'a> bindings::named_imports::wasmcloud::messaging::consumer::Host for ActiveCtx<'a> {
+impl bindings::named_imports::wasmcloud::messaging::consumer::Host for ActiveCtx<'_> {}
+
+impl<T> bindings::named_imports::wasmcloud::messaging::consumer::HostWithStore<T> for SharedCtx {
     #[instrument(name = "wasmcloud.messaging.request", skip_all, fields(subject = %subject, timeout_ms = timeout_ms))]
     async fn request(
-        &mut self,
+        _store: &Accessor<T, Self>,
         id: MsgId,
         subject: String,
         body: Vec<u8>,
@@ -76,7 +79,7 @@ impl<'a> bindings::named_imports::wasmcloud::messaging::consumer::Host for Activ
 
     #[instrument(name = "wasmcloud.messaging.publish", skip_all, fields(subject = %msg.subject))]
     async fn publish(
-        &mut self,
+        _store: &Accessor<T, Self>,
         id: MsgId,
         msg: BrokerMessage,
     ) -> wasmtime::Result<Result<(), String>> {
@@ -138,7 +141,7 @@ impl HostPlugin for MultiplexedMessaging {
     fn world(&self) -> WitWorld {
         WitWorld {
             imports: HashSet::from([WitInterface::from(
-                "wasmcloud:messaging/consumer,types@0.2.0",
+                "wasmcloud:messaging/consumer,types@0.3.0",
             )]),
             ..Default::default()
         }

@@ -153,7 +153,7 @@ fn messaging_handler_workload(
                 namespace: "wasmcloud".to_string(),
                 package: "messaging".to_string(),
                 interfaces: ["handler".to_string()].into_iter().collect(),
-                version: Some(semver::Version::new(0, 2, 0)),
+                version: Some(semver::Version::new(0, 3, 0)),
                 config: HashMap::from([(
                     "subscriptions".to_string(),
                     SUBSCRIPTION_SUBJECT.to_string(),

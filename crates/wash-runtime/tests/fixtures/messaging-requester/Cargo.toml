@@ -1,5 +1,5 @@
 [package]
-name = "messaging-handler"
+name = "messaging-requester"
 edition = "2024"
 version = "0.1.0"
 

@@ -117,6 +117,8 @@ const P3_FIXTURES: &[&str] = &[
     "blobstore-default-p3",
     "keyvalue-implements-p3",
     "keyvalue-default-p3",
+    "messaging-requester",
+    "messaging-multiplexed",
     "postgres-stream-p3",
     "svc-counter",
     "svc-http-proxy",

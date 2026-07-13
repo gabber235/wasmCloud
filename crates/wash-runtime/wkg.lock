@@ -75,15 +75,6 @@ version = "0.1.0"
 digest = "sha256:f1d194f6a56e57a2ce23cf2858de79f6c953f9159c9c0456e17935a0c5fcda73"
 
 [[packages]]
-name = "wasmcloud:messaging"
-registry = "wasmcloud.com"
-
-[[packages.versions]]
-requirement = "=0.2.0"
-version = "0.2.0"
-digest = "sha256:bd2182f0a304b9a54a6b363f2f655422c8c0f00a03073c0195f1614a92dfdc7b"
-
-[[packages]]
 name = "wasmcloud:postgres"
 registry = "wasmcloud.com"
 

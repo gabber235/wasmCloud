@@ -14,7 +14,7 @@ mod bindings {
 struct Component;
 
 impl bindings::exports::wasmcloud::messaging::handler::Guest for Component {
-    fn handle_message(_msg: BrokerMessage) -> Result<(), String> {
+    async fn handle_message(_msg: BrokerMessage) -> Result<(), String> {
         logging::log(logging::Level::Info, "messaging", "hello, world!");
         Ok(())
     }

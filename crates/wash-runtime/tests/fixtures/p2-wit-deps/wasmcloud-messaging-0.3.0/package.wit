@@ -1,4 +1,4 @@
-package wasmcloud:messaging@0.2.0;
+package wasmcloud:messaging@0.3.0;
 
 /// Types common to message broker interactions
 interface types {
@@ -14,16 +14,15 @@ interface handler {
   use types.{broker-message};
 
   /// Callback handled to invoke a function when a message is received from a subscription
-  handle-message: func(msg: broker-message) -> result<_, string>;
+  handle-message: async func(msg: broker-message) -> result<_, string>;
 }
 
 interface consumer {
   use types.{broker-message};
 
   /// Perform a request operation on a subject
-  request: func(subject: string, body: list<u8>, timeout-ms: u32) -> result<broker-message, string>;
+  request: async func(subject: string, body: list<u8>, timeout-ms: u32) -> result<broker-message, string>;
 
   /// Publish a message to a subject without awaiting a response
-  publish: func(msg: broker-message) -> result<_, string>;
+  publish: async func(msg: broker-message) -> result<_, string>;
 }
-

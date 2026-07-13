@@ -597,11 +597,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "messaging-multiplexed"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "messaging-requester"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
 name = "msg-counter"
 version = "0.0.0"
 dependencies = [
  "wit-bindgen 0.60.0",
 ]
+
+[[package]]
+name = "metal"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c43f73953f8cbe511f021b58f18c3ce1c3d1ae13fe953293e13345bf83217f25"
 
 [[package]]
 name = "ntapi"
