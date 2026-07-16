@@ -7,9 +7,23 @@ pub use in_memory::InMemoryMessaging;
 #[cfg(feature = "wasm_component_model_implements")]
 pub use multiplexed::{
     BrokerMessage, InMemoryMsgBackend, InMemoryMsgProvider, MsgBackend, MsgId, MsgProvider,
-    MultiplexedMessaging, NatsMsgBackend, NatsMsgProvider,
+    MultiplexedMessaging, NatsMsgBackend, NatsMsgProvider, TraceContext,
 };
 pub use nats::NatsMessaging;
+
+pub(crate) fn record_messaging_error(span: &tracing::Span, slug: &'static str, message: &str) {
+    let message: String = message
+        .chars()
+        .filter(|character| !character.is_control() || *character == ' ')
+        .take(1024)
+        .collect();
+    span.record("otel.status_code", "ERROR");
+    span.record("error", true);
+    span.record("error.type", slug);
+    span.record("exception.message", message);
+    span.record("exception.slug", slug);
+    span.record("messaging.operation.outcome", "failure");
+}
 
 /// Returns `true` if the world exports the `wasmcloud:messaging/handler`
 /// interface at any version. Matches via [`WitInterface::contains`] rather
@@ -35,9 +49,74 @@ pub(crate) fn parse_subscriptions(raw: Option<&str>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{exports_messaging_handler, parse_subscriptions};
+    use super::{exports_messaging_handler, parse_subscriptions, record_messaging_error};
     use crate::wit::{WitInterface, WitWorld};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::{Layer, Registry};
+
+    #[derive(Default)]
+    struct FieldVisitor(HashMap<String, String>);
+
+    impl Visit for FieldVisitor {
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.0.insert(field.name().into(), value.to_string());
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().into(), value.into());
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().into(), format!("{value:?}"));
+        }
+    }
+
+    struct RecordLayer(Arc<Mutex<HashMap<String, String>>>);
+
+    impl<S: tracing::Subscriber> Layer<S> for RecordLayer {
+        fn on_record(
+            &self,
+            _id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: Context<'_, S>,
+        ) {
+            let mut visitor = FieldVisitor::default();
+            values.record(&mut visitor);
+            self.0.lock().unwrap().extend(visitor.0);
+        }
+    }
+
+    #[test]
+    fn timeout_records_error_status_and_semantic_slug() {
+        let fields = Arc::new(Mutex::new(HashMap::new()));
+        let subscriber = Registry::default().with(RecordLayer(fields.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "request",
+                otel.status_code = tracing::field::Empty,
+                error = tracing::field::Empty,
+                error.type = tracing::field::Empty,
+                exception.message = tracing::field::Empty,
+                exception.slug = tracing::field::Empty,
+                messaging.operation.outcome = tracing::field::Empty,
+            );
+            record_messaging_error(
+                &span,
+                "messaging-request-timeout",
+                "request timed out after 10ms",
+            );
+        });
+
+        let fields = fields.lock().unwrap();
+        assert_eq!(fields["otel.status_code"], "ERROR");
+        assert_eq!(fields["error"], "true");
+        assert_eq!(fields["error.type"], "messaging-request-timeout");
+        assert_eq!(fields["exception.slug"], "messaging-request-timeout");
+        assert_eq!(fields["messaging.operation.outcome"], "failure");
+    }
 
     #[test]
     fn recognizes_exported_handler_at_any_version() {

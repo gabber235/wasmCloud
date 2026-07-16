@@ -39,6 +39,7 @@ impl MsgBackend for InMemoryMsgBackend {
         subject: String,
         body: Vec<u8>,
         _timeout_ms: u32,
+        _parent_context: Option<super::TraceContext>,
     ) -> Result<BrokerMessage, String> {
         // Loopback: echo the request back as its own reply.
         self.published.write().await.push(BrokerMessage {
@@ -53,7 +54,11 @@ impl MsgBackend for InMemoryMsgBackend {
         })
     }
 
-    async fn publish(&self, msg: BrokerMessage) -> Result<(), String> {
+    async fn publish(
+        &self,
+        msg: BrokerMessage,
+        _parent_context: Option<super::TraceContext>,
+    ) -> Result<(), String> {
         self.published.write().await.push(msg);
         Ok(())
     }
@@ -90,8 +95,8 @@ mod tests {
     #[tokio::test]
     async fn in_memory_backend_records_publishes() {
         let b = InMemoryMsgBackend::new();
-        b.publish(brokered("a", b"1")).await.unwrap();
-        b.publish(brokered("b", b"2")).await.unwrap();
+        b.publish(brokered("a", b"1"), None).await.unwrap();
+        b.publish(brokered("b", b"2"), None).await.unwrap();
         let published = b.published().await;
         assert_eq!(published.len(), 2);
         assert_eq!(published[0].subject, "a");

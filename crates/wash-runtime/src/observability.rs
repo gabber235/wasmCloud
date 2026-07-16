@@ -2,7 +2,61 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 
 use anyhow::Context;
 
-use opentelemetry::{KeyValue, trace::TracerProvider};
+use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
+use opentelemetry::trace::{TraceContextExt, TracerProvider};
+use opentelemetry::{Context as OtelContext, KeyValue};
+use opentelemetry_sdk::propagation::TraceContextPropagator;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PropagationContext {
+    pub traceparent: String,
+    pub tracestate: Option<String>,
+}
+
+#[derive(Debug)]
+struct PropagationCarrier(PropagationContext);
+
+impl Extractor for PropagationCarrier {
+    fn get(&self, key: &str) -> Option<&str> {
+        match key {
+            "traceparent" => Some(&self.0.traceparent),
+            "tracestate" => self.0.tracestate.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        vec!["traceparent", "tracestate"]
+    }
+}
+
+impl Injector for PropagationCarrier {
+    fn set(&mut self, key: &str, value: String) {
+        match key {
+            "traceparent" => self.0.traceparent = value,
+            "tracestate" => self.0.tracestate = Some(value),
+            _ => {}
+        }
+    }
+}
+
+pub fn context_from_propagation(value: &PropagationContext) -> anyhow::Result<OtelContext> {
+    let context = TraceContextPropagator::new().extract(&PropagationCarrier(value.clone()));
+    anyhow::ensure!(
+        context.span().span_context().is_valid(),
+        "invalid W3C trace context"
+    );
+    Ok(context)
+}
+
+pub fn inject_context(context: &OtelContext) -> PropagationContext {
+    let mut carrier = PropagationCarrier(PropagationContext {
+        traceparent: String::new(),
+        tracestate: None,
+    });
+    TraceContextPropagator::new().inject_context(context, &mut carrier);
+    carrier.0
+}
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_sdk::Resource;
 use opentelemetry_semantic_conventions::resource;
@@ -42,13 +96,24 @@ pub fn initialize_observability(
         .with_ansi(ansi_colors)
         .with_filter(fmt_filter);
 
+    opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+
     let otel_enabled = std::env::vars().any(|(key, _)| key.starts_with("OTEL_"));
     if !otel_enabled {
-        Registry::default().with(fmt_layer).init();
+        let tracer_provider = opentelemetry_sdk::trace::TracerProviderBuilder::default().build();
+        let otel_tracer_layer = tracing_opentelemetry::layer()
+            .with_tracer(tracer_provider.tracer("runtime"))
+            .with_filter(EnvFilter::new(log_level.as_str()));
+        Registry::default()
+            .with(fmt_layer)
+            .with(otel_tracer_layer)
+            .init();
 
-        // No-op shutdown function
-        let shutdown_fn = || {};
-        return Ok(Box::new(shutdown_fn));
+        return Ok(Box::new(move || {
+            if let Err(error) = tracer_provider.shutdown() {
+                eprintln!("failed to shutdown tracer provider: {error}");
+            }
+        }));
     }
 
     let resource = Resource::builder()
@@ -116,16 +181,6 @@ pub fn initialize_observability(
         .build();
 
     opentelemetry::global::set_meter_provider(meter_provider.clone());
-
-    // Register the W3C Trace Context propagator so the incoming-request path
-    // (`opentelemetry::global::get_text_map_propagator` in `host::http`) can
-    // parse the `traceparent` header into the OpenTelemetry context.
-    // Without this every workload roots its own trace instead of continuing the
-    // caller's. Registering it here is what lets a trace roll up across
-    // workload/host boundaries.
-    opentelemetry::global::set_text_map_propagator(
-        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
-    );
 
     // Return a shutdown function to flush providers on exit
     let shutdown_fn = move || {

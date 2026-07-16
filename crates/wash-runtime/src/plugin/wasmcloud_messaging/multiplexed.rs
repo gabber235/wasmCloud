@@ -37,12 +37,13 @@ mod bindings {
         imports: { default: store | async | trappable | tracing },
         exports: { default: async | tracing },
         named_imports: {
-            "wasmcloud:messaging/consumer@0.3.0": super::MsgId,
+            "wasmcloud:messaging/consumer@0.4.0": super::MsgId,
         },
     });
 }
 
 pub use bindings::wasmcloud::messaging::types::BrokerMessage;
+pub use bindings::wasmcloud::observability::propagation::TraceContext;
 
 /// The "implements id" threaded through every consumer host method: the backend
 /// a given named import is bound to. `Arc` so it is cheaply `Clone`d into each
@@ -59,8 +60,13 @@ pub trait MsgBackend: Send + Sync {
         subject: String,
         body: Vec<u8>,
         timeout_ms: u32,
+        parent_context: Option<TraceContext>,
     ) -> Result<BrokerMessage, String>;
-    async fn publish(&self, msg: BrokerMessage) -> Result<(), String>;
+    async fn publish(
+        &self,
+        msg: BrokerMessage,
+        parent_context: Option<TraceContext>,
+    ) -> Result<(), String>;
 }
 
 impl bindings::named_imports::wasmcloud::messaging::consumer::Host for ActiveCtx<'_> {}
@@ -73,8 +79,9 @@ impl<T> bindings::named_imports::wasmcloud::messaging::consumer::HostWithStore<T
         subject: String,
         body: Vec<u8>,
         timeout_ms: u32,
+        parent_context: Option<TraceContext>,
     ) -> wasmtime::Result<Result<BrokerMessage, String>> {
-        Ok(id.request(subject, body, timeout_ms).await)
+        Ok(id.request(subject, body, timeout_ms, parent_context).await)
     }
 
     #[instrument(name = "wasmcloud.messaging.publish", skip_all, fields(subject = %msg.subject))]
@@ -82,8 +89,9 @@ impl<T> bindings::named_imports::wasmcloud::messaging::consumer::HostWithStore<T
         _store: &Accessor<T, Self>,
         id: MsgId,
         msg: BrokerMessage,
+        parent_context: Option<TraceContext>,
     ) -> wasmtime::Result<Result<(), String>> {
-        Ok(id.publish(msg).await)
+        Ok(id.publish(msg, parent_context).await)
     }
 }
 
@@ -141,7 +149,7 @@ impl HostPlugin for MultiplexedMessaging {
     fn world(&self) -> WitWorld {
         WitWorld {
             imports: HashSet::from([WitInterface::from(
-                "wasmcloud:messaging/consumer,types@0.3.0",
+                "wasmcloud:messaging/consumer,types@0.4.0",
             )]),
             ..Default::default()
         }
@@ -221,7 +229,7 @@ mod tests {
         let a = registry.get("cluster-a").expect("a routed").clone();
         let b = registry.get("cluster-b").expect("b routed").clone();
 
-        a.publish(brokered("tasks", b"hi")).await.unwrap();
+        a.publish(brokered("tasks", b"hi"), None).await.unwrap();
 
         // The registry hands back the same backend for a given name, and the two
         // names resolve to independent instances (the in-memory provider never

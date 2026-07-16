@@ -6,9 +6,9 @@ use futures::stream::StreamExt;
 use opentelemetry::KeyValue;
 use tokio::sync::RwLock;
 use tracing::{Instrument, debug, instrument, trace, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use wasmtime::component::Accessor;
 use wasmtime::error::Context as _;
-
 mod bindings {
     crate::wasmtime::component::bindgen!({
         world: "messaging",
@@ -22,7 +22,7 @@ use bindings::wasmcloud::messaging::types;
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::{ResolvedWorkload, WorkloadItem};
-use crate::observability::Meters;
+use crate::observability::{Meters, PropagationContext, context_from_propagation, inject_context};
 use crate::plugin::{HostPlugin, WitInterfaces, WorkloadTracker};
 use crate::wit::{WitInterface, WitWorld};
 
@@ -31,6 +31,95 @@ const CONSUMER_GROUP_CONFIG: &str = "consumer_group";
 const BROADCAST_CONSUMER_GROUP: &str = "broadcast";
 const DEFAULT_CONSUMER_GROUP_PREFIX: &str = "wasmcloud";
 const MAX_DEFAULT_CONSUMER_GROUP_LEN: usize = 128;
+
+fn propagation_context(
+    value: bindings::wasmcloud::observability::propagation::TraceContext,
+) -> PropagationContext {
+    PropagationContext {
+        traceparent: value.traceparent,
+        tracestate: value.tracestate,
+    }
+}
+
+fn producer_span(
+    operation: &'static str,
+    destination: &str,
+    payload_size: usize,
+    parent: Option<bindings::wasmcloud::observability::propagation::TraceContext>,
+) -> tracing::Span {
+    producer_span_with_parent(
+        operation,
+        destination,
+        payload_size,
+        parent.map(propagation_context),
+    )
+}
+
+pub(super) fn producer_span_with_parent(
+    operation: &'static str,
+    destination: &str,
+    payload_size: usize,
+    parent: Option<PropagationContext>,
+) -> tracing::Span {
+    let span = tracing::info_span!(
+        "wasmcloud.messaging.produce",
+        otel.kind = "producer",
+        messaging.system = "nats",
+        messaging.operation = operation,
+        messaging.destination.name = destination,
+        messaging.message.body.size = payload_size,
+        messaging.operation.outcome = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+        otel.propagation.error = tracing::field::Empty,
+        exception.slug = tracing::field::Empty,
+        exception.message = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+        error = tracing::field::Empty,
+    );
+    if let Some(parent) = parent {
+        match context_from_propagation(&parent) {
+            Ok(parent) => {
+                let _ = span.set_parent(parent);
+            }
+            Err(_) => {
+                span.record("otel.propagation.error", true);
+                span.record("exception.slug", "messaging-invalid-trace-context");
+            }
+        }
+    }
+    span
+}
+
+pub(super) fn headers_for_span(span: &tracing::Span) -> async_nats::HeaderMap {
+    let propagation = inject_context(&span.context());
+    let mut headers = async_nats::HeaderMap::new();
+    if !propagation.traceparent.is_empty() {
+        headers.insert("traceparent", propagation.traceparent);
+    }
+    if let Some(tracestate) = propagation.tracestate {
+        headers.insert("tracestate", tracestate);
+    }
+    headers
+}
+
+fn message_parent(msg: &async_nats::Message) -> (Option<opentelemetry::Context>, bool) {
+    let Some(headers) = &msg.headers else {
+        return (None, false);
+    };
+    let Some(traceparent) = headers.get("traceparent") else {
+        return (None, headers.get("tracestate").is_some());
+    };
+    let propagation = PropagationContext {
+        traceparent: traceparent.as_str().to_string(),
+        tracestate: headers
+            .get("tracestate")
+            .map(|value| value.as_str().to_string()),
+    };
+    match context_from_propagation(&propagation) {
+        Ok(context) => (Some(context), false),
+        Err(_) => (None, true),
+    }
+}
 
 pub struct ComponentData {
     subscriptions: Vec<String>,
@@ -102,61 +191,85 @@ fn plugin<T>(store: &Accessor<T, SharedCtx>) -> wasmtime::Result<Arc<NatsMessagi
 impl Host for ActiveCtx<'_> {}
 
 impl<T> HostWithStore<T> for SharedCtx {
-    #[instrument(name = "wasmcloud.messaging.request", skip_all, fields(subject = %subject, timeout_ms))]
     async fn request(
         store: &Accessor<T, Self>,
         subject: String,
         body: Vec<u8>,
         timeout_ms: u32,
+        parent_context: Option<bindings::wasmcloud::observability::propagation::TraceContext>,
     ) -> wasmtime::Result<Result<types::BrokerMessage, String>> {
         let plugin = plugin(store)?;
-
-        let timeout_duration = std::time::Duration::from_millis(timeout_ms as u64);
-        let request_future = plugin.client.request(subject, body.into());
-
-        let resp = match tokio::time::timeout(timeout_duration, request_future).await {
-            Ok(Ok(msg)) => msg,
-            Ok(Err(e)) => {
-                warn!("failed to send request: {e}");
-                return Ok(Err(format!("failed to send request: {e}")));
+        let span = producer_span("request", &subject, body.len(), parent_context);
+        let headers = headers_for_span(&span);
+        let result = async {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms as u64),
+                plugin
+                    .client
+                    .request_with_headers(subject, headers, body.into()),
+            )
+            .await
+            {
+                Ok(Ok(msg)) => Ok(types::BrokerMessage {
+                    subject: msg.subject.to_string(),
+                    reply_to: msg.reply.as_ref().map(ToString::to_string),
+                    body: msg.payload.into(),
+                }),
+                Ok(Err(error)) => Err(format!("failed to send request: {error}")),
+                Err(_) => Err(format!("request timed out after {timeout_ms}ms")),
             }
-            Err(_) => {
-                warn!("request timed out after {timeout_ms}ms");
-                return Ok(Err(format!("request timed out after {timeout_ms}ms")));
+        }
+        .instrument(span.clone())
+        .await;
+        match &result {
+            Ok(_) => {
+                span.record("messaging.operation.outcome", "success");
             }
-        };
-        let reply_to = resp.reply.as_ref().map(|r| r.to_string());
-        Ok(Ok(types::BrokerMessage {
-            subject: resp.subject.to_string(),
-            reply_to,
-            body: resp.payload.into(),
-        }))
+            Err(error) => {
+                let slug = if error.starts_with("request timed out") {
+                    "messaging-request-timeout"
+                } else {
+                    "messaging-broker-failed"
+                };
+                super::record_messaging_error(&span, slug, error);
+            }
+        }
+        Ok(result)
     }
 
-    #[instrument(name = "wasmcloud.messaging.publish", skip_all, fields(subject = %msg.subject, reply_to = %msg.reply_to.as_deref().unwrap_or("<none>")))]
     async fn publish(
         store: &Accessor<T, Self>,
         msg: types::BrokerMessage,
+        parent_context: Option<bindings::wasmcloud::observability::propagation::TraceContext>,
     ) -> wasmtime::Result<Result<(), String>> {
         let plugin = plugin(store)?;
-
-        let subject = msg.subject;
-
-        if let Some(reply_to) = msg.reply_to {
-            plugin
-                .client
-                .publish_with_reply(subject, reply_to, msg.body.into())
-                .await
-                .context("failed to send message")?;
-        } else {
-            plugin
-                .client
-                .publish(subject, msg.body.into())
-                .await
-                .context("failed to send message")?;
+        let span = producer_span("publish", &msg.subject, msg.body.len(), parent_context);
+        let headers = headers_for_span(&span);
+        let result = async {
+            if let Some(reply_to) = msg.reply_to {
+                plugin
+                    .client
+                    .publish_with_reply_and_headers(msg.subject, reply_to, headers, msg.body.into())
+                    .await
+            } else {
+                plugin
+                    .client
+                    .publish_with_headers(msg.subject, headers, msg.body.into())
+                    .await
+            }
+            .map_err(|error| format!("failed to send message: {error}"))
         }
-
-        Ok(Ok(()))
+        .instrument(span.clone())
+        .await;
+        match &result {
+            Ok(_) => {
+                span.record("messaging.operation.outcome", "success");
+            }
+            Err(error) => {
+                super::record_messaging_error(&span, "messaging-broker-failed", error);
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -171,10 +284,10 @@ impl HostPlugin for NatsMessaging {
     fn world(&self) -> WitWorld {
         WitWorld {
             imports: HashSet::from([WitInterface::from(
-                "wasmcloud:messaging/consumer,types@0.3.0",
+                "wasmcloud:messaging/consumer,types@0.4.0",
             )]),
 
-            exports: HashSet::from([WitInterface::from("wasmcloud:messaging/handler@0.3.0")]),
+            exports: HashSet::from([WitInterface::from("wasmcloud:messaging/handler@0.4.0")]),
         }
     }
 
@@ -385,9 +498,32 @@ impl HostPlugin for NatsMessaging {
                             }
                         };
 
+                        let (message_parent, invalid_parent) = message_parent(&msg);
                         let subject = msg.subject.to_string();
                         let reply_to = msg.reply.as_ref().map(|r| r.to_string());
+                        let payload_size = msg.payload.len();
                         let body: Vec<u8> = msg.payload.into();
+                        let span = tracing::info_span!(
+                            "wasmcloud.messaging.consume",
+                            otel.kind = "consumer",
+                            messaging.system = "nats",
+                            messaging.operation = "process",
+                            messaging.destination.name = %subject,
+                            messaging.message.body.size = payload_size,
+                            messaging.operation.outcome = tracing::field::Empty,
+                            error.type = tracing::field::Empty,
+                            otel.propagation.error = invalid_parent,
+                            exception.slug = tracing::field::Empty,
+                            exception.message = tracing::field::Empty,
+                            otel.status_code = tracing::field::Empty,
+                            error = tracing::field::Empty,
+                        );
+                        if let Some(parent) = message_parent {
+                            let _ = span.set_parent(parent);
+                        }
+                        if invalid_parent {
+                            span.record("exception.slug", "messaging-invalid-trace-context");
+                        }
 
                         // If this workload runs a long-lived trigger service for
                         // messaging, deliver to it (preserving its in-memory
@@ -402,16 +538,22 @@ impl HostPlugin for NatsMessaging {
                                 body,
                                 reply_to,
                             };
-                            match workload
+                            let result = workload
                                 .http_handler()
                                 .deliver_trigger_service_message(workload.id(), broker)
-                                .await
-                            {
-                                Ok(Ok(())) => debug!(%subject, "trigger service handled message"),
+                                .instrument(span.clone())
+                                .await;
+                            match result {
+                                Ok(Ok(())) => {
+                                    span.record("messaging.operation.outcome", "success");
+                                    debug!(%subject, "trigger service handled message");
+                                }
                                 Ok(Err(e)) => {
+                                    super::record_messaging_error(&span, "messaging-handler-rejected", &e);
                                     warn!(%subject, error = %e, "trigger service message handler returned error")
                                 }
                                 Err(e) => {
+                                    super::record_messaging_error(&span, "messaging-consumer-delivery-failed", &e.to_string());
                                     warn!(%subject, error = %e, "failed to deliver message to trigger service")
                                 }
                             }
@@ -427,18 +569,20 @@ impl HostPlugin for NatsMessaging {
                             continue;
                         };
                         let mut store = match workload.new_store(&component_id).await {
-                            Err(e) => {
-                                warn!("failed to create store for component {component_id}: {e}");
+                            Err(error) => {
+                                super::record_messaging_error(&span, "messaging-consumer-setup-failed", &error.to_string());
+                                warn!("failed to create store for component {component_id}: {error}");
                                 continue;
                             }
-                            Ok(s) => s,
+                            Ok(store) => store,
                         };
                         let proxy = match pre.instantiate_async(&mut store).await {
-                            Err(e) => {
-                                warn!("failed to instantiate component {component_id}: {e}");
+                            Err(error) => {
+                                super::record_messaging_error(&span, "messaging-consumer-setup-failed", &error.to_string());
+                                warn!("failed to instantiate component {component_id}: {error}");
                                 continue;
                             }
-                            Ok(p) => p,
+                            Ok(proxy) => proxy,
                         };
                         let msg = types::BrokerMessage {
                             subject,
@@ -446,16 +590,10 @@ impl HostPlugin for NatsMessaging {
                             body,
                         };
 
-                        let span = tracing::span!(
-                            tracing::Level::INFO,
-                            "incoming_wasmcloud_message",
-                            subject = %msg.subject,
-                            reply_to = %msg.reply_to.as_deref().unwrap_or("<none>"),
-                        );
-
                         let fuel_meter = fuel_meter.clone();
 
                         tokio::spawn(async move {
+                            let handler_span = span.clone();
                             let result = fuel_meter.observe(
                                 &[
                                     KeyValue::new("plugin", PLUGIN_MESSAGING_ID),
@@ -468,7 +606,7 @@ impl HostPlugin for NatsMessaging {
                                             proxy
                                                 .wasmcloud_messaging_handler()
                                                 .call_handle_message(accessor, msg)
-                                                .instrument(span)
+                                                .instrument(handler_span)
                                                 .await
                                         })
                                         .await
@@ -479,11 +617,13 @@ impl HostPlugin for NatsMessaging {
                             ).await;
 
                             match result {
-                                Ok(Ok(())) => debug!("message handled successfully"),
+                                Ok(Ok(())) => { span.record("messaging.operation.outcome", "success"); debug!("message handled successfully"); },
                                 Ok(Err(message)) => {
+                                    super::record_messaging_error(&span, "messaging-handler-rejected", &message);
                                     warn!(error = %message, "handler rejected message");
                                 }
                                 Err(error) => {
+                                    super::record_messaging_error(&span, "messaging-handler-rejected", &error.to_string());
                                     warn!(error = %error, "handler invocation failed");
                                 }
                             };
@@ -633,12 +773,139 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::plugin::WorkloadTrackerItem;
+    use opentelemetry::trace::{
+        SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
+    };
     use std::time::Duration;
+
+    fn remote_context(trace_id: &str, span_id: &str) -> opentelemetry::Context {
+        opentelemetry::Context::new().with_remote_span_context(SpanContext::new(
+            TraceId::from_hex(trace_id).unwrap(),
+            SpanId::from_hex(span_id).unwrap(),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        ))
+    }
+
+    fn message_with_context(context: &opentelemetry::Context) -> async_nats::Message {
+        let propagation = inject_context(context);
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert("traceparent", propagation.traceparent);
+        if let Some(tracestate) = propagation.tracestate {
+            headers.insert("tracestate", tracestate);
+        }
+        nats_message(Some(headers))
+    }
+
+    #[test]
+    fn producer_header_consumer_and_reply_producer_keep_exact_graph_ids() {
+        const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+        const REQUEST_PRODUCER_ID: &str = "00f067aa0ba902b7";
+        const CONSUMER_ID: &str = "1111111111111111";
+        const REPLY_PRODUCER_ID: &str = "2222222222222222";
+
+        let request_producer = remote_context(TRACE_ID, REQUEST_PRODUCER_ID);
+        let (consumer_parent, invalid) = message_parent(&message_with_context(&request_producer));
+        assert!(!invalid);
+        let consumer_parent = consumer_parent.unwrap();
+        assert_eq!(
+            consumer_parent.span().span_context().trace_id().to_string(),
+            TRACE_ID
+        );
+        assert_eq!(
+            consumer_parent.span().span_context().span_id().to_string(),
+            REQUEST_PRODUCER_ID
+        );
+
+        let consumer = remote_context(TRACE_ID, CONSUMER_ID);
+        let (reply_parent, invalid) = message_parent(&message_with_context(&consumer));
+        assert!(!invalid);
+        let reply_parent = reply_parent.unwrap();
+        assert_eq!(
+            reply_parent.span().span_context().trace_id().to_string(),
+            TRACE_ID
+        );
+        assert_eq!(
+            reply_parent.span().span_context().span_id().to_string(),
+            CONSUMER_ID
+        );
+
+        let reply_producer = remote_context(TRACE_ID, REPLY_PRODUCER_ID);
+        let (reply_consumer_parent, invalid) =
+            message_parent(&message_with_context(&reply_producer));
+        assert!(!invalid);
+        let reply_consumer_parent = reply_consumer_parent.unwrap();
+        assert_eq!(
+            reply_consumer_parent
+                .span()
+                .span_context()
+                .trace_id()
+                .to_string(),
+            TRACE_ID
+        );
+        assert_eq!(
+            reply_consumer_parent
+                .span()
+                .span_context()
+                .span_id()
+                .to_string(),
+            REPLY_PRODUCER_ID
+        );
+    }
 
     /// Tracker round-trip: stored subscriptions and a stored cancellation
     /// token are retrievable by the same component_id; cleanup cancels the
     /// stored token. Does not exercise the NATS client at all — the goal is
     /// to lock in the contract `on_workload_resolved` depends on.
+    fn nats_message(headers: Option<async_nats::HeaderMap>) -> async_nats::Message {
+        async_nats::Message {
+            subject: "subject".into(),
+            reply: None,
+            payload: bytes::Bytes::new(),
+            headers,
+            status: None,
+            description: None,
+            length: 0,
+        }
+    }
+
+    #[test]
+    fn extracts_unsampled_nats_parent() {
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert(
+            "traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00",
+        );
+        headers.insert("tracestate", "vendor=value");
+        let (parent, invalid) = message_parent(&nats_message(Some(headers)));
+        let parent = parent.expect("valid unsampled context");
+        let span = opentelemetry::trace::TraceContextExt::span(&parent);
+        let span_context = span.span_context();
+        assert!(span_context.is_valid());
+        assert!(!span_context.is_sampled());
+        assert!(!invalid);
+    }
+
+    #[test]
+    fn accepts_missing_and_rejects_malformed_nats_parent() {
+        let (parent, invalid) = message_parent(&nats_message(None));
+        assert!(parent.is_none());
+        assert!(!invalid);
+
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert("traceparent", "malformed");
+        let (parent, invalid) = message_parent(&nats_message(Some(headers)));
+        assert!(parent.is_none());
+        assert!(invalid);
+
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert("tracestate", "vendor=value");
+        let (parent, invalid) = message_parent(&nats_message(Some(headers)));
+        assert!(parent.is_none());
+        assert!(invalid);
+    }
+
     #[tokio::test]
     async fn tracker_round_trip_with_component_data() {
         use crate::plugin::WorkloadTracker;
