@@ -6,24 +6,25 @@ mod convert;
 
 pub use convert::otel_span_context_to_wit;
 use convert::{
-    convert_span_kind, convert_status, convert_wasi_log_record, extract_counter_values,
-    extract_gauge_values, extract_span_attributes, extract_span_events, extract_span_links,
-    summarize_resource_metrics, summarize_span_data, wasi_span_parent_context,
-    wit_span_context_to_otel,
+    convert_wasi_log_record, extract_counter_values, extract_gauge_values,
+    summarize_resource_metrics, summarize_span_data, try_into_sdk_span_data,
 };
 
 use anyhow::bail;
-use opentelemetry::logs::{Logger, LoggerProvider};
-use opentelemetry::trace::Span as _;
-
 use opentelemetry::KeyValue;
-use opentelemetry::trace::SpanContext;
+use opentelemetry::logs::{Logger, LoggerProvider};
+use opentelemetry::trace::TraceContextExt;
 use opentelemetry_sdk::logs::{BatchLogProcessor, SdkLoggerProvider};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
-use opentelemetry_sdk::trace::SdkTracerProvider;
+use opentelemetry_sdk::trace::SpanData;
+use opentelemetry_sdk::trace::{BatchSpanProcessor, SpanProcessor};
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter};
 
@@ -32,6 +33,8 @@ use crate::plugin::{HostPlugin, WitInterfaces, WorkloadItem, WorkloadTracker};
 use crate::wit::{WitInterface, WitWorld};
 
 const WASI_OTEL_ID: &str = "wasi-otel";
+const SPAN_SUBMISSION_QUEUE_CAPACITY: usize = 2_048;
+const QUEUE_FULL_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(30);
 
 /// OTel gRPC default per the OTLP/gRPC spec. Matches what
 /// `opentelemetry_otlp::SpanExporter::builder().with_tonic()` falls back to
@@ -78,13 +81,116 @@ impl Default for WasiOtelConfig {
     }
 }
 
-/// Per-component context tracking
-#[allow(dead_code)]
+enum SpanSubmission {
+    Span(SpanData),
+    Shutdown,
+}
+
 struct ComponentContext {
-    component_id: String,
-    workload_name: String,
-    /// Current span context for this component's execution
-    current_span_context: Option<SpanContext>,
+    component_id: Arc<str>,
+    submissions: mpsc::SyncSender<SpanSubmission>,
+    dropped_spans: Arc<AtomicU64>,
+    last_queue_full_diagnostic: AtomicU64,
+    worker: JoinHandle<()>,
+}
+
+impl ComponentContext {
+    fn submit(&self, span: SpanData) {
+        if self
+            .submissions
+            .try_send(SpanSubmission::Span(span))
+            .is_ok()
+        {
+            return;
+        }
+
+        self.record_queue_rejection();
+    }
+
+    fn record_queue_rejection(&self) {
+        let dropped = self.dropped_spans.fetch_add(1, Ordering::Relaxed) + 1;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let previous = self.last_queue_full_diagnostic.load(Ordering::Relaxed);
+        if now.saturating_sub(previous) < QUEUE_FULL_DIAGNOSTIC_INTERVAL.as_secs()
+            || self
+                .last_queue_full_diagnostic
+                .compare_exchange(previous, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        tracing::warn!(
+            component_id = %self.component_id,
+            wasi_otel_export_queue_dropped_spans = dropped,
+            exception.slug = "wasi-otel-export-queue-full",
+            "wasi-otel-export-queue-full"
+        );
+    }
+
+    fn shutdown(self) {
+        let _ = self.submissions.send(SpanSubmission::Shutdown);
+        if self.worker.join().is_err() {
+            tracing::warn!(
+                exception.slug = "wasi-otel-component-shutdown-failed",
+                "Failed to join component span exporter"
+            );
+        }
+    }
+}
+
+fn component_context(
+    component_id: Arc<str>,
+    span_processor: BatchSpanProcessor,
+    capacity: usize,
+) -> ComponentContext {
+    let (submissions, receiver) = mpsc::sync_channel(capacity);
+    let dropped_spans = Arc::new(AtomicU64::new(0));
+    let worker = std::thread::spawn(move || {
+        while let Ok(SpanSubmission::Span(span)) = receiver.recv() {
+            span_processor.on_end(span);
+        }
+        if let Err(error) = span_processor.force_flush() {
+            tracing::warn!(error = %error, exception.slug = "wasi-otel-component-flush-failed", "Failed to flush component spans");
+        }
+        if let Err(error) = span_processor.shutdown() {
+            tracing::warn!(error = %error, exception.slug = "wasi-otel-component-shutdown-failed", "Failed to shut down component span processor");
+        }
+    });
+    ComponentContext {
+        component_id,
+        submissions,
+        dropped_spans,
+        last_queue_full_diagnostic: AtomicU64::new(0),
+        worker,
+    }
+}
+
+fn component_resource(
+    config: &WasiOtelConfig,
+    component_id: &str,
+    workload_id: &str,
+    workload_name: &str,
+    workload_namespace: &str,
+) -> opentelemetry_sdk::Resource {
+    let configured_name = config.service_name.trim();
+    let service_name = if configured_name.is_empty() || configured_name == WASI_OTEL_ID {
+        workload_name
+    } else {
+        configured_name
+    };
+
+    opentelemetry_sdk::Resource::builder_empty()
+        .with_attributes([
+            KeyValue::new("service.name", service_name.to_string()),
+            KeyValue::new("service.namespace", workload_namespace.to_string()),
+            KeyValue::new("service.instance.id", workload_id.to_string()),
+            KeyValue::new("wasmcloud.workload.name", workload_name.to_string()),
+            KeyValue::new("wasmcloud.component.id", component_id.to_string()),
+        ])
+        .build()
 }
 
 /// WASI OpenTelemetry Plugin
@@ -93,7 +199,6 @@ pub struct WasiOtel {
     tracker: Arc<RwLock<WorkloadTracker<(), ComponentContext>>>,
     /// Meter provider for metrics export
     meter_provider: Arc<RwLock<Option<SdkMeterProvider>>>,
-    tracer_provider: Arc<RwLock<Option<SdkTracerProvider>>>,
     logger_provider: Arc<RwLock<Option<SdkLoggerProvider>>>,
 }
 
@@ -103,7 +208,6 @@ impl Default for WasiOtel {
             config: WasiOtelConfig::default(),
             tracker: Arc::new(RwLock::new(WorkloadTracker::default())),
             meter_provider: Arc::new(RwLock::new(None)),
-            tracer_provider: Arc::new(RwLock::new(None)),
             logger_provider: Arc::new(RwLock::new(None)),
         }
     }
@@ -142,12 +246,6 @@ impl HostPlugin for WasiOtel {
         // TODO: thread per-target endpoints (host vs workload) through `WasiOtelConfig`
         // so platform telemetry and application telemetry can ship to different backends.
 
-        // set up the grpc span exporter
-        let span_exporter = SpanExporter::builder()
-            .with_tonic()
-            .build()
-            .map_err(|e| anyhow::anyhow!("Failed to create span exporter: {e}"))?;
-
         // set up the grpc log exporter
         let log_exporter = LogExporter::builder()
             .with_tonic()
@@ -163,21 +261,7 @@ impl HostPlugin for WasiOtel {
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to create metric exporter: {e}"))?;
 
-        // processor
         let processor = BatchLogProcessor::builder(log_exporter).build();
-
-        // Initialize all providers
-        let tracer_provider = opentelemetry_sdk::trace::TracerProviderBuilder::default()
-            .with_batch_exporter(span_exporter)
-            .with_resource(
-                opentelemetry_sdk::Resource::builder_empty()
-                    .with_attributes([KeyValue::new(
-                        "service.name",
-                        self.config.service_name.clone(),
-                    )])
-                    .build(),
-            )
-            .build();
         let logger_provider = opentelemetry_sdk::logs::LoggerProviderBuilder::default()
             .with_log_processor(processor)
             .with_resource(
@@ -201,7 +285,6 @@ impl HostPlugin for WasiOtel {
             )
             .build();
 
-        *self.tracer_provider.write().await = Some(tracer_provider);
         *self.logger_provider.write().await = Some(logger_provider);
         *self.meter_provider.write().await = Some(meter_provider);
 
@@ -232,21 +315,34 @@ impl HostPlugin for WasiOtel {
             extract_active_ctx,
         )?;
 
-        // Register component context for tracking
-        let ctx = ComponentContext {
-            component_id: component_handle.id().to_string(),
-            workload_name: component_handle.workload_name().to_string(),
-            current_span_context: None,
-        };
-
         let WorkloadItem::Component(component_handle) = component_handle else {
             bail!("Service can not be tracked");
         };
 
+        let span_exporter = SpanExporter::builder()
+            .with_tonic()
+            .build()
+            .map_err(|error| {
+                anyhow::anyhow!("Failed to create component span exporter: {error}")
+            })?;
+        let mut span_processor = BatchSpanProcessor::builder(span_exporter).build();
+        span_processor.set_resource(&component_resource(
+            &self.config,
+            component_handle.id(),
+            component_handle.workload_id(),
+            component_handle.workload_name(),
+            component_handle.workload_namespace(),
+        ));
+
+        let context = component_context(
+            Arc::from(component_handle.id()),
+            span_processor,
+            SPAN_SUBMISSION_QUEUE_CAPACITY,
+        );
         self.tracker
             .write()
             .await
-            .add_component(component_handle, ctx);
+            .add_component(component_handle, context);
 
         tracing::info!(
             component_id = component_handle.id(),
@@ -263,7 +359,13 @@ impl HostPlugin for WasiOtel {
         self.tracker
             .write()
             .await
-            .remove_workload(workload_id)
+            .remove_workload_with_cleanup(
+                workload_id,
+                |_| async {},
+                |ctx| async move {
+                    ctx.shutdown();
+                },
+            )
             .await;
         tracing::info!(workload_id, "WASI OTel unbound from workload");
         Ok(())
@@ -272,11 +374,22 @@ impl HostPlugin for WasiOtel {
     async fn stop(&self) -> anyhow::Result<()> {
         tracing::info!("Stopping WASI OTel plugin");
 
-        // Flush and shutdown all providers
-        if let Some(provider) = self.tracer_provider.write().await.take() {
-            let _ = provider.force_flush();
-            let _ = provider.shutdown();
+        let mut tracker = self.tracker.write().await;
+        let workload_ids = tracker.workloads.keys().cloned().collect::<Vec<_>>();
+        for workload_id in workload_ids {
+            tracker
+                .remove_workload_with_cleanup(
+                    &workload_id,
+                    |_| async {},
+                    |ctx| async move {
+                        ctx.shutdown();
+                    },
+                )
+                .await;
         }
+        drop(tracker);
+
+        // Flush and shutdown all providers
         if let Some(provider) = self.logger_provider.write().await.take() {
             let _ = provider.shutdown();
         }
@@ -399,6 +512,8 @@ impl<'a> bindings::wasi::otel::tracing::Host for ActiveCtx<'a> {
         &mut self,
         span_data: bindings::wasi::otel::tracing::SpanData,
     ) -> wasmtime::Result<()> {
+        let outer_context = tracing::Span::current().context();
+        let outer_span_context = outer_context.span().span_context().clone();
         if let Ok(plugin) = self.ctx.try_get_plugin::<WasiOtel>(WASI_OTEL_ID) {
             let summary = summarize_span_data(&span_data);
             tracing::info!(
@@ -414,55 +529,21 @@ impl<'a> bindings::wasi::otel::tracing::Host for ActiveCtx<'a> {
                 "Processing WASI span end"
             );
 
-            let provider_guard = plugin.tracer_provider.read().await;
-            if let Some(ref provider) = *provider_guard {
-                use opentelemetry::trace::{SpanBuilder, Tracer, TracerProvider};
-
-                let tracer = provider.tracer(plugin.config.service_name.clone());
-
-                // Build a span with the data from WASI, preserving the guest's own
-                // trace/span IDs and parent linkage instead of letting the SDK mint
-                // fresh IDs and fall back to whatever host span is ambient.
-                let wasi_span_context = wit_span_context_to_otel(&span_data.span_context);
-                let parent_cx = wasi_span_parent_context(&span_data);
-                let span_kind = convert_span_kind(span_data.span_kind);
-                let status = convert_status(&span_data.status);
-                let attributes = extract_span_attributes(&span_data);
-                let events = extract_span_events(&span_data);
-                let links = extract_span_links(&span_data);
-
-                // Create a span builder with the WASI span data
-                let mut builder = SpanBuilder::from_name(span_data.name.clone())
-                    .with_trace_id(wasi_span_context.trace_id())
-                    .with_span_id(wasi_span_context.span_id())
-                    .with_kind(span_kind)
-                    .with_attributes(attributes)
-                    .with_links(links);
-
-                // Set start time
-                builder = builder.with_start_time(summary.start_time);
-
-                // Start the span, parented according to the guest's own nesting
-                let mut span = tracer.build_with_context(builder, &parent_cx);
-
-                // Add events to the span
-                for (event_name, _event_time, event_attrs) in events {
-                    span.add_event(event_name, event_attrs);
+            let tracker = plugin.tracker.read().await;
+            if let Some(component) = tracker.get_component_data(&self.component_id.to_string()) {
+                match try_into_sdk_span_data(span_data, Some(&outer_span_context)) {
+                    Ok(span) => component.submit(span),
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        exception.slug = "wasi-otel-invalid-span-data",
+                        "Dropping invalid WASI span data"
+                    ),
                 }
-
-                // Set status
-                span.set_status(status);
-
-                // End the span with the end time from WASI
-                span.end_with_timestamp(summary.end_time);
-
-                tracing::info!(
-                    name = %summary.name,
-                    trace_id = %summary.trace_id,
-                    "Successfully exported WASI span"
-                );
             } else {
-                tracing::warn!("Tracer provider not initialized");
+                tracing::warn!(
+                    exception.slug = "wasi-otel-component-not-bound",
+                    "Dropping span for unbound component"
+                );
             }
         }
         Ok(())
@@ -495,3 +576,220 @@ impl<'a> bindings::wasi::otel::tracing::Host for ActiveCtx<'a> {
 }
 
 impl<'a> bindings::wasi::otel::types::Host for ActiveCtx<'a> {}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+    use std::sync::Mutex;
+
+    use opentelemetry::InstrumentationScope;
+    use opentelemetry::trace::{
+        SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceId, TraceState,
+    };
+    use opentelemetry_sdk::error::OTelSdkResult;
+    use opentelemetry_sdk::trace::{SpanEvents, SpanExporter, SpanLinks};
+
+    use super::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct TestExporter {
+        spans: Arc<Mutex<Vec<SpanData>>>,
+        resource: Arc<Mutex<Option<opentelemetry_sdk::Resource>>>,
+    }
+
+    impl SpanExporter for TestExporter {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.spans.lock().unwrap().extend(batch);
+            Ok(())
+        }
+
+        fn set_resource(&mut self, resource: &opentelemetry_sdk::Resource) {
+            *self.resource.lock().unwrap() = Some(resource.clone());
+        }
+    }
+
+    fn span(trace_id: u128, span_id: u64, parent_id: u64, name: &'static str) -> SpanData {
+        SpanData {
+            span_context: SpanContext::new(
+                TraceId::from(trace_id),
+                SpanId::from(span_id),
+                TraceFlags::SAMPLED,
+                false,
+                TraceState::default(),
+            ),
+            parent_span_id: SpanId::from(parent_id),
+            parent_span_is_remote: false,
+            span_kind: SpanKind::Internal,
+            name: Cow::Borrowed(name),
+            start_time: SystemTime::now(),
+            end_time: SystemTime::now(),
+            attributes: vec![],
+            dropped_attributes_count: 0,
+            events: SpanEvents::default(),
+            links: SpanLinks::default(),
+            status: Status::Ok,
+            instrumentation_scope: InstrumentationScope::builder("guest-test").build(),
+        }
+    }
+
+    fn test_component(
+        component_id: &str,
+        resource: opentelemetry_sdk::Resource,
+    ) -> (ComponentContext, TestExporter) {
+        let exporter = TestExporter::default();
+        let mut processor = BatchSpanProcessor::builder(exporter.clone()).build();
+        processor.set_resource(&resource);
+        (
+            component_context(Arc::from(component_id), processor, 16),
+            exporter,
+        )
+    }
+
+    fn attribute(resource: &opentelemetry_sdk::Resource, key: &str) -> String {
+        resource
+            .iter()
+            .find(|(candidate, _)| candidate.as_str() == key)
+            .map(|(_, value)| value.to_string())
+            .unwrap()
+    }
+
+    #[test]
+    fn component_resources_have_distinct_namespace_and_name() {
+        let config = WasiOtelConfig::default();
+        let first = component_resource(&config, "random-a", "instance-a", "orders", "shop");
+        let second = component_resource(&config, "random-b", "instance-b", "billing", "finance");
+
+        assert_eq!(attribute(&first, "service.name"), "orders");
+        assert_eq!(attribute(&first, "service.namespace"), "shop");
+        assert_eq!(attribute(&second, "service.name"), "billing");
+        assert_eq!(attribute(&second, "service.namespace"), "finance");
+        assert_ne!(
+            attribute(&first, "service.name"),
+            attribute(&first, "service.namespace")
+        );
+    }
+
+    #[test]
+    fn component_resource_name_is_stable_across_random_instance_ids() {
+        let config = WasiOtelConfig::builder().service_name("   ").build();
+        let first = component_resource(&config, "random-a", "instance-a", "orders", "shop");
+        let second = component_resource(&config, "random-b", "instance-b", "orders", "shop");
+
+        assert_eq!(attribute(&first, "service.name"), "orders");
+        assert_eq!(attribute(&second, "service.name"), "orders");
+        assert_ne!(
+            attribute(&first, "service.instance.id"),
+            attribute(&second, "service.instance.id")
+        );
+    }
+
+    #[test]
+    fn validated_configured_service_name_takes_precedence() {
+        let config = WasiOtelConfig::builder().service_name("orders").build();
+        let resource = component_resource(&config, "component-id", "instance", "rollout", "shop");
+
+        assert_eq!(attribute(&resource, "service.name"), "orders");
+    }
+
+    #[test]
+    fn guest_spans_keep_exact_ids_resources_and_component_isolation_on_unbind() {
+        let config = WasiOtelConfig::default();
+        let first_resource =
+            component_resource(&config, "component-a", "instance-a", "orders", "shop");
+        let second_resource =
+            component_resource(&config, "component-b", "instance-b", "billing", "finance");
+        let (first, first_exporter) = test_component("component-a", first_resource);
+        let (second, second_exporter) = test_component("component-b", second_resource);
+
+        first.submit(span(0x1111, 0xaaaa, 0x1010, "first"));
+        second.submit(span(0x2222, 0xbbbb, 0x2020, "second"));
+        first.shutdown();
+        second.shutdown();
+
+        let first_spans = first_exporter.spans.lock().unwrap();
+        let second_spans = second_exporter.spans.lock().unwrap();
+        assert_eq!(first_spans.len(), 1);
+        assert_eq!(second_spans.len(), 1);
+        assert_eq!(
+            first_spans[0].span_context.trace_id(),
+            TraceId::from(0x1111)
+        );
+        assert_eq!(first_spans[0].span_context.span_id(), SpanId::from(0xaaaa));
+        assert_eq!(first_spans[0].parent_span_id, SpanId::from(0x1010));
+        assert_eq!(
+            second_spans[0].span_context.trace_id(),
+            TraceId::from(0x2222)
+        );
+        assert_eq!(second_spans[0].name, "second");
+        drop(first_spans);
+        drop(second_spans);
+
+        let first_resource = first_exporter.resource.lock().unwrap();
+        let second_resource = second_exporter.resource.lock().unwrap();
+        assert_eq!(
+            attribute(first_resource.as_ref().unwrap(), "service.name"),
+            "orders"
+        );
+        assert_eq!(
+            attribute(first_resource.as_ref().unwrap(), "service.namespace"),
+            "shop"
+        );
+        assert_eq!(
+            attribute(first_resource.as_ref().unwrap(), "wasmcloud.component.id"),
+            "component-a"
+        );
+        assert_eq!(
+            attribute(second_resource.as_ref().unwrap(), "service.name"),
+            "billing"
+        );
+        assert_eq!(
+            attribute(second_resource.as_ref().unwrap(), "wasmcloud.component.id"),
+            "component-b"
+        );
+    }
+
+    #[test]
+    fn plugin_stop_style_shutdown_drains_every_component() {
+        let resource = opentelemetry_sdk::Resource::builder_empty().build();
+        let components = (0..2)
+            .map(|id| {
+                let (component, exporter) =
+                    test_component(&format!("component-{id}"), resource.clone());
+                component.submit(span(id + 1, id as u64 + 1, 9, "queued"));
+                (component, exporter)
+            })
+            .collect::<Vec<_>>();
+        let exporters = components
+            .iter()
+            .map(|(_, exporter)| exporter.clone())
+            .collect::<Vec<_>>();
+
+        for (component, _) in components {
+            component.shutdown();
+        }
+
+        assert!(
+            exporters
+                .iter()
+                .all(|exporter| exporter.spans.lock().unwrap().len() == 1)
+        );
+    }
+
+    #[test]
+    fn queue_rejections_are_counted_per_component() {
+        let (submissions, _receiver) = mpsc::sync_channel(1);
+        let dropped_spans = Arc::new(AtomicU64::new(0));
+        let context = ComponentContext {
+            component_id: Arc::from("component-a"),
+            submissions,
+            dropped_spans: dropped_spans.clone(),
+            last_queue_full_diagnostic: AtomicU64::new(0),
+            worker: std::thread::spawn(|| {}),
+        };
+
+        context.record_queue_rejection();
+        context.record_queue_rejection();
+        assert_eq!(dropped_spans.load(Ordering::Relaxed), 2);
+        context.shutdown();
+    }
+}

@@ -39,7 +39,7 @@ use hyper_util::{
     rt::{TokioExecutor, TokioTimer},
     server::conn::auto,
 };
-use opentelemetry::{KeyValue, context::FutureExt};
+use opentelemetry::{KeyValue, context::FutureExt, trace::TraceContextExt};
 use opentelemetry_semantic_conventions::attribute::{
     HTTP_REQUEST_METHOD, HTTP_RESPONSE_BODY_SIZE, HTTP_RESPONSE_STATUS_CODE, OTEL_STATUS_CODE,
     RPC_GRPC_STATUS_CODE, SERVER_ADDRESS, SERVER_PORT, URL_FULL, URL_PATH,
@@ -47,6 +47,7 @@ use opentelemetry_semantic_conventions::attribute::{
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tracing::{Instrument, debug, error, info, instrument, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use wasmtime::Store;
 use wasmtime::component::InstancePre;
 use wasmtime_wasi_http::{
@@ -605,21 +606,10 @@ impl OutgoingHandler for DefaultOutgoingHandler {
         config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
     ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
     {
-        // Spawn the send ourselves so the request can be wrapped in a client
-        // span and the response status recorded once it arrives.
-        let span = outbound_client_span(request.method(), request.uri());
         let client = self.clients().client(workload_id);
-        let handle = wasmtime_wasi::runtime::spawn(
-            async move {
-                let result = client.send_request_p2(request, config).await;
-                match &result {
-                    Ok(incoming) => record_outbound_status(incoming.resp.status()),
-                    Err(_) => record_outbound_error(),
-                }
-                Ok(result)
-            }
-            .instrument(span),
-        );
+        let handle = wasmtime_wasi::runtime::spawn(async move {
+            Ok(client.send_request_p2(request, config).await)
+        });
         Ok(HostFutureIncomingResponse::pending(handle))
     }
     fn send_request_p3(
@@ -1346,45 +1336,51 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
     fn outgoing_request(
         &self,
         workload_id: &str,
-        request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        mut request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
         config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
         allowed_hosts: &[AllowedHost],
     ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
     {
+        let span = outbound_client_span(&mut request);
         if let Err(e) =
             self.router
                 .allow_outgoing_request(workload_id, &request, &config, allowed_hosts)
         {
             warn!(workload_id = %workload_id, err = %e, "outgoing request denied by allowed_hosts policy");
+            record_outbound_error_on(&span);
             return Err(wasmtime_wasi_http::p2::HttpError::trap(
                 wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::HttpRequestDenied,
             ));
         }
-        // The gRPC path is selected by the guest via a
-        // `content-type: application/grpc` header, and needs HTTP/2 rather
-        // than the HTTP/1.1 the ordinary egress pool speaks. A pooling
-        // handler serves it from its own per-workload HTTP/2 pool, under the
-        // same quota; otherwise the runtime opens a connection
-        // per request.
-        if is_grpc_request(&request) {
-            return Ok(match self.outgoing_handler.grpc_transport(workload_id) {
+        let future = if is_grpc_request(&request) {
+            match self.outgoing_handler.grpc_transport(workload_id) {
                 Some(client) => send_pooled_grpc_request(client, request, config),
                 None => send_grpc_request(request, config, self.grpc_tls()),
-            });
-        }
-        self.outgoing_handler
-            .send_request(workload_id, request, config)
+            }
+        } else {
+            match self
+                .outgoing_handler
+                .send_request(workload_id, request, config)
+            {
+                Ok(future) => future,
+                Err(error) => {
+                    record_outbound_error_on(&span);
+                    return Err(error);
+                }
+            }
+        };
+        Ok(instrument_outgoing_response(future, span))
     }
 
     fn outgoing_request_p3(
         &self,
         workload_id: &str,
-        request: hyper::Request<crate::host::http_p3::P3Body>,
+        mut request: hyper::Request<crate::host::http_p3::P3Body>,
         options: Option<wasmtime_wasi_http::p3::RequestOptions>,
         fut: crate::host::http_p3::P3RequestErrorFuture,
         allowed_hosts: &[AllowedHost],
     ) -> crate::host::http_p3::P3SendFuture {
-        let span = outbound_client_span(request.method(), request.uri());
+        let span = outbound_client_span(&mut request);
         let inner: crate::host::http_p3::P3SendFuture = if let Err(e) = self
             .router
             .allow_outgoing_request_p3(workload_id, &request, options, allowed_hosts)
@@ -1484,8 +1480,11 @@ async fn run_http_server<T: Router>(
                                     let extractor = opentelemetry_http::HeaderExtractor(req.headers());
                                     let remote_context =
                                         opentelemetry::global::get_text_map_propagator(|propagator| propagator.extract(&extractor));
+                                    let malformed_trace_context = (req.headers().contains_key("traceparent")
+                                        || req.headers().contains_key("tracestate"))
+                                        && !remote_context.span().span_context().is_valid();
 
-                                    handle_http_request(handler, req, handles, service_handlers, fuel_meter).with_context(remote_context).await
+                                    handle_http_request(handler, req, handles, service_handlers, fuel_meter, malformed_trace_context).with_context(remote_context).await
                                 }
                             });
 
@@ -1572,6 +1571,9 @@ fn error_response(status: u16) -> hyper::Response<HyperOutgoingBody> {
     // Recorded once the response body has been fully streamed (see `MeteredBody`).
     { HTTP_RESPONSE_BODY_SIZE } = tracing::field::Empty,
     { OTEL_STATUS_CODE } = tracing::field::Empty,
+    otel.kind = "server",
+    otel.propagation.error = tracing::field::Empty,
+    exception.slug = tracing::field::Empty,
 ))]
 async fn handle_http_request<T: Router>(
     handler: Arc<T>,
@@ -1579,7 +1581,13 @@ async fn handle_http_request<T: Router>(
     workload_handles: WorkloadHandles,
     service_handlers: ServiceHandlers,
     fuel_meter: FuelConsumptionMeter,
+    malformed_trace_context: bool,
 ) -> Result<hyper::Response<HyperOutgoingBody>, hyper::Error> {
+    if malformed_trace_context {
+        tracing::Span::current().record("otel.propagation.error", true);
+        tracing::Span::current().record("exception.slug", "http-invalid-trace-context");
+        warn!("Ignoring invalid inbound HTTP trace context");
+    }
     let method = req.method().clone();
     let uri = req.uri().clone();
 
@@ -1697,20 +1705,51 @@ fn record_response_status<B>(response: &hyper::Response<B>) {
 /// The span must be entered (e.g. via [`tracing::Instrument::instrument`]) for
 /// the duration of the request so that status recorded on the *current* span
 /// from inside the async work lands on this span.
-fn outbound_client_span(method: &hyper::Method, uri: &hyper::Uri) -> tracing::Span {
+fn outbound_client_span<B>(request: &mut hyper::Request<B>) -> tracing::Span {
     let span = tracing::info_span!(
         "outbound_http_request",
         otel.kind = "client",
-        { HTTP_REQUEST_METHOD } = %method,
-        { URL_FULL } = %uri,
-        { SERVER_ADDRESS } = uri.host().unwrap_or_default(),
+        otel.propagation.error = tracing::field::Empty,
+        exception.slug = tracing::field::Empty,
+        { HTTP_REQUEST_METHOD } = %request.method(),
+        { URL_FULL } = %request.uri(),
+        { SERVER_ADDRESS } = request.uri().host().unwrap_or_default(),
         { SERVER_PORT } = tracing::field::Empty,
         { HTTP_RESPONSE_STATUS_CODE } = tracing::field::Empty,
         { RPC_GRPC_STATUS_CODE } = tracing::field::Empty,
         { OTEL_STATUS_CODE } = tracing::field::Empty,
     );
-    if let Some(port) = uri.port_u16() {
+    if let Some(port) = request.uri().port_u16() {
         span.record(SERVER_PORT, port);
+    }
+
+    let has_trace_headers = request.headers().contains_key("traceparent")
+        || request.headers().contains_key("tracestate");
+    if has_trace_headers {
+        let extractor = opentelemetry_http::HeaderExtractor(request.headers());
+        let parent = opentelemetry::global::get_text_map_propagator(|propagator| {
+            propagator.extract(&extractor)
+        });
+        if parent.span().span_context().is_valid() {
+            if let Err(error) = span.set_parent(parent) {
+                warn!(%error, "failed to set outbound HTTP parent context");
+            }
+        } else {
+            span.record("otel.propagation.error", true);
+            span.record("exception.slug", "http-invalid-trace-context");
+        }
+    }
+
+    let context = span.context();
+    if context.span().span_context().is_valid() {
+        request.headers_mut().remove("traceparent");
+        request.headers_mut().remove("tracestate");
+        opentelemetry::global::get_text_map_propagator(|propagator| {
+            propagator.inject_context(
+                &context,
+                &mut opentelemetry_http::HeaderInjector(request.headers_mut()),
+            );
+        });
     }
     span
 }
@@ -1730,6 +1769,51 @@ fn record_outbound_status(status: hyper::StatusCode) {
 /// response (allowed-hosts denial, connection failure, transport error, …).
 fn record_outbound_error() {
     tracing::Span::current().record(OTEL_STATUS_CODE, "ERROR");
+}
+
+fn record_outbound_error_on(span: &tracing::Span) {
+    span.record(OTEL_STATUS_CODE, "ERROR");
+}
+
+fn instrument_outgoing_response(
+    future: HostFutureIncomingResponse,
+    span: tracing::Span,
+) -> HostFutureIncomingResponse {
+    use wasmtime_wasi_http::p2::types::HostFutureIncomingResponse::{Consumed, Pending, Ready};
+
+    match future {
+        Pending(handle) => HostFutureIncomingResponse::pending(wasmtime_wasi::runtime::spawn(
+            async move {
+                let result = handle.await;
+                record_outgoing_result(&result);
+                result
+            }
+            .instrument(span),
+        )),
+        Ready(result) => {
+            let _entered = span.enter();
+            record_outgoing_result(&result);
+            HostFutureIncomingResponse::ready(result)
+        }
+        Consumed => Consumed,
+    }
+}
+
+fn record_outgoing_result(
+    result: &wasmtime::Result<
+        Result<
+            wasmtime_wasi_http::p2::types::IncomingResponse,
+            wasmtime_wasi_http::p2::bindings::http::types::ErrorCode,
+        >,
+    >,
+) {
+    match result {
+        Ok(Ok(incoming)) => {
+            record_outbound_status(incoming.resp.status());
+            record_grpc_status(incoming.resp.headers());
+        }
+        Ok(Err(_)) | Err(_) => record_outbound_error(),
+    }
 }
 
 /// Record the gRPC status as `rpc.grpc.status_code` on the current span when the
@@ -2148,21 +2232,9 @@ fn send_pooled_grpc_request(
     request: hyper::Request<HyperOutgoingBody>,
     config: OutgoingRequestConfig,
 ) -> HostFutureIncomingResponse {
-    let span = outbound_client_span(request.method(), request.uri());
-    let handle = wasmtime_wasi::runtime::spawn(
-        async move {
-            let result = client.send_grpc_request_p2(request, config).await;
-            match &result {
-                Ok(incoming) => {
-                    record_outbound_status(incoming.resp.status());
-                    record_grpc_status(incoming.resp.headers());
-                }
-                Err(_) => record_outbound_error(),
-            }
-            Ok(result)
-        }
-        .instrument(span),
-    );
+    let handle = wasmtime_wasi::runtime::spawn(async move {
+        Ok(client.send_grpc_request_p2(request, config).await)
+    });
     HostFutureIncomingResponse::pending(handle)
 }
 

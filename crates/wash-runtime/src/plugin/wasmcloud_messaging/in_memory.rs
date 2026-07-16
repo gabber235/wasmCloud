@@ -3,21 +3,66 @@ use std::sync::Arc;
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::{ResolvedWorkload, UnresolvedWorkload, WorkloadItem};
-use crate::observability::Meters;
+use crate::observability::{Meters, PropagationContext, context_from_propagation, inject_context};
 use crate::plugin::{HostPlugin, WitInterfaces};
 use crate::wit::{WitInterface, WitWorld};
 use anyhow::Context;
 use opentelemetry::KeyValue;
 use tokio::sync::{Notify, RwLock, oneshot};
 use tracing::{Instrument, debug, instrument, trace, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use wasmtime::component::Accessor;
 
 const PLUGIN_MESSAGING_MEMORY_ID: &str = "wasmcloud-messaging-memory";
 const MAX_QUEUE_SIZE: usize = 10000;
 
+fn propagation_context(
+    value: bindings::wasmcloud::observability::propagation::TraceContext,
+) -> PropagationContext {
+    PropagationContext {
+        traceparent: value.traceparent,
+        tracestate: value.tracestate,
+    }
+}
+
+fn producer_span(
+    operation: &'static str,
+    destination: &str,
+    payload_size: usize,
+    parent: Option<bindings::wasmcloud::observability::propagation::TraceContext>,
+) -> tracing::Span {
+    let span = tracing::info_span!("wasmcloud.messaging.produce", otel.kind = "producer", messaging.system = "in-memory", messaging.operation = operation, messaging.destination.name = destination, messaging.message.body.size = payload_size, messaging.operation.outcome = tracing::field::Empty, error.type = tracing::field::Empty, otel.propagation.error = tracing::field::Empty, exception.slug = tracing::field::Empty, exception.message = tracing::field::Empty, otel.status_code = tracing::field::Empty, error = tracing::field::Empty);
+    if let Some(parent) = parent {
+        match context_from_propagation(&propagation_context(parent)) {
+            Ok(parent) => {
+                let _ = span.set_parent(parent);
+            }
+            Err(_) => {
+                span.record("otel.propagation.error", true);
+                span.record("exception.slug", "messaging-invalid-trace-context");
+            }
+        }
+    }
+    span
+}
+
+fn routed_message(message: types::BrokerMessage, span: &tracing::Span) -> RoutedMessage {
+    let propagation = inject_context(&span.context());
+    RoutedMessage {
+        message,
+        propagation: (!propagation.traceparent.is_empty()).then_some(propagation),
+    }
+}
+
 /// A component's message inbox, shared between the publisher side
 /// (`route_to_subscribers`) and the component's processing task.
-type Inbox = Arc<RwLock<VecDeque<types::BrokerMessage>>>;
+#[derive(Clone)]
+struct RoutedMessage {
+    message: types::BrokerMessage,
+    propagation: Option<PropagationContext>,
+}
+
+type Inbox = Arc<RwLock<VecDeque<RoutedMessage>>>;
 
 mod bindings {
     crate::wasmtime::component::bindgen!({
@@ -37,10 +82,10 @@ use crate::plugin::WorkloadTracker;
 /// [`ComponentData`]).
 #[derive(Default)]
 struct WorkloadData {
-    pending_requests: Arc<RwLock<HashMap<String, oneshot::Sender<types::BrokerMessage>>>>,
+    pending_requests: Arc<RwLock<HashMap<String, oneshot::Sender<RoutedMessage>>>>,
 }
 
-type PendingRequests = Arc<RwLock<HashMap<String, oneshot::Sender<types::BrokerMessage>>>>;
+type PendingRequests = Arc<RwLock<HashMap<String, oneshot::Sender<RoutedMessage>>>>;
 
 struct PendingRequestGuard {
     key: String,
@@ -122,7 +167,7 @@ fn subscriptions_match(subscriptions: &[String], subject: &str) -> bool {
 async fn route_to_subscribers(
     plugin: &InMemoryMessaging,
     workload_id: &str,
-    msg: &types::BrokerMessage,
+    msg: &RoutedMessage,
 ) -> Result<(), String> {
     let targets: Vec<(Inbox, Arc<Notify>)> = {
         let lock = plugin.tracker.read().await;
@@ -131,7 +176,7 @@ async fn route_to_subscribers(
         };
         item.components
             .values()
-            .filter(|c| subscriptions_match(&c.subscriptions, &msg.subject))
+            .filter(|c| subscriptions_match(&c.subscriptions, &msg.message.subject))
             .map(|c| (c.inbox.clone(), c.notify.clone()))
             .collect()
     };
@@ -218,8 +263,10 @@ impl<T> HostWithStore<T> for SharedCtx {
         subject: String,
         body: Vec<u8>,
         timeout_ms: u32,
+        parent_context: Option<bindings::wasmcloud::observability::propagation::TraceContext>,
     ) -> wasmtime::Result<Result<types::BrokerMessage, String>> {
         let (plugin, workload_id) = plugin_and_workload(store)?;
+        let span = producer_span("request", &subject, body.len(), parent_context);
 
         let pending_requests = {
             let lock = plugin.tracker.read().await;
@@ -244,29 +291,46 @@ impl<T> HostWithStore<T> for SharedCtx {
             PendingRequestGuard::new(reply_to.clone(), pending_requests.clone());
 
         // Create the request message with reply_to set
-        let msg = types::BrokerMessage {
-            subject,
-            reply_to: Some(reply_to.clone()),
-            body,
-        };
+        let msg = routed_message(
+            types::BrokerMessage {
+                subject,
+                reply_to: Some(reply_to.clone()),
+                body,
+            },
+            &span,
+        );
 
-        debug!(subject = %msg.subject, reply_to = %msg.reply_to.as_deref().unwrap_or("<none>"), "Sending request");
+        debug!(subject = %msg.message.subject, reply_to = %msg.message.reply_to.as_deref().unwrap_or("<none>"), "Sending request");
         // Route the request to subscribers of its subject.
-        if let Err(e) = route_to_subscribers(&plugin, &workload_id, &msg).await {
-            return Ok(Err(e));
+        if let Err(error) = route_to_subscribers(&plugin, &workload_id, &msg).await {
+            super::record_messaging_error(&span, "messaging-broker-failed", &error);
+            return Ok(Err(error));
         }
 
         // Wait for the response with timeout
         let timeout_duration = std::time::Duration::from_millis(timeout_ms as u64);
         match tokio::time::timeout(timeout_duration, rx).await {
-            Ok(Ok(response)) => Ok(Ok(response)),
+            Ok(Ok(response)) => {
+                span.record("messaging.operation.outcome", "success");
+                Ok(Ok(response.message))
+            }
             Ok(Err(_)) => {
                 // Channel was dropped without sending
                 warn!("request channel closed without response");
+                super::record_messaging_error(
+                    &span,
+                    "messaging-broker-failed",
+                    "request channel closed without response",
+                );
                 Ok(Err("request channel closed without response".to_string()))
             }
             Err(_) => {
                 warn!("request timed out after {timeout_ms}ms");
+                super::record_messaging_error(
+                    &span,
+                    "messaging-request-timeout",
+                    &format!("request timed out after {timeout_ms}ms"),
+                );
                 Ok(Err(format!("request timed out after {timeout_ms}ms")))
             }
         }
@@ -276,8 +340,11 @@ impl<T> HostWithStore<T> for SharedCtx {
     async fn publish(
         store: &Accessor<T, Self>,
         msg: types::BrokerMessage,
+        parent_context: Option<bindings::wasmcloud::observability::propagation::TraceContext>,
     ) -> wasmtime::Result<Result<(), String>> {
         let (plugin, workload_id) = plugin_and_workload(store)?;
+        let span = producer_span("publish", &msg.subject, msg.body.len(), parent_context);
+        let msg = routed_message(msg, &span);
         let pending_requests = {
             let lock = plugin.tracker.read().await;
             match lock.get_workload_data(&workload_id) {
@@ -290,20 +357,27 @@ impl<T> HostWithStore<T> for SharedCtx {
             let mut lock = pending_requests.write().await;
             // Check if this is a reply to a pending request. Reply subjects
             // (`_INBOX.*`) are routed here, not to subscribers.
-            if let Some(sender) = lock.remove(&msg.subject) {
-                debug!(subject = %msg.subject, reply_to = %msg.reply_to.as_deref().unwrap_or("<none>"), "Responding message");
+            if let Some(sender) = lock.remove(&msg.message.subject) {
+                debug!(subject = %msg.message.subject, reply_to = %msg.message.reply_to.as_deref().unwrap_or("<none>"), "Responding message");
                 // This is a response to a request - send it via the oneshot channel
                 let _ = sender.send(msg);
+                span.record("messaging.operation.outcome", "success");
                 return Ok(Ok(()));
             }
         }
 
-        debug!(subject = %msg.subject, reply_to = %msg.reply_to.as_deref().unwrap_or("<none>"), "Publishing message");
+        debug!(subject = %msg.message.subject, reply_to = %msg.message.reply_to.as_deref().unwrap_or("<none>"), "Publishing message");
 
         // Regular publish - deliver to every subscriber of this subject.
         match route_to_subscribers(&plugin, &workload_id, &msg).await {
-            Ok(()) => Ok(Ok(())),
-            Err(e) => Ok(Err(e)),
+            Ok(()) => {
+                span.record("messaging.operation.outcome", "success");
+                Ok(Ok(()))
+            }
+            Err(error) => {
+                super::record_messaging_error(&span, "messaging-broker-failed", &error);
+                Ok(Err(error))
+            }
         }
     }
 }
@@ -319,9 +393,9 @@ impl HostPlugin for InMemoryMessaging {
     fn world(&self) -> WitWorld {
         WitWorld {
             imports: HashSet::from([WitInterface::from(
-                "wasmcloud:messaging/consumer,types@0.3.0",
+                "wasmcloud:messaging/consumer,types@0.4.0",
             )]),
-            exports: HashSet::from([WitInterface::from("wasmcloud:messaging/handler@0.3.0")]),
+            exports: HashSet::from([WitInterface::from("wasmcloud:messaging/handler@0.4.0")]),
         }
     }
 
@@ -453,7 +527,32 @@ impl HostPlugin for InMemoryMessaging {
                             break;
                         };
 
+                        let parent = msg.propagation.as_ref().and_then(|context| context_from_propagation(context).ok());
+                        let invalid_parent = msg.propagation.as_ref().is_some_and(|context| context_from_propagation(context).is_err());
+                        let msg = msg.message;
                         debug!(subject = %msg.subject, reply_to = %msg.reply_to.as_deref().unwrap_or("<none>"), "Processing message");
+
+                        let span = tracing::info_span!(
+                            "wasmcloud.messaging.consume",
+                            otel.kind = "consumer",
+                            messaging.system = "in-memory",
+                            messaging.operation = "process",
+                            messaging.destination.name = %msg.subject,
+                            messaging.message.body.size = msg.body.len(),
+                            messaging.operation.outcome = tracing::field::Empty,
+                            error.type = tracing::field::Empty,
+                            otel.propagation.error = invalid_parent,
+                            exception.slug = tracing::field::Empty,
+                            exception.message = tracing::field::Empty,
+                            otel.status_code = tracing::field::Empty,
+                            error = tracing::field::Empty,
+                        );
+                        if let Some(parent) = parent {
+                            let _ = span.set_parent(parent);
+                        }
+                        if invalid_parent {
+                            span.record("exception.slug", "messaging-invalid-trace-context");
+                        }
 
                         // If this workload runs a long-lived trigger service for
                         // messaging, deliver to it (preserving its in-memory
@@ -468,16 +567,22 @@ impl HostPlugin for InMemoryMessaging {
                                 body: msg.body.clone(),
                                 reply_to: msg.reply_to.clone(),
                             };
-                            match workload
+                            let result = workload
                                 .http_handler()
                                 .deliver_trigger_service_message(workload.id(), broker)
-                                .await
-                            {
-                                Ok(Ok(())) => debug!(subject = %msg.subject, "trigger service handled message"),
+                                .instrument(span.clone())
+                                .await;
+                            match result {
+                                Ok(Ok(())) => {
+                                    span.record("messaging.operation.outcome", "success");
+                                    debug!(subject = %msg.subject, "trigger service handled message");
+                                }
                                 Ok(Err(e)) => {
+                                    super::record_messaging_error(&span, "messaging-handler-rejected", &e);
                                     warn!(subject = %msg.subject, error = %e, "trigger service message handler returned error")
                                 }
                                 Err(e) => {
+                                    super::record_messaging_error(&span, "messaging-consumer-delivery-failed", &e.to_string());
                                     warn!(subject = %msg.subject, error = %e, "failed to deliver message to trigger service")
                                 }
                             }
@@ -493,31 +598,27 @@ impl HostPlugin for InMemoryMessaging {
                             continue;
                         };
                         let mut store = match workload.new_store(&component_id).await {
-                            Err(e) => {
-                                warn!("failed to create store for component {component_id}: {e}");
+                            Err(error) => {
+                                super::record_messaging_error(&span, "messaging-consumer-setup-failed", &error.to_string());
+                                warn!("failed to create store for component {component_id}: {error}");
                                 continue;
                             }
-                            Ok(s) => s,
+                            Ok(store) => store,
                         };
 
                         let proxy = match pre.instantiate_async(&mut store).await {
-                            Err(e) => {
-                                warn!("failed to instantiate component {component_id}: {e}");
+                            Err(error) => {
+                                super::record_messaging_error(&span, "messaging-consumer-setup-failed", &error.to_string());
+                                warn!("failed to instantiate component {component_id}: {error}");
                                 continue;
                             }
-                            Ok(p) => p,
+                            Ok(proxy) => proxy,
                         };
-
-                        let span = tracing::span!(
-                            tracing::Level::INFO,
-                            "incoming_wasmcloud_message_memory",
-                            subject = %msg.subject,
-                            reply_to = %msg.reply_to.as_deref().unwrap_or("<none>"),
-                        );
 
                         let fuel_meter = fuel_meter.clone();
 
                         tokio::spawn(async move {
+                            let handler_span = span.clone();
                             let result = fuel_meter.observe(
                                 &[
                                     KeyValue::new("plugin", PLUGIN_MESSAGING_MEMORY_ID),
@@ -530,7 +631,7 @@ impl HostPlugin for InMemoryMessaging {
                                             proxy
                                                 .wasmcloud_messaging_handler()
                                                 .call_handle_message(accessor, msg)
-                                                .instrument(span)
+                                                .instrument(handler_span)
                                                 .await
                                         })
                                         .await
@@ -541,11 +642,13 @@ impl HostPlugin for InMemoryMessaging {
                             ).await;
 
                             match result {
-                                Ok(Ok(())) => debug!("message handled successfully"),
+                                Ok(Ok(())) => { span.record("messaging.operation.outcome", "success"); debug!("message handled successfully"); },
                                 Ok(Err(message)) => {
+                                    super::record_messaging_error(&span, "messaging-handler-rejected", &message);
                                     warn!(error = %message, "handler rejected message");
                                 }
                                 Err(error) => {
+                                    super::record_messaging_error(&span, "messaging-handler-rejected", &error.to_string());
                                     warn!(error = %error, "handler invocation failed");
                                 }
                             };
@@ -595,9 +698,85 @@ impl HostPlugin for InMemoryMessaging {
 mod tests {
     use std::{collections::HashMap, sync::Arc, time::Duration};
 
+    use opentelemetry::trace::{
+        SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
+    };
     use tokio::sync::{RwLock, oneshot};
 
-    use super::{PendingRequestGuard, subject_matches, subscriptions_match};
+    use super::{PendingRequestGuard, RoutedMessage, subject_matches, subscriptions_match, types};
+    use crate::observability::{PropagationContext, context_from_propagation, inject_context};
+
+    fn context(trace: u128, span: u64) -> opentelemetry::Context {
+        opentelemetry::Context::new().with_remote_span_context(SpanContext::new(
+            TraceId::from(trace),
+            SpanId::from(span),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn concurrent_propagation_contexts_do_not_leak() {
+        let tasks = (1..=256_u64).map(|id| {
+            tokio::spawn(async move {
+                let expected_trace = TraceId::from(id as u128);
+                let expected_span = SpanId::from(id);
+                let propagation = inject_context(&context(id as u128, id));
+                tokio::task::yield_now().await;
+                let extracted = context_from_propagation(&propagation).unwrap();
+                let actual = extracted.span().span_context().clone();
+                (expected_trace, expected_span, actual)
+            })
+        });
+
+        for task in tasks {
+            let (trace_id, span_id, actual) = task.await.unwrap();
+            assert_eq!(actual.trace_id(), trace_id);
+            assert_eq!(actual.span_id(), span_id);
+        }
+    }
+
+    #[test]
+    fn routed_message_envelope_preserves_and_validates_context() {
+        let message = types::BrokerMessage {
+            subject: "orders.created".into(),
+            reply_to: Some("_INBOX.reply".into()),
+            body: vec![1, 2, 3],
+        };
+        let propagation = inject_context(&context(0x1234, 0x5678));
+        let routed = RoutedMessage {
+            message: message.clone(),
+            propagation: Some(propagation),
+        };
+
+        assert_eq!(routed.message.subject, message.subject);
+        assert_eq!(routed.message.reply_to, message.reply_to);
+        assert_eq!(routed.message.body, message.body);
+        let extracted = context_from_propagation(routed.propagation.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            extracted.span().span_context().trace_id(),
+            TraceId::from(0x1234)
+        );
+        assert_eq!(
+            extracted.span().span_context().span_id(),
+            SpanId::from(0x5678)
+        );
+
+        let missing = RoutedMessage {
+            message: message.clone(),
+            propagation: None,
+        };
+        assert!(missing.propagation.is_none());
+        let malformed = RoutedMessage {
+            message,
+            propagation: Some(PropagationContext {
+                traceparent: "malformed".into(),
+                tracestate: None,
+            }),
+        };
+        assert!(context_from_propagation(malformed.propagation.as_ref().unwrap()).is_err());
+    }
 
     #[tokio::test]
     async fn dropped_pending_request_is_removed() {

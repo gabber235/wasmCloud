@@ -46,8 +46,8 @@ async fn async_request_replies_between_components() -> Result<()> {
         .start()
         .await?;
 
-    let messaging_consumer = WitInterface::from("wasmcloud:messaging/consumer,types@0.3.0");
-    let messaging_handler = WitInterface::from("wasmcloud:messaging/handler@0.3.0");
+    let messaging_consumer = WitInterface::from("wasmcloud:messaging/consumer,types@0.4.0");
+    let messaging_handler = WitInterface::from("wasmcloud:messaging/handler@0.4.0");
     let http = WitInterface {
         namespace: "wasi".to_string(),
         package: "http".to_string(),

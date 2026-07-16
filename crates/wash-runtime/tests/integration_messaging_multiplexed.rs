@@ -28,7 +28,9 @@ use wash_runtime::{
         HostApi, HostBuilder,
         http::{DevRouter, HttpServer},
     },
-    plugin::wasmcloud_messaging::{BrokerMessage, MultiplexedMessaging, NatsMsgProvider},
+    plugin::wasmcloud_messaging::{
+        BrokerMessage, MultiplexedMessaging, NatsMsgProvider, TraceContext,
+    },
     types::{Component, LocalResources, Workload, WorkloadStartRequest, WorkloadState},
     wit::WitInterface,
 };
@@ -42,7 +44,7 @@ fn msg_iface(name: &str, url: &str) -> WitInterface {
         interfaces: ["consumer".to_string(), "types".to_string()]
             .into_iter()
             .collect(),
-        version: Some(semver::Version::new(0, 3, 0)),
+        version: Some(semver::Version::new(0, 4, 0)),
         config: HashMap::from([
             ("backend".to_string(), "nats".to_string()),
             ("url".to_string(), url.to_string()),
@@ -135,26 +137,46 @@ async fn multiplexed_messaging_routes_each_import_to_its_cluster() -> Result<()>
     sync(&verify_b).await?;
 
     // team-a's publish lands on cluster A only.
+    let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
     team_a
-        .publish(BrokerMessage {
-            subject: subject.to_string(),
-            reply_to: None,
-            body: b"from-a".to_vec(),
-        })
+        .publish(
+            BrokerMessage {
+                subject: subject.to_string(),
+                reply_to: None,
+                body: b"from-a".to_vec(),
+            },
+            Some(TraceContext {
+                traceparent: traceparent.to_string(),
+                tracestate: None,
+            }),
+        )
         .await
         .map_err(err)?;
-    assert_eq!(next_msg(&mut sub_a).await?.payload.as_ref(), b"from-a");
+    let published = next_msg(&mut sub_a).await?;
+    assert_eq!(published.payload.as_ref(), b"from-a");
+    assert_eq!(
+        published
+            .headers
+            .as_ref()
+            .and_then(|headers| headers.get("traceparent"))
+            .map(ToString::to_string)
+            .as_deref(),
+        Some(traceparent)
+    );
     expect_silent(&mut sub_b)
         .await
         .context("cluster B must not see team-a's publish")?;
 
     // team-b's publish lands on cluster B only.
     team_b
-        .publish(BrokerMessage {
-            subject: subject.to_string(),
-            reply_to: None,
-            body: b"from-b".to_vec(),
-        })
+        .publish(
+            BrokerMessage {
+                subject: subject.to_string(),
+                reply_to: None,
+                body: b"from-b".to_vec(),
+            },
+            None,
+        )
         .await
         .map_err(err)?;
     assert_eq!(next_msg(&mut sub_b).await?.payload.as_ref(), b"from-b");
@@ -179,7 +201,7 @@ async fn multiplexed_messaging_routes_each_import_to_its_cluster() -> Result<()>
     });
 
     let reply = team_a
-        .request("team-a.rpc".to_string(), b"ping".to_vec(), 5000)
+        .request("team-a.rpc".to_string(), b"ping".to_vec(), 5000, None)
         .await
         .map_err(err)?;
     assert_eq!(reply.body, b"pong".to_vec());

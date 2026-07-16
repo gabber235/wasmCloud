@@ -7,7 +7,7 @@ mod bindings {
 
 use bindings::exports::wasi::http::handler::Guest as Handler;
 use bindings::wasi::http::types::{ErrorCode, Fields, Request, Response};
-use bindings::wasmcloud::messaging::consumer;
+use bindings::wasmcloud::messaging0_4_0::consumer;
 
 struct Component;
 
@@ -42,7 +42,7 @@ impl Handler for Component {
         let body = body.collect().await;
         drop(body_result_tx);
 
-        match consumer::request(SUBJECT.to_string(), body, 5_000).await {
+        match consumer::request(SUBJECT.to_string(), body, 5_000, None).await {
             Ok(reply) => respond(200, reply.body),
             Err(message) => respond(502, message.into_bytes()),
         }
