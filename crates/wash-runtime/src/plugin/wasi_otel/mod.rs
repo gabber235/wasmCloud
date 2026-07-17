@@ -13,7 +13,7 @@ use convert::{
 use anyhow::bail;
 use opentelemetry::KeyValue;
 use opentelemetry::logs::{Logger, LoggerProvider};
-use opentelemetry::trace::TraceContextExt;
+use opentelemetry::trace::{SpanContext, TraceContextExt};
 use opentelemetry_sdk::logs::{BatchLogProcessor, SdkLoggerProvider};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SpanData;
@@ -171,13 +171,14 @@ fn component_context(
 fn component_resource(
     config: &WasiOtelConfig,
     component_id: &str,
+    component_name: &str,
     workload_id: &str,
     workload_name: &str,
     workload_namespace: &str,
 ) -> opentelemetry_sdk::Resource {
     let configured_name = config.service_name.trim();
     let service_name = if configured_name.is_empty() || configured_name == WASI_OTEL_ID {
-        workload_name
+        component_name
     } else {
         configured_name
     };
@@ -188,9 +189,18 @@ fn component_resource(
             KeyValue::new("service.namespace", workload_namespace.to_string()),
             KeyValue::new("service.instance.id", workload_id.to_string()),
             KeyValue::new("wasmcloud.workload.name", workload_name.to_string()),
+            KeyValue::new("wasmcloud.component.name", component_name.to_string()),
             KeyValue::new("wasmcloud.component.id", component_id.to_string()),
         ])
         .build()
+}
+
+fn current_outer_span_context() -> SpanContext {
+    tracing::Span::current()
+        .context()
+        .span()
+        .span_context()
+        .clone()
 }
 
 /// WASI OpenTelemetry Plugin
@@ -329,6 +339,7 @@ impl HostPlugin for WasiOtel {
         span_processor.set_resource(&component_resource(
             &self.config,
             component_handle.id(),
+            component_handle.name(),
             component_handle.workload_id(),
             component_handle.workload_name(),
             component_handle.workload_namespace(),
@@ -512,8 +523,7 @@ impl<'a> bindings::wasi::otel::tracing::Host for ActiveCtx<'a> {
         &mut self,
         span_data: bindings::wasi::otel::tracing::SpanData,
     ) -> wasmtime::Result<()> {
-        let outer_context = tracing::Span::current().context();
-        let outer_span_context = outer_context.span().span_context().clone();
+        let outer_span_context = current_outer_span_context();
         if let Ok(plugin) = self.ctx.try_get_plugin::<WasiOtel>(WASI_OTEL_ID) {
             let summary = summarize_span_data(&span_data);
             tracing::info!(
@@ -550,10 +560,9 @@ impl<'a> bindings::wasi::otel::tracing::Host for ActiveCtx<'a> {
     }
 
     async fn outer_span_context(&mut self) -> wasmtime::Result<WitSpanContext> {
-        // Try to get the current span context from the OpenTelemetry context
-        use opentelemetry::trace::TraceContextExt;
-        let current_context = opentelemetry::Context::current();
-        let span_context = current_context.span().span_context().clone();
+        // Host calls are instrumented with `tracing::Span`, so bridge through the
+        // tracing-opentelemetry layer instead of the OTel thread-local context.
+        let span_context = current_outer_span_context();
 
         if span_context.is_valid() {
             tracing::info!(
@@ -582,12 +591,13 @@ mod tests {
     use std::borrow::Cow;
     use std::sync::Mutex;
 
-    use opentelemetry::InstrumentationScope;
     use opentelemetry::trace::{
-        SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceId, TraceState,
+        SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceId, TraceState, TracerProvider as _,
     };
+    use opentelemetry::{Context, InstrumentationScope};
     use opentelemetry_sdk::error::OTelSdkResult;
-    use opentelemetry_sdk::trace::{SpanEvents, SpanExporter, SpanLinks};
+    use opentelemetry_sdk::trace::{SdkTracerProvider, SpanEvents, SpanExporter, SpanLinks};
+    use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::*;
 
@@ -654,10 +664,73 @@ mod tests {
     }
 
     #[test]
+    fn outer_context_comes_from_current_tracing_span() {
+        let exporter = TestExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter)
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer().with_tracer(provider.tracer("outer-context-test")),
+        );
+        let trace_id = TraceId::from(0x11112222333344445555666677778888_u128);
+        let parent = SpanContext::new(
+            trace_id,
+            SpanId::from(0x1111222233334444_u64),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::from_key_value([("vendor", "state")]).unwrap(),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("messaging-consumer-test");
+            span.set_parent(Context::new().with_remote_span_context(parent))
+                .unwrap();
+
+            {
+                let _guard = span.enter();
+                assert!(
+                    !Context::current().span().span_context().is_valid(),
+                    "the regression test must not attach an OTel thread-local context"
+                );
+
+                let current = current_outer_span_context();
+                assert!(current.is_valid());
+                assert_eq!(current.trace_id(), trace_id);
+                assert_ne!(current.span_id(), SpanId::INVALID);
+                assert_eq!(current.trace_flags(), TraceFlags::SAMPLED);
+                assert_eq!(current.trace_state().header(), "vendor=state");
+
+                let wit = otel_span_context_to_wit(&current);
+                assert_eq!(wit.trace_id, trace_id.to_string());
+                assert_eq!(wit.span_id, current.span_id().to_string());
+                assert!(wit.trace_flags.contains(WitTraceFlags::SAMPLED));
+                assert_eq!(wit.trace_state, vec![("vendor".into(), "state".into())]);
+            }
+
+            assert!(!current_outer_span_context().is_valid());
+        });
+        provider.shutdown().unwrap();
+    }
+
+    #[test]
     fn component_resources_have_distinct_namespace_and_name() {
         let config = WasiOtelConfig::default();
-        let first = component_resource(&config, "random-a", "instance-a", "orders", "shop");
-        let second = component_resource(&config, "random-b", "instance-b", "billing", "finance");
+        let first = component_resource(
+            &config,
+            "random-a",
+            "orders",
+            "instance-a",
+            "orders-84b6b87c8c-7586ccf9b6",
+            "shop",
+        );
+        let second = component_resource(
+            &config,
+            "random-b",
+            "billing",
+            "instance-b",
+            "billing-69b457f44f-64f959db5c",
+            "finance",
+        );
 
         assert_eq!(attribute(&first, "service.name"), "orders");
         assert_eq!(attribute(&first, "service.namespace"), "shop");
@@ -672,8 +745,22 @@ mod tests {
     #[test]
     fn component_resource_name_is_stable_across_random_instance_ids() {
         let config = WasiOtelConfig::builder().service_name("   ").build();
-        let first = component_resource(&config, "random-a", "instance-a", "orders", "shop");
-        let second = component_resource(&config, "random-b", "instance-b", "orders", "shop");
+        let first = component_resource(
+            &config,
+            "random-a",
+            "orders",
+            "instance-a",
+            "orders-84b6b87c8c-7586ccf9b6",
+            "shop",
+        );
+        let second = component_resource(
+            &config,
+            "random-b",
+            "orders",
+            "instance-b",
+            "orders-69b457f44f-64f959db5c",
+            "shop",
+        );
 
         assert_eq!(attribute(&first, "service.name"), "orders");
         assert_eq!(attribute(&second, "service.name"), "orders");
@@ -686,7 +773,14 @@ mod tests {
     #[test]
     fn validated_configured_service_name_takes_precedence() {
         let config = WasiOtelConfig::builder().service_name("orders").build();
-        let resource = component_resource(&config, "component-id", "instance", "rollout", "shop");
+        let resource = component_resource(
+            &config,
+            "component-id",
+            "component-name",
+            "instance",
+            "rollout",
+            "shop",
+        );
 
         assert_eq!(attribute(&resource, "service.name"), "orders");
     }
@@ -694,10 +788,22 @@ mod tests {
     #[test]
     fn guest_spans_keep_exact_ids_resources_and_component_isolation_on_unbind() {
         let config = WasiOtelConfig::default();
-        let first_resource =
-            component_resource(&config, "component-a", "instance-a", "orders", "shop");
-        let second_resource =
-            component_resource(&config, "component-b", "instance-b", "billing", "finance");
+        let first_resource = component_resource(
+            &config,
+            "component-a",
+            "orders",
+            "instance-a",
+            "orders-84b6b87c8c-7586ccf9b6",
+            "shop",
+        );
+        let second_resource = component_resource(
+            &config,
+            "component-b",
+            "billing",
+            "instance-b",
+            "billing-69b457f44f-64f959db5c",
+            "finance",
+        );
         let (first, first_exporter) = test_component("component-a", first_resource);
         let (second, second_exporter) = test_component("component-b", second_resource);
 
@@ -733,6 +839,10 @@ mod tests {
         assert_eq!(
             attribute(first_resource.as_ref().unwrap(), "service.namespace"),
             "shop"
+        );
+        assert_eq!(
+            attribute(first_resource.as_ref().unwrap(), "wasmcloud.component.name"),
+            "orders"
         );
         assert_eq!(
             attribute(first_resource.as_ref().unwrap(), "wasmcloud.component.id"),
