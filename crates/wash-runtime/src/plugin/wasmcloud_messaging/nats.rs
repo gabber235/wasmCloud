@@ -606,9 +606,9 @@ impl HostPlugin for NatsMessaging {
                                             proxy
                                                 .wasmcloud_messaging_handler()
                                                 .call_handle_message(accessor, msg)
-                                                .instrument(handler_span)
                                                 .await
                                         })
+                                        .instrument(handler_span)
                                         .await
                                         .map_err(anyhow::Error::from)?;
 
