@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ops::{Deref, DerefMut},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
 };
 
 use crate::{plugin::WitInterfaces, sockets::loopback};
@@ -35,13 +35,72 @@ use crate::{
     wit::{WitInterface, WitWorld},
 };
 
-/// Type alias for tracking bound plugins with their matched interfaces during binding.
-/// Tuple: (plugin, matched_interfaces, component_ids)
 type BoundPluginWithInterfaces = (
     Arc<dyn HostPlugin + 'static>,
     HashSet<WitInterface>,
     Vec<String>,
 );
+
+#[derive(Clone)]
+struct PluginBinding {
+    plugin: Arc<dyn HostPlugin + 'static>,
+    interfaces: HashSet<WitInterface>,
+    item_ids: Vec<String>,
+}
+
+#[derive(Clone, Default)]
+struct BindingLedger {
+    plugins: Vec<PluginBinding>,
+    public_bindings: Vec<(Arc<dyn HostPlugin + 'static>, Vec<String>)>,
+    http_registered: Arc<std::sync::atomic::AtomicBool>,
+    service_http_registered: Arc<std::sync::atomic::AtomicBool>,
+    service_messaging_registered: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Deref for BindingLedger {
+    type Target = [(Arc<dyn HostPlugin + 'static>, Vec<String>)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.public_bindings
+    }
+}
+
+impl<'a> IntoIterator for &'a BindingLedger {
+    type Item = &'a (Arc<dyn HostPlugin + 'static>, Vec<String>);
+    type IntoIter = std::slice::Iter<'a, (Arc<dyn HostPlugin + 'static>, Vec<String>)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.public_bindings.iter()
+    }
+}
+
+async fn rollback_plugin_bindings(
+    workload_id: &str,
+    bindings: &[PluginBinding],
+) -> anyhow::Result<()> {
+    let mut errors = Vec::new();
+    for binding in bindings.iter().rev() {
+        if let Err(error) = binding
+            .plugin
+            .on_workload_unbind(workload_id, WitInterfaces::new(&binding.interfaces))
+            .await
+        {
+            errors.push(format!("plugin '{}': {error:#}", binding.plugin.id()));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("failed to roll back plugin bindings: {}", errors.join("; "))
+    }
+}
+
+fn with_cleanup_error(error: anyhow::Error, cleanup: anyhow::Result<()>) -> anyhow::Error {
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup_error) => error.context(format!("cleanup also failed: {cleanup_error:#}")),
+    }
+}
 
 /// Metadata associated with components and services within a workload.
 #[derive(Clone)]
@@ -533,6 +592,7 @@ pub struct ResolvedWorkload {
     service: Option<WorkloadService>,
     /// The requested host [`WitInterface`]s to resolve this workload
     host_interfaces: Vec<WitInterface>,
+    binding_ledger: BindingLedger,
     /// TLS provider override for `wasi:tls` client connections in this workload.
     #[cfg(feature = "wasi-tls")]
     tls_provider: Option<SharedTlsProvider>,
@@ -799,6 +859,9 @@ impl ResolvedWorkload {
                 .on_service_http_resolved(self.id(), &ingress_hostnames, http_tx)
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to register service HTTP handler: {e:#}"))?;
+            self.binding_ledger
+                .service_http_registered
+                .store(true, Ordering::Release);
         }
         if let Some(messaging_tx) = messaging_tx {
             self.http_handler
@@ -807,6 +870,9 @@ impl ResolvedWorkload {
                 .map_err(|e| {
                     anyhow::anyhow!("failed to register trigger service messaging handler: {e:#}")
                 })?;
+            self.binding_ledger
+                .service_messaging_registered
+                .store(true, Ordering::Release);
         }
 
         // Supervise the driver: on a fault (e.g. a guest trap in `cli/run` or a
@@ -1579,104 +1645,46 @@ impl ResolvedWorkload {
         );
 
         for component in self.components.read().await.values() {
-            // Warm instances hold guest resources (sockets, open files) for as
-            // long as they stay parked, so release them with the rest of the
-            // workload's teardown. Calls still in flight own their own stores
-            // and are unaffected.
             component.instances.clear();
-
-            if let Some(plugins) = component.plugins() {
-                for (plugin_id, plugin) in plugins.iter() {
-                    trace!(
-                        plugin_id,
-                        component_id = component.id(),
-                        workload_id = self.id.as_ref(),
-                        "unbinding plugin from component"
-                    );
-
-                    // Get the interfaces this plugin was bound to by checking the component's imports
-                    let world = component.world();
-                    let plugin_world = plugin.world();
-
-                    // Find the intersection of what the component imports and what the plugin provides
-                    let bound_interfaces = world
-                        .imports
-                        .iter()
-                        .filter(|import| plugin_world.imports.contains(import))
-                        .cloned()
-                        .collect::<std::collections::HashSet<_>>();
-
-                    if let Err(e) = plugin
-                        .on_workload_unbind(self.id(), WitInterfaces::new(&bound_interfaces))
-                        .await
-                    {
-                        warn!(
-                            plugin_id,
-                            component_id = component.id(),
-                            workload_id = self.id.as_ref(),
-                            error = ?e,
-                            "failed to unbind plugin from workload, continuing cleanup"
-                        );
-                    }
-                }
-            }
-
-            if component.exports_wasi_http() {
-                anyhow::Context::context(
-                    self.http_handler.on_workload_unbind(self.id()).await,
-                    "failed to notify HTTP handler of workload",
-                )?;
-            }
         }
 
-        // The service item records plugin bindings just like a component;
-        // unbind them the same way so a plugin bound only to the service is
-        // not left tracking a stopped workload.
-        if let Some(service) = self.service.as_ref()
-            && let Some(plugins) = service.plugins()
+        let mut errors = Vec::new();
+        if let Err(error) = rollback_plugin_bindings(self.id(), &self.binding_ledger.plugins).await
         {
-            for (plugin_id, plugin) in plugins.iter() {
-                let world = service.world();
-                let plugin_world = plugin.world();
-                let bound_interfaces = world
-                    .imports
-                    .iter()
-                    .filter(|import| plugin_world.imports.contains(import))
-                    .cloned()
-                    .collect::<std::collections::HashSet<_>>();
-
-                if let Err(e) = plugin
-                    .on_workload_unbind(self.id(), WitInterfaces::new(&bound_interfaces))
-                    .await
-                {
-                    warn!(
-                        plugin_id,
-                        service_id = service.id(),
-                        workload_id = self.id.as_ref(),
-                        error = ?e,
-                        "failed to unbind plugin from service, continuing cleanup"
-                    );
-                }
-            }
+            errors.push(error.to_string());
         }
-
-        // A trigger service registered its HTTP/messaging handlers at start
-        // (`execute_trigger_service`); drop those registrations on stop so it no
-        // longer receives host-invoked deliveries on a torn-down instance.
-        if self.service.is_some() {
-            if let Err(e) = self.http_handler.on_service_http_unbind(self.id()).await {
-                tracing::error!(workload.id = %self.id(), err = %e, "failed to unbind service HTTP handler, continuing");
-            }
-            if let Err(e) = self
+        if self
+            .binding_ledger
+            .http_registered
+            .swap(false, Ordering::AcqRel)
+            && let Err(error) = self.http_handler.on_workload_unbind(self.id()).await
+        {
+            errors.push(format!("HTTP workload cleanup: {error:#}"));
+        }
+        if self
+            .binding_ledger
+            .service_http_registered
+            .swap(false, Ordering::AcqRel)
+            && let Err(error) = self.http_handler.on_service_http_unbind(self.id()).await
+        {
+            errors.push(format!("HTTP service route cleanup: {error:#}"));
+        }
+        if self
+            .binding_ledger
+            .service_messaging_registered
+            .swap(false, Ordering::AcqRel)
+            && let Err(error) = self
                 .http_handler
                 .on_trigger_service_messaging_unbind(self.id())
                 .await
-            {
-                tracing::error!(workload.id = %self.id(), err = %e, "failed to unbind trigger service messaging handler, continuing");
-            }
+        {
+            errors.push(format!("messaging service route cleanup: {error:#}"));
         }
-
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("workload cleanup failed: {}", errors.join("; "))
+        }
     }
 }
 
@@ -1835,6 +1843,16 @@ impl UnresolvedWorkload {
         &mut self,
         plugins: &HashMap<&'static str, Arc<dyn HostPlugin + 'static>>,
     ) -> anyhow::Result<Vec<(Arc<dyn HostPlugin + 'static>, Vec<String>)>> {
+        Ok(self
+            .bind_plugins_transactional(plugins)
+            .await?
+            .public_bindings)
+    }
+
+    async fn bind_plugins_transactional(
+        &mut self,
+        plugins: &HashMap<&'static str, Arc<dyn HostPlugin + 'static>>,
+    ) -> anyhow::Result<BindingLedger> {
         // Track bound plugins with their matched interfaces for cleanup on failure
         let mut bound_plugins_with_interfaces: Vec<BoundPluginWithInterfaces> = Vec::new();
         let mut bound_plugins: Vec<(Arc<dyn HostPlugin + 'static>, Vec<String>)> = Vec::new();
@@ -1969,6 +1987,16 @@ impl UnresolvedWorkload {
                 }
                 for ((ns, pkg), mut names) in ns_pkg_named {
                     if names.len() > 1 && !p.supports_named_instances() {
+                        for (bound_plugin, bound_interfaces, _) in
+                            bound_plugins_with_interfaces.iter().rev()
+                        {
+                            if let Err(error) = bound_plugin
+                                .on_workload_unbind(self.id(), WitInterfaces::new(bound_interfaces))
+                                .await
+                            {
+                                warn!(plugin_id = bound_plugin.id(), error = ?error, "failed to clean up plugin after named-instance validation failure");
+                            }
+                        }
                         names.sort_unstable();
                         bail!(
                             "plugin '{}' does not support named instances, but workload \
@@ -2026,6 +2054,12 @@ impl UnresolvedWorkload {
                     }
                     bail!(e)
                 }
+
+                bound_plugins_with_interfaces.push((
+                    p.clone(),
+                    plugin_matched_interfaces.clone(),
+                    Vec::new(),
+                ));
 
                 // Collect component IDs for this plugin
                 let mut plugin_component_ids = Vec::new();
@@ -2099,6 +2133,11 @@ impl UnresolvedWorkload {
                         );
                         workload_item.add_plugin(plugin_id, p.clone());
                         plugin_component_ids.push(workload_item.id().to_string());
+                        if let Some((_, _, component_ids)) =
+                            bound_plugins_with_interfaces.last_mut()
+                        {
+                            component_ids.push(workload_item.id().to_string());
+                        }
 
                         // Remove matched interfaces from unmatched set
                         if let Some(unmatched) = unmatched_interfaces.get_mut(&id) {
@@ -2110,12 +2149,7 @@ impl UnresolvedWorkload {
                 }
 
                 // Add this plugin with all its bound component IDs
-                bound_plugins.push((p.clone(), plugin_component_ids.clone()));
-                bound_plugins_with_interfaces.push((
-                    p.clone(),
-                    plugin_matched_interfaces,
-                    plugin_component_ids,
-                ));
+                bound_plugins.push((p.clone(), plugin_component_ids));
             }
         }
 
@@ -2127,25 +2161,12 @@ impl UnresolvedWorkload {
                     interfaces = ?unmatched,
                     "no plugins found for requested interfaces"
                 );
-                // The same rollback the bind-failure paths perform: without it
-                // every successfully bound plugin keeps tracking a workload
-                // that never deploys.
-                for (bound_plugin, bound_interfaces, _) in
-                    bound_plugins_with_interfaces.iter().rev()
-                {
-                    debug!(
-                        plugin_id = bound_plugin.id(),
-                        "calling on_workload_unbind for cleanup after unmatched interfaces"
-                    );
-                    if let Err(cleanup_err) = bound_plugin
-                        .on_workload_unbind(self.id(), WitInterfaces::new(bound_interfaces))
+                for (plugin, interfaces, _) in bound_plugins_with_interfaces.iter().rev() {
+                    if let Err(error) = plugin
+                        .on_workload_unbind(self.id(), WitInterfaces::new(interfaces))
                         .await
                     {
-                        warn!(
-                            plugin_id = bound_plugin.id(),
-                            error = ?cleanup_err,
-                            "failed to cleanup plugin after unmatched interfaces"
-                        );
+                        warn!(plugin_id = plugin.id(), error = ?error, "failed to clean up unmatched workload binding");
                     }
                 }
                 bail!(
@@ -2154,10 +2175,26 @@ impl UnresolvedWorkload {
             }
         }
 
-        Ok(bound_plugins)
+        Ok(BindingLedger {
+            plugins: bound_plugins_with_interfaces
+                .into_iter()
+                .map(|(plugin, interfaces, item_ids)| PluginBinding {
+                    plugin,
+                    interfaces,
+                    item_ids,
+                })
+                .collect(),
+            public_bindings: bound_plugins,
+            ..BindingLedger::default()
+        })
     }
 
     /// Resolves the workload by binding it to host plugins and creating the final executable workload.
+    ///
+    /// This operation is cancellation-unsafe because registrations span await points. Callers must
+    /// supervise it to completion and stop and unbind a successful result after cancellation. Host
+    /// startup does this in a host-owned task; cancel framework starts through
+    /// [`crate::host::HostApi::workload_stop`].
     ///
     /// This method performs the final resolution step that transforms an unresolved workload
     /// into a [`ResolvedWorkload`] ready for execution. It:
@@ -2187,11 +2224,11 @@ impl UnresolvedWorkload {
         http_handler: Arc<dyn crate::host::http::HostHandler>,
     ) -> anyhow::Result<ResolvedWorkload> {
         // Bind to plugins
-        let bound_plugins = if let Some(plugins) = plugins {
+        let binding_ledger = if let Some(plugins) = plugins {
             trace!("binding plugins to workload");
-            self.bind_plugins(plugins).await?
+            self.bind_plugins_transactional(plugins).await?
         } else {
-            Vec::new()
+            BindingLedger::default()
         };
 
         let incoming_http_component = {
@@ -2218,6 +2255,7 @@ impl UnresolvedWorkload {
             service: self.service,
             host_interfaces: self.host_interfaces,
             http_handler: http_handler.clone(),
+            binding_ledger,
             #[cfg(feature = "wasi-tls")]
             tls_provider: self.tls_provider,
         };
@@ -2229,8 +2267,8 @@ impl UnresolvedWorkload {
                 error = ?e,
                 "failed to link components, unbinding all plugins"
             );
-            let _ = resolved_workload.unbind_all_plugins().await;
-            bail!(e);
+            let cleanup = resolved_workload.unbind_all_plugins().await;
+            return Err(with_cleanup_error(e, cleanup));
         }
 
         // Canonicalize component volume mounts up front so bad paths fail at
@@ -2242,19 +2280,25 @@ impl UnresolvedWorkload {
             .keys()
             .cloned()
             .collect();
-        resolved_workload
+        if let Err(error) = resolved_workload
             .resolve_component_volume_mounts(&all_component_ids)
-            .await?;
+            .await
+        {
+            let error = error.context("failed to resolve component volume mounts");
+            let cleanup = resolved_workload.unbind_all_plugins().await;
+            return Err(with_cleanup_error(error, cleanup));
+        }
 
         // Notify plugins of the resolved workload
-        for (plugin, component_ids) in bound_plugins.iter() {
+        for binding in &resolved_workload.binding_ledger.plugins {
+            let plugin = &binding.plugin;
             debug!(
                 plugin_id = plugin.id(),
-                component_count = component_ids.len(),
+                component_count = binding.item_ids.len(),
                 "notifying plugin of resolved workload"
             );
             // Call on_workload_resolved for each component this plugin is bound to
-            for component_id in component_ids {
+            for component_id in &binding.item_ids {
                 if let Err(e) = plugin
                     .on_workload_resolved(&resolved_workload, component_id.as_str())
                     .await
@@ -2266,24 +2310,29 @@ impl UnresolvedWorkload {
                         error = ?e,
                         "failed to notify plugin of resolved workload, unbinding all plugins"
                     );
-                    let _ = resolved_workload.unbind_all_plugins().await;
-                    bail!(e);
+                    let cleanup = resolved_workload.unbind_all_plugins().await;
+                    return Err(with_cleanup_error(e, cleanup));
                 }
             }
         }
 
-        if let Some(component_id) = incoming_http_component
-            && let Err(e) = http_handler
+        if let Some(component_id) = incoming_http_component {
+            if let Err(e) = http_handler
                 .on_workload_resolved(&resolved_workload, &component_id)
                 .await
-        {
-            warn!(
-                component_id = component_id,
-                error = ?e,
-                "failed to notify HTTP handler of resolved workload, unbinding all plugins"
-            );
-            let _ = resolved_workload.unbind_all_plugins().await;
-            bail!(e);
+            {
+                warn!(
+                    component_id = component_id,
+                    error = ?e,
+                    "failed to notify HTTP handler of resolved workload, unbinding all plugins"
+                );
+                let cleanup = resolved_workload.unbind_all_plugins().await;
+                return Err(with_cleanup_error(e, cleanup));
+            }
+            resolved_workload
+                .binding_ledger
+                .http_registered
+                .store(true, Ordering::Release);
         }
 
         Ok(resolved_workload)

@@ -9,7 +9,7 @@
 //! - [`Host`] - The main runtime that manages workloads and plugins
 //! - [`HostBuilder`] - Builder for configuring host settings
 //! - [`HostApi`] - Trait defining the host's external API
-//! - [`HostWorkload`] - Internal representation of workload states
+//! - [`WorkloadEntry`] - Internal representation of workload states
 //!
 //! # Architecture
 //!
@@ -43,13 +43,16 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use names::{Generator, Name};
-use tokio::sync::RwLock;
-use tracing::{debug, info, instrument, trace, warn};
+use tokio::sync::{Notify, RwLock};
+use tracing::{info, instrument, warn};
 use wasmtime::component::Component;
 
 use crate::engine::workload::ResolvedWorkload;
@@ -153,14 +156,10 @@ impl<T: HostApi> HostApi for Arc<T> {
     }
 }
 
-/// Internal representation of a workload's state within the host.
-///
-/// This enum tracks the lifecycle stages of a workload from starting
-/// through running to stopping or error states.
+/// Public workload lifecycle state.
 #[derive(Debug, Clone)]
 pub enum HostWorkload {
     Starting,
-    // Boxed to reduce size of the enum
     Running(Box<ResolvedWorkload>),
     Stopping,
     Error(String),
@@ -169,21 +168,135 @@ pub enum HostWorkload {
 impl std::fmt::Display for HostWorkload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HostWorkload::Starting => write!(f, "Starting"),
-            HostWorkload::Running(_) => write!(f, "Running"),
-            HostWorkload::Stopping => write!(f, "Stopping"),
-            HostWorkload::Error(err) => write!(f, "Error: {err}"),
+            Self::Starting => write!(f, "Starting"),
+            Self::Running(_) => write!(f, "Running"),
+            Self::Stopping => write!(f, "Stopping"),
+            Self::Error(error) => write!(f, "Error: {error}"),
         }
     }
 }
 
 impl From<&HostWorkload> for WorkloadState {
-    fn from(hw: &HostWorkload) -> Self {
-        match hw {
+    fn from(workload: &HostWorkload) -> Self {
+        match workload {
             HostWorkload::Starting => WorkloadState::Starting,
             HostWorkload::Running(_) => WorkloadState::Running,
             HostWorkload::Stopping => WorkloadState::Stopping,
             HostWorkload::Error(_) => WorkloadState::Error,
+        }
+    }
+}
+
+/// Internal representation of a workload's state within the host.
+///
+/// This enum tracks the lifecycle stages of a workload from starting
+/// through running to stopping or error states.
+#[derive(Debug, Clone)]
+enum WorkloadEntry {
+    Starting {
+        generation: u64,
+        cancelled: Arc<AtomicBool>,
+        finished: Arc<Notify>,
+    },
+    Running {
+        generation: u64,
+        workload: Box<ResolvedWorkload>,
+    },
+    Stopping {
+        generation: u64,
+        completion: Arc<StopCompletion>,
+    },
+    Error {
+        generation: u64,
+        message: String,
+    },
+}
+
+#[derive(Debug, Default)]
+struct StopCompletion {
+    finished: Notify,
+    result: std::sync::Mutex<Option<Result<(), String>>>,
+}
+
+impl StopCompletion {
+    async fn wait(&self) -> Result<(), String> {
+        loop {
+            let notified = self.finished.notified();
+            if let Some(result) = self
+                .result
+                .lock()
+                .expect("stop result lock poisoned")
+                .clone()
+            {
+                return result;
+            }
+            notified.await;
+        }
+    }
+
+    fn complete(&self, result: Result<(), String>) {
+        *self.result.lock().expect("stop result lock poisoned") = Some(result);
+        self.finished.notify_waiters();
+    }
+}
+
+struct StartCompletionGuard {
+    workload_id: String,
+    generation: u64,
+    workloads: Arc<RwLock<HashMap<String, WorkloadEntry>>>,
+    finished: Arc<Notify>,
+    completed: bool,
+}
+
+impl Drop for StartCompletionGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let workload_id = self.workload_id.clone();
+        let generation = self.generation;
+        let workloads = Arc::clone(&self.workloads);
+        let finished = Arc::clone(&self.finished);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let mut entries = workloads.write().await;
+                if matches!(entries.get(&workload_id), Some(WorkloadEntry::Starting { generation: current, .. }) if *current == generation)
+                {
+                    entries.insert(
+                        workload_id,
+                        WorkloadEntry::Error {
+                            generation,
+                            message: "workload start task panicked".to_string(),
+                        },
+                    );
+                }
+                drop(entries);
+                finished.notify_waiters();
+            });
+        } else {
+            finished.notify_waiters();
+        }
+    }
+}
+
+impl std::fmt::Display for WorkloadEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkloadEntry::Starting { .. } => write!(f, "Starting"),
+            WorkloadEntry::Running { .. } => write!(f, "Running"),
+            WorkloadEntry::Stopping { .. } => write!(f, "Stopping"),
+            WorkloadEntry::Error { message, .. } => write!(f, "Error: {message}"),
+        }
+    }
+}
+
+impl From<&WorkloadEntry> for WorkloadState {
+    fn from(hw: &WorkloadEntry) -> Self {
+        match hw {
+            WorkloadEntry::Starting { .. } => WorkloadState::Starting,
+            WorkloadEntry::Running { .. } => WorkloadState::Running,
+            WorkloadEntry::Stopping { .. } => WorkloadState::Stopping,
+            WorkloadEntry::Error { .. } => WorkloadState::Error,
         }
     }
 }
@@ -198,7 +311,8 @@ impl From<&HostWorkload> for WorkloadState {
 pub struct Host {
     engine: Engine,
     /// Workloads mapped from ID to the workload and its current state
-    workloads: Arc<RwLock<HashMap<String, HostWorkload>>>,
+    workloads: Arc<RwLock<HashMap<String, WorkloadEntry>>>,
+    workload_generation: AtomicU64,
     /// Plugins in a map from their ID to the plugin itself
     plugins: HashMap<&'static str, Arc<dyn HostPlugin>>,
     /// Host metadata
@@ -326,10 +440,12 @@ impl Host {
     pub async fn start(self) -> anyhow::Result<Arc<Self>> {
         self.http_handler.inject_meters(&self.meters).await;
 
-        self.http_handler
-            .start()
-            .await
-            .context("failed to start HTTP handler")?;
+        if let Err(error) = self.http_handler.start().await {
+            if let Err(cleanup_error) = self.http_handler.stop().await {
+                tracing::error!(error = ?cleanup_error, "failed to roll back HTTP handler startup");
+            }
+            return Err(error).context("failed to start HTTP handler");
+        }
 
         // A plugin can fail a workload out of band (a host component plugin
         // evicting one whose lifecycle bind crash-loops). Give each plugin a
@@ -338,17 +454,26 @@ impl Host {
         let (failure_tx, failure_rx) = tokio::sync::mpsc::unbounded_channel();
         let failure_sink = WorkloadFailureSink::new(failure_tx);
 
-        // Start all plugins, any errors means the host fails to start. The
-        // failure sink is injected before `start` so a plugin that evicts a
-        // workload immediately still has somewhere to report it.
+        let mut started_plugins: Vec<(&'static str, Arc<dyn HostPlugin>)> = Vec::new();
         for (id, plugin) in &self.plugins {
             plugin.inject_meters(&self.meters).await;
             plugin.set_workload_failure_sink(failure_sink.clone());
-
-            if let Err(e) = plugin.start().await {
-                tracing::error!(id = id, err = ?e, "failed to start plugin");
-                bail!(e)
+            if let Err(error) = plugin.start().await {
+                tracing::error!(id, error = ?error, "failed to start plugin");
+                if let Err(cleanup_error) = plugin.stop().await {
+                    tracing::error!(id, error = ?cleanup_error, "failed to roll back partially started plugin");
+                }
+                for (started_id, started_plugin) in started_plugins.into_iter().rev() {
+                    if let Err(cleanup_error) = started_plugin.stop().await {
+                        tracing::error!(id = started_id, error = ?cleanup_error, "failed to roll back started plugin");
+                    }
+                }
+                if let Err(cleanup_error) = self.http_handler.stop().await {
+                    tracing::error!(error = ?cleanup_error, "failed to roll back HTTP handler");
+                }
+                return Err(error).with_context(|| format!("failed to start plugin {id}"));
             }
+            started_plugins.push((*id, Arc::clone(plugin)));
         }
 
         let host = Arc::new(self);
@@ -372,9 +497,21 @@ impl Host {
             let mut workloads = self.workloads.write().await;
             match workloads.get_mut(workload_id) {
                 Some(slot) => {
-                    let previous = std::mem::replace(slot, HostWorkload::Error(reason.clone()));
+                    let generation = match slot {
+                        WorkloadEntry::Starting { generation, .. }
+                        | WorkloadEntry::Running { generation, .. }
+                        | WorkloadEntry::Stopping { generation, .. }
+                        | WorkloadEntry::Error { generation, .. } => *generation,
+                    };
+                    let previous = std::mem::replace(
+                        slot,
+                        WorkloadEntry::Error {
+                            generation,
+                            message: reason.clone(),
+                        },
+                    );
                     match previous {
-                        HostWorkload::Running(rw) => Some(*rw),
+                        WorkloadEntry::Running { workload, .. } => Some(*workload),
                         // Not running (starting/stopping/already error): leave the
                         // Error we just wrote, nothing to tear down.
                         _ => None,
@@ -405,10 +542,27 @@ impl Host {
     /// # Returns
     /// Ok if the shutdown process completes (even with plugin errors).
     pub async fn stop(self: Arc<Self>) -> anyhow::Result<()> {
-        self.http_handler
+        let http_result = self
+            .http_handler
             .stop()
             .await
-            .context("failed to stop HTTP handler")?;
+            .context("failed to stop HTTP handler");
+
+        let workload_ids = self
+            .workloads
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for workload_id in workload_ids {
+            if let Err(error) = self
+                .workload_stop(WorkloadStopRequest { workload_id })
+                .await
+            {
+                warn!(error = ?error, "failed to stop workload during host shutdown");
+            }
+        }
 
         // Stop all plugins, log errors but continue stopping others. The cap
         // must outlast the plugin-stop budget: a host component plugin's
@@ -438,7 +592,7 @@ impl Host {
             }
         }
 
-        Ok(())
+        http_result
     }
 
     /// Get a label value by key.
@@ -610,32 +764,6 @@ impl Host {
         let monitor = self.system_monitor.read().await;
         Ok(monitor.cpu_usage().global_usage)
     }
-
-    async fn workload_start_inner(
-        &self,
-        request: WorkloadStartRequest,
-    ) -> anyhow::Result<ResolvedWorkload> {
-        let service_present = request.workload.service.is_some();
-
-        // Initialize the workload using the engine, receiving the unresolved workload
-        let unresolved_workload = self
-            .engine
-            .initialize_workload(&request.workload_id, request.workload)?;
-
-        let mut resolved_workload = unresolved_workload
-            .resolve(Some(&self.plugins), self.http_handler.clone())
-            .await?;
-
-        // If the service didn't run and we had one, warn
-        if service_present && resolved_workload.execute_service().await?.is_none() {
-            warn!(
-                workload_id = request.workload_id,
-                "service did not properly execute"
-            );
-        }
-
-        Ok(resolved_workload)
-    }
 }
 
 impl HostApi for Host {
@@ -663,7 +791,7 @@ impl HostApi for Host {
             let workload_count: u64 = workloads.len() as u64;
             let mut component_count: u64 = 0;
             for workload in workloads.values() {
-                if let HostWorkload::Running(workload) = workload {
+                if let WorkloadEntry::Running { workload, .. } = workload {
                     component_count += workload.component_count().await as u64;
                 }
             }
@@ -708,50 +836,137 @@ impl HostApi for Host {
         &self,
         request: WorkloadStartRequest,
     ) -> anyhow::Result<WorkloadStartResponse> {
-        // Reserve the workload ID while holding the write lock so concurrent
-        // starts cannot both observe it as available. An ID remains reserved
-        // in every lifecycle state until workload_stop removes it.
+        let workload_id = request.workload_id.clone();
+        let generation = self.workload_generation.fetch_add(1, Ordering::Relaxed);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(Notify::new());
         {
             let mut workloads = self.workloads.write().await;
-            if workloads.contains_key(&request.workload_id) {
+            if workloads.contains_key(&workload_id) {
                 return Ok(WorkloadStartResponse {
                     workload_status: WorkloadStatus {
-                        workload_id: request.workload_id.clone(),
+                        workload_id,
                         workload_state: WorkloadState::Error,
                         message: format!(
-                            "Workload ID [{}] already exists (the exising workload must be stopped to reuse the ID)",
+                            "Workload ID [{}] already exists (the existing workload must be stopped to reuse the ID)",
                             request.workload_id
                         ),
                     },
                 });
             }
-            workloads.insert(request.workload_id.clone(), HostWorkload::Starting);
+            workloads.insert(
+                workload_id.clone(),
+                WorkloadEntry::Starting {
+                    generation,
+                    cancelled: Arc::clone(&cancelled),
+                    finished: Arc::clone(&finished),
+                },
+            );
         }
 
-        let workload_id = request.workload_id.clone();
-        let resolved_workload = self.workload_start_inner(request).await;
-
-        let (workload_state, message) = if let Err(ref err) = resolved_workload {
-            (WorkloadState::Error, err.to_string())
-        } else {
-            (
-                WorkloadState::Running,
-                "Workload started successfully".to_string(),
-            )
-        };
-
-        // Update the workload state to `Running`
-        self.workloads
-            .write()
-            .await
-            .entry(workload_id.clone())
-            .and_modify(|workload| match resolved_workload {
-                Ok(resolved_workload) => {
-                    *workload = HostWorkload::Running(Box::new(resolved_workload))
+        let task_workload_id = workload_id.clone();
+        let engine = self.engine.clone();
+        let plugins = self.plugins.clone();
+        let http_handler = Arc::clone(&self.http_handler);
+        let workloads = Arc::clone(&self.workloads);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let workload_id = task_workload_id;
+            let mut completion = StartCompletionGuard {
+                workload_id: workload_id.clone(),
+                generation,
+                workloads: Arc::clone(&workloads),
+                finished: Arc::clone(&finished),
+                completed: false,
+            };
+            let service_present = request.workload.service.is_some();
+            let result = async {
+                let unresolved = engine
+                    .initialize_workload(&request.workload_id, request.workload)
+                    .context("failed to initialize workload")?;
+                let mut resolved = unresolved
+                    .resolve(Some(&plugins), Arc::clone(&http_handler))
+                    .await
+                    .context("failed to resolve workload")?;
+                match resolved.execute_service().await {
+                    Ok(None) if service_present => {
+                        warn!(workload_id, "service did not properly execute");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        resolved.stop_service();
+                        let cleanup = resolved.unbind_all_plugins().await;
+                        return Err(match cleanup {
+                            Ok(()) => error,
+                            Err(cleanup_error) => error.context(format!(
+                                "failed to clean up workload after service error: {cleanup_error:#}"
+                            )),
+                        });
+                    }
                 }
-                Err(err) => *workload = HostWorkload::Error(err.to_string()),
-            });
+                Ok::<_, anyhow::Error>(resolved)
+            }
+            .await;
 
+            let response = match result {
+                Ok(resolved) if cancelled.load(Ordering::Acquire) => {
+                    resolved.stop_service();
+                    if let Err(error) = resolved.unbind_all_plugins().await {
+                        warn!(workload_id, error = ?error, "failed to roll back cancelled workload start");
+                    }
+                    (
+                        WorkloadState::Stopping,
+                        "Workload start cancelled".to_string(),
+                        None,
+                    )
+                }
+                Ok(resolved) => (
+                    WorkloadState::Running,
+                    "Workload started successfully".to_string(),
+                    Some(WorkloadEntry::Running {
+                        generation,
+                        workload: Box::new(resolved),
+                    }),
+                ),
+                Err(error) => {
+                    let message = error.to_string();
+                    (
+                        WorkloadState::Error,
+                        message.clone(),
+                        Some(WorkloadEntry::Error {
+                            generation,
+                            message,
+                        }),
+                    )
+                }
+            };
+
+            let mut entries = workloads.write().await;
+            let current_generation = entries.get(&workload_id).map(|entry| match entry {
+                WorkloadEntry::Starting { generation, .. }
+                | WorkloadEntry::Running { generation, .. }
+                | WorkloadEntry::Stopping { generation, .. }
+                | WorkloadEntry::Error { generation, .. } => *generation,
+            });
+            if current_generation == Some(generation) {
+                match response.2 {
+                    Some(state) => {
+                        entries.insert(workload_id.clone(), state);
+                    }
+                    None => {
+                        entries.remove(&workload_id);
+                    }
+                }
+            }
+            drop(entries);
+            finished.notify_waiters();
+            let _ = result_tx.send((response.0, response.1));
+            completion.completed = true;
+        });
+
+        let (workload_state, message) = result_rx
+            .await
+            .context("workload start task terminated before reporting its result")?;
         Ok(WorkloadStartResponse {
             workload_status: WorkloadStatus {
                 workload_id,
@@ -792,62 +1007,100 @@ impl HostApi for Host {
         &self,
         request: WorkloadStopRequest,
     ) -> anyhow::Result<WorkloadStopResponse> {
-        let has_workload = self
-            .workloads
-            .read()
-            .await
-            .contains_key(&request.workload_id);
-
-        let (workload_state, message) = if has_workload {
-            // Update state to stopping
-            let resolved_workload = {
-                let mut workloads = self.workloads.write().await;
-                trace!(
-                    workload_id = request.workload_id,
-                    "updating workload state to stopping"
-                );
-                // Insert Stopping state, extract the running workload if it was running
-                workloads
-                    .insert(request.workload_id.clone(), HostWorkload::Stopping)
-                    .and_then(|hw| match hw {
-                        HostWorkload::Running(rw) => Some(*rw),
-                        _ => None,
-                    })
+        let mut found = false;
+        let resolved_workload = loop {
+            let mut workloads = self.workloads.write().await;
+            let starting = match workloads.get(&request.workload_id) {
+                Some(WorkloadEntry::Starting {
+                    cancelled,
+                    finished,
+                    ..
+                }) => Some((Arc::clone(cancelled), Arc::clone(finished))),
+                _ => None,
             };
-
-            // Stop the workload:
-            // 1. Unbind from all plugins
-            // 2. Clean up resources (drop will handle wasmtime cleanup)
-            // 3. Remove from active workloads
-            if let Some(resolved_workload) = resolved_workload {
-                debug!(
-                    workload_id = request.workload_id,
-                    workload_name = resolved_workload.name(),
-                    "stopping workload"
-                );
-
-                // Stop the service if running
-                resolved_workload.stop_service();
-
-                // Unbind all plugins from the workload
-                if let Err(e) = resolved_workload.unbind_all_plugins().await {
-                    warn!(
-                        workload_id = request.workload_id,
-                        error = ?e,
-                        "error unbinding plugins during workload stop, continuing"
-                    );
-                }
+            if let Some((cancelled, finished)) = starting {
+                found = true;
+                cancelled.store(true, Ordering::Release);
+                let notified = finished.notified();
+                drop(workloads);
+                notified.await;
+                continue;
             }
+            match workloads.remove(&request.workload_id) {
+                Some(WorkloadEntry::Starting { .. }) => {
+                    unreachable!("starting workload was checked while holding the write lock")
+                }
+                Some(WorkloadEntry::Running {
+                    generation,
+                    workload,
+                }) => {
+                    found = true;
+                    let completion = Arc::new(StopCompletion::default());
+                    workloads.insert(
+                        request.workload_id.clone(),
+                        WorkloadEntry::Stopping {
+                            generation,
+                            completion: Arc::clone(&completion),
+                        },
+                    );
+                    break Some((generation, *workload, completion));
+                }
+                Some(WorkloadEntry::Stopping {
+                    generation,
+                    completion,
+                }) => {
+                    found = true;
+                    workloads.insert(
+                        request.workload_id.clone(),
+                        WorkloadEntry::Stopping {
+                            generation,
+                            completion: Arc::clone(&completion),
+                        },
+                    );
+                    drop(workloads);
+                    completion.wait().await.map_err(anyhow::Error::msg)?;
+                    break None;
+                }
+                Some(WorkloadEntry::Error { .. }) => {
+                    found = true;
+                    break None;
+                }
+                None => break None,
+            }
+        };
 
-            // Remove the workload from the active workloads map
-            // This will drop the workload and clean up wasmtime resources
+        if let Some((generation, resolved_workload, completion)) = resolved_workload {
+            let workload_id = request.workload_id.clone();
+            let workloads = Arc::clone(&self.workloads);
+            let teardown = tokio::spawn(async move {
+                resolved_workload.stop_service();
+                resolved_workload
+                    .unbind_all_plugins()
+                    .await
+                    .map_err(|error| format!("error unbinding workload: {error:#}"))
+            });
+            let task_completion = Arc::clone(&completion);
+            tokio::spawn(async move {
+                let result = match teardown.await {
+                    Ok(result) => result,
+                    Err(error) => Err(format!("workload teardown task panicked: {error}")),
+                };
+                if let Err(error) = &result {
+                    warn!(workload_id, error, "error stopping workload, continuing");
+                }
+                let mut entries = workloads.write().await;
+                if matches!(entries.get(&workload_id), Some(WorkloadEntry::Stopping { generation: current, .. }) if *current == generation)
+                {
+                    entries.remove(&workload_id);
+                }
+                drop(entries);
+                task_completion.complete(result);
+            });
+            completion.wait().await.map_err(anyhow::Error::msg)?;
+        } else if !found {
             self.workloads.write().await.remove(&request.workload_id);
-
-            debug!(
-                workload_id = request.workload_id,
-                "workload stopped successfully"
-            );
-
+        }
+        let (workload_state, message) = if found {
             (
                 WorkloadState::Stopping,
                 "Workload stopped successfully".to_string(),
@@ -1141,6 +1394,7 @@ impl HostBuilder {
         Ok(Host {
             engine,
             workloads: Arc::default(),
+            workload_generation: AtomicU64::new(1),
             plugins: self.plugins,
             id: self.id,
             hostname,
@@ -1257,7 +1511,7 @@ mod tests {
         assert_eq!(workloads.len(), 1);
         assert!(matches!(
             workloads.get("duplicate"),
-            Some(HostWorkload::Running(_))
+            Some(WorkloadEntry::Running { .. })
         ));
     }
 
@@ -1296,6 +1550,61 @@ mod tests {
             1
         );
         assert_eq!(host.workloads.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_waits_for_host_owned_start_completion() {
+        let host = Arc::new(Host::builder().build().expect("failed to build host"));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(Notify::new());
+        host.workloads.write().await.insert(
+            "starting".to_string(),
+            WorkloadEntry::Starting {
+                generation: 7,
+                cancelled: Arc::clone(&cancelled),
+                finished: Arc::clone(&finished),
+            },
+        );
+
+        let stop_host = Arc::clone(&host);
+        let mut stop = tokio::spawn(async move {
+            stop_host
+                .workload_stop(WorkloadStopRequest {
+                    workload_id: "starting".to_string(),
+                })
+                .await
+        });
+        while !cancelled.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut stop)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            host.workloads.read().await.get("starting"),
+            Some(WorkloadEntry::Starting { generation: 7, .. })
+        ));
+
+        stop.abort();
+        stop.await.expect_err("first stop caller should be aborted");
+        let later_host = Arc::clone(&host);
+        let later_stop = tokio::spawn(async move {
+            later_host
+                .workload_stop(WorkloadStopRequest {
+                    workload_id: "starting".to_string(),
+                })
+                .await
+        });
+        host.workloads.write().await.remove("starting");
+        finished.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), later_stop)
+            .await
+            .expect("later stop caller should complete")
+            .unwrap()
+            .unwrap();
+        assert!(!host.workloads.read().await.contains_key("starting"));
     }
 
     #[tokio::test]

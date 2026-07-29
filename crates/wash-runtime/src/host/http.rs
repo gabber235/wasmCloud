@@ -772,6 +772,36 @@ pub type MessagingHandlers = Arc<RwLock<HashMap<String, tokio::sync::mpsc::Sende
 /// ```
 ///
 /// [`deliver_trigger_service_message`]: HostHandler::deliver_trigger_service_message
+#[derive(Default)]
+struct HttpStopCompletion {
+    finished: tokio::sync::Notify,
+    result: std::sync::Mutex<Option<Result<(), String>>>,
+}
+
+impl HttpStopCompletion {
+    async fn wait(&self) -> anyhow::Result<()> {
+        loop {
+            let notified = self.finished.notified();
+            if let Some(result) = self.result.lock().expect("HTTP stop lock poisoned").clone() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            notified.await;
+        }
+    }
+
+    fn complete(&self, result: Result<(), String>) {
+        *self.result.lock().expect("HTTP stop lock poisoned") = Some(result);
+        self.finished.notify_waiters();
+    }
+}
+
+enum HttpLifecycle {
+    Idle,
+    Running(tokio::task::JoinHandle<anyhow::Result<()>>),
+    Stopping(Arc<HttpStopCompletion>),
+    Stopped(Arc<HttpStopCompletion>),
+}
+
 pub struct Ingress<T: Router, O: OutgoingHandler = DefaultOutgoingHandler> {
     router: Arc<T>,
     outgoing_handler: O,
@@ -784,6 +814,7 @@ pub struct Ingress<T: Router, O: OutgoingHandler = DefaultOutgoingHandler> {
     shutdown_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
     tls_acceptor: Option<TlsAcceptor>,
     listener: Arc<tokio::sync::Mutex<Option<TcpListener>>>,
+    lifecycle: Arc<tokio::sync::Mutex<HttpLifecycle>>,
     meters: RwLock<Meters>,
 }
 
@@ -903,6 +934,7 @@ impl<T: Router, O: OutgoingHandler> IngressBuilder<T, O> {
             shutdown_tx: Arc::new(RwLock::new(None)),
             tls_acceptor,
             listener: Arc::new(tokio::sync::Mutex::new(Some(listener))),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(HttpLifecycle::Idle)),
             meters: Default::default(),
         })
     }
@@ -966,8 +998,8 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
         // to the workload based on host header.
         let handler = self.router.clone();
         let fuel_meter = self.meters.read().await.fuel_consumption.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_http_server(
+        let task = tokio::spawn(async move {
+            run_http_server(
                 listener,
                 handler,
                 workload_handles,
@@ -977,20 +1009,62 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
                 fuel_meter,
             )
             .await
-            {
-                error!(err = ?e, addr = ?addr, "HTTP server error");
-            }
         });
+        *self.lifecycle.lock().await = HttpLifecycle::Running(task);
         Ok(())
     }
 
     async fn stop(&self) -> anyhow::Result<()> {
         info!(addr = ?self.addr, "HTTP server stopping");
-        let mut shutdown_guard = self.shutdown_tx.write().await;
-        if let Some(tx) = shutdown_guard.take() {
-            let _ = tx.send(()).await;
-        }
-        Ok(())
+        let (task, completion) = {
+            let mut lifecycle = self.lifecycle.lock().await;
+            match &*lifecycle {
+                HttpLifecycle::Stopping(completion) | HttpLifecycle::Stopped(completion) => {
+                    let completion = Arc::clone(completion);
+                    drop(lifecycle);
+                    return completion.wait().await;
+                }
+                HttpLifecycle::Idle => return Ok(()),
+                HttpLifecycle::Running(_) => {}
+            }
+            let HttpLifecycle::Running(task) =
+                std::mem::replace(&mut *lifecycle, HttpLifecycle::Idle)
+            else {
+                unreachable!("HTTP lifecycle changed while locked")
+            };
+            let completion = Arc::new(HttpStopCompletion::default());
+            *lifecycle = HttpLifecycle::Stopping(Arc::clone(&completion));
+            (task, completion)
+        };
+        let shutdown_tx = Arc::clone(&self.shutdown_tx);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let task_completion = Arc::clone(&completion);
+        let teardown = tokio::spawn(async move {
+            if let Some(tx) = shutdown_tx.write().await.take() {
+                let _ = tx.send(()).await;
+            }
+            let mut task = task;
+            match tokio::time::timeout(Duration::from_secs(11), &mut task).await {
+                Ok(result) => result
+                    .context("HTTP server task panicked")
+                    .and_then(|result| result)
+                    .map_err(|error| error.to_string()),
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    Err("timed out draining HTTP connections".to_string())
+                }
+            }
+        });
+        tokio::spawn(async move {
+            let result = match teardown.await {
+                Ok(result) => result,
+                Err(error) => Err(format!("HTTP stop task panicked: {error}")),
+            };
+            *lifecycle.lock().await = HttpLifecycle::Stopped(Arc::clone(&task_completion));
+            task_completion.complete(result);
+        });
+        completion.wait().await
     }
 
     fn port(&self) -> u16 {
@@ -1222,11 +1296,14 @@ async fn run_http_server<T: Router>(
     tls_acceptor: Option<TlsAcceptor>,
     fuel_meter: FuelConsumptionMeter,
 ) -> anyhow::Result<()> {
+    let mut connections = tokio::task::JoinSet::new();
+    let (connection_shutdown_tx, _) = tokio::sync::watch::channel(false);
     loop {
         tokio::select! {
             // Handle shutdown signal
             _ = shutdown_rx.recv() => {
                 info!("HTTP server received shutdown signal");
+                let _ = connection_shutdown_tx.send(true);
                 break;
             }
             // Accept new connections
@@ -1242,7 +1319,8 @@ async fn run_http_server<T: Router>(
                         let tls_acceptor_clone = tls_acceptor.clone();
                         let handler_clone = handler.clone();
                         let fuel_meter = fuel_meter.clone();
-                        tokio::spawn(async move {
+                        let mut connection_shutdown = connection_shutdown_tx.subscribe();
+                        connections.spawn(async move {
                             let service = hyper::service::service_fn(move |req| {
                                 let handles = handles_clone.clone();
                                 let service_handlers = service_handlers_clone.clone();
@@ -1273,9 +1351,16 @@ async fn run_http_server<T: Router>(
                                 // Handle HTTPS connection
                                 match acceptor.accept(client).await {
                                     Ok(tls_stream) => {
-                                        builder
-                                            .serve_connection_with_upgrades(TokioIo::new(tls_stream), service)
-                                            .await
+                                        let connection = builder
+                                            .serve_connection_with_upgrades(TokioIo::new(tls_stream), service);
+                                        tokio::pin!(connection);
+                                        tokio::select! {
+                                            result = &mut connection => result,
+                                            _ = connection_shutdown.changed() => {
+                                                connection.as_mut().graceful_shutdown();
+                                                connection.await
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         error!(addr = ?client_addr, err = ?e, "TLS handshake failed");
@@ -1284,9 +1369,16 @@ async fn run_http_server<T: Router>(
                                 }
                             } else {
                                 // Handle HTTP/h2c connection
-                                builder
-                                    .serve_connection_with_upgrades(TokioIo::new(client), service)
-                                    .await
+                                let connection = builder
+                                    .serve_connection_with_upgrades(TokioIo::new(client), service);
+                                tokio::pin!(connection);
+                                tokio::select! {
+                                    result = &mut connection => result,
+                                    _ = connection_shutdown.changed() => {
+                                        connection.as_mut().graceful_shutdown();
+                                        connection.await
+                                    }
+                                }
                             };
 
                             if let Err(e) = result {
@@ -1302,7 +1394,20 @@ async fn run_http_server<T: Router>(
         }
     }
 
-    Ok(())
+    let drain = async {
+        while let Some(result) = connections.join_next().await {
+            result.context("HTTP connection task panicked")?;
+        }
+        anyhow::Ok(())
+    };
+    match tokio::time::timeout(Duration::from_secs(10), drain).await {
+        Ok(result) => result,
+        Err(_) => {
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+            anyhow::bail!("timed out draining HTTP connections")
+        }
+    }
 }
 
 /// Build an error response with the given status code.
@@ -2302,6 +2407,45 @@ mod tests {
     use super::*;
     use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
     use wasmtime_wasi_http::p2::types::OutgoingRequestConfig;
+
+    #[tokio::test]
+    async fn aborting_first_stop_caller_does_not_strand_http_lifecycle() {
+        let server = Arc::new(
+            Ingress::new(DevRouter::default(), "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        let release = Arc::new(tokio::sync::Notify::new());
+        let task_release = Arc::clone(&release);
+        *server.lifecycle.lock().await = HttpLifecycle::Running(tokio::spawn(async move {
+            task_release.notified().await;
+            Ok(())
+        }));
+
+        let first_server = Arc::clone(&server);
+        let first_stop = tokio::spawn(async move { first_server.stop().await });
+        loop {
+            if matches!(*server.lifecycle.lock().await, HttpLifecycle::Stopping(_)) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        first_stop.abort();
+        first_stop
+            .await
+            .expect_err("first stop caller should be aborted");
+
+        release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), server.stop())
+            .await
+            .expect("later stop caller should complete")
+            .unwrap();
+        assert!(matches!(
+            *server.lifecycle.lock().await,
+            HttpLifecycle::Stopped(_)
+        ));
+        assert!(server.shutdown_tx.read().await.is_none());
+    }
 
     fn build_request(uri: &str) -> hyper::Request<HyperOutgoingBody> {
         hyper::Request::builder()

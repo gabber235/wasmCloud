@@ -13,7 +13,6 @@ use crate::engine::workload::WorkloadItem;
 use crate::plugin::{HostPlugin, WitInterfaces};
 use crate::wit::{WitInterface, WitWorld};
 use tracing::instrument;
-use wasmtime::bail;
 
 const PLUGIN_LOGGING_ID: &str = "wasi-logging";
 
@@ -24,16 +23,52 @@ mod bindings {
     });
 }
 
-use bindings::wasi::logging::logging::Level;
+pub use bindings::wasi::logging::logging::Level;
 use tokio::sync::RwLock;
 
 type ComponentMap = Arc<RwLock<HashMap<String, ComponentInfo>>>;
 
+/// A log event emitted by a workload component.
+#[derive(Clone, Debug)]
+pub struct LogRecord {
+    pub level: Level,
+    pub context: String,
+    pub message: String,
+    pub workload_name: String,
+    pub workload_namespace: String,
+    pub component_id: String,
+}
+
+/// A synchronous destination for component log events.
+pub trait LogSink: Send + Sync + 'static {
+    fn log(&self, record: LogRecord);
+}
+
+impl<F> LogSink for F
+where
+    F: Fn(LogRecord) + Send + Sync + 'static,
+{
+    fn log(&self, record: LogRecord) {
+        self(record);
+    }
+}
+
 #[derive(Default)]
 pub struct TracingLogger {
     components: ComponentMap,
+    sink: Option<Arc<dyn LogSink>>,
 }
 
+impl TracingLogger {
+    pub fn with_sink(sink: impl LogSink) -> Self {
+        Self {
+            components: ComponentMap::default(),
+            sink: Some(Arc::new(sink)),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct ComponentInfo {
     workload_name: String,
     workload_namespace: String,
@@ -50,15 +85,18 @@ impl<'a> bindings::wasi::logging::logging::Host for ActiveCtx<'a> {
     ) -> wasmtime::Result<()> {
         let plugin = self.try_get_plugin::<TracingLogger>(PLUGIN_LOGGING_ID)?;
 
-        let workloads = plugin.components.read().await;
-        let Some(ComponentInfo {
+        let component = plugin
+            .components
+            .read()
+            .await
+            .get(&self.component_id.to_string())
+            .cloned()
+            .ok_or_else(|| wasmtime::format_err!("Component not found in TracingLogger plugin"))?;
+        let ComponentInfo {
             workload_name,
             workload_namespace,
             component_id,
-        }) = workloads.get(&self.component_id.to_string())
-        else {
-            bail!("Component not found in TracingLogger plugin");
-        };
+        } = component;
         match level {
             Level::Trace => {
                 tracing::trace!(
@@ -116,6 +154,17 @@ impl<'a> bindings::wasi::logging::logging::Host for ActiveCtx<'a> {
             }
         };
 
+        if let Some(sink) = &plugin.sink {
+            sink.log(LogRecord {
+                level,
+                context,
+                message,
+                workload_name,
+                workload_namespace,
+                component_id,
+            });
+        }
+
         Ok(())
     }
 }
@@ -163,5 +212,43 @@ impl HostPlugin for TracingLogger {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{Level, LogRecord, TracingLogger};
+
+    #[test]
+    fn sink_receives_original_record_without_a_subscriber() {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&records);
+        let logger = TracingLogger::with_sink(move |record| {
+            if let Ok(mut records) = captured.lock() {
+                records.push(record);
+            }
+        });
+        let record = LogRecord {
+            level: Level::Warn,
+            context: "request-42".to_string(),
+            message: "careful".to_string(),
+            workload_name: "worker".to_string(),
+            workload_namespace: "default".to_string(),
+            component_id: "logger".to_string(),
+        };
+        if let Some(sink) = &logger.sink {
+            sink.log(record);
+        }
+
+        let records = records.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(records.len(), 1);
+        assert!(matches!(records[0].level, Level::Warn));
+        assert_eq!(records[0].context, "request-42");
+        assert_eq!(records[0].message, "careful");
+        assert_eq!(records[0].workload_name, "worker");
+        assert_eq!(records[0].workload_namespace, "default");
+        assert_eq!(records[0].component_id, "logger");
     }
 }
