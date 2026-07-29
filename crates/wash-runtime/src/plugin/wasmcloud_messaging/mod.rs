@@ -3,7 +3,11 @@ mod in_memory;
 mod multiplexed;
 mod nats;
 
-pub use in_memory::InMemoryMessaging;
+pub use in_memory::{
+    HostMessage, InMemoryMessaging, InMemoryMessagingDriver, MessageOrigin, MessagingError,
+    ObservationReceiver, ObservedMessage, ObservedOperation, ResponderReceiver, ResponderRequest,
+    TraceContext as InMemoryTraceContext,
+};
 #[cfg(feature = "wasm_component_model_implements")]
 pub use multiplexed::{
     BrokerMessage, InMemoryMsgBackend, InMemoryMsgProvider, MsgBackend, MsgId, MsgProvider,

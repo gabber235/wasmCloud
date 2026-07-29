@@ -1,14 +1,16 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::{ResolvedWorkload, UnresolvedWorkload, WorkloadItem};
-use crate::observability::{Meters, PropagationContext, context_from_propagation, inject_context};
+use crate::observability::{Meters, PropagationContext, context_from_propagation};
 use crate::plugin::{HostPlugin, WitInterfaces};
 use crate::wit::{WitInterface, WitWorld};
 use anyhow::Context;
 use opentelemetry::KeyValue;
-use tokio::sync::{Notify, RwLock, oneshot};
+use tokio::sync::{Notify, RwLock, mpsc, oneshot};
 use tracing::{Instrument, debug, instrument, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use wasmtime::component::Accessor;
@@ -46,23 +48,15 @@ fn producer_span(
     span
 }
 
-fn routed_message(message: types::BrokerMessage, span: &tracing::Span) -> RoutedMessage {
-    let propagation = inject_context(&span.context());
-    RoutedMessage {
-        message,
-        propagation: (!propagation.traceparent.is_empty()).then_some(propagation),
-    }
-}
-
 /// A component's message inbox, shared between the publisher side
 /// (`route_to_subscribers`) and the component's processing task.
-#[derive(Clone)]
 struct RoutedMessage {
     message: types::BrokerMessage,
     propagation: Option<PropagationContext>,
+    _activity: Option<Activity>,
 }
 
-type Inbox = Arc<RwLock<VecDeque<RoutedMessage>>>;
+type InboxSender = mpsc::Sender<RoutedMessage>;
 
 mod bindings {
     crate::wasmtime::component::bindgen!({
@@ -77,62 +71,185 @@ use bindings::wasmcloud::messaging::types;
 
 use crate::plugin::WorkloadTracker;
 
-/// Per-workload tracking data. Holds the reply-routing table shared by every
-/// component in the workload; message delivery itself is per-component (see
-/// [`ComponentData`]).
-#[derive(Default)]
-struct WorkloadData {
-    pending_requests: Arc<RwLock<HashMap<String, oneshot::Sender<RoutedMessage>>>>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostMessage {
+    pub subject: String,
+    pub reply_to: Option<String>,
+    pub body: Vec<u8>,
+    pub trace_context: Option<TraceContext>,
 }
 
-type PendingRequests = Arc<RwLock<HashMap<String, oneshot::Sender<RoutedMessage>>>>;
-
-struct PendingRequestGuard {
-    key: String,
-    pending_requests: PendingRequests,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceContext {
+    pub traceparent: String,
+    pub tracestate: Option<String>,
 }
 
-impl PendingRequestGuard {
-    fn new(key: String, pending_requests: PendingRequests) -> Self {
-        Self {
-            key,
-            pending_requests,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageOrigin {
+    Guest,
+    HostInjected,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservedOperation {
+    Publish,
+    Request,
+    Reply,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedMessage {
+    pub operation: ObservedOperation,
+    pub origin: MessageOrigin,
+    pub message: HostMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessagingError {
+    AlreadyReserved,
+    NotBound,
+    Closed,
+    QueueFull,
+    Timeout,
+    AlreadyReplied,
+}
+impl std::fmt::Display for MessagingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::AlreadyReserved => "workload is already reserved",
+            Self::NotBound => "workload is not bound",
+            Self::Closed => "workload is closed",
+            Self::QueueFull => "message queue is full",
+            Self::Timeout => "request timed out",
+            Self::AlreadyReplied => "reply was already sent",
+        })
+    }
+}
+impl std::error::Error for MessagingError {}
+
+pub struct ObservationReceiver(mpsc::Receiver<ObservedMessage>);
+impl ObservationReceiver {
+    pub async fn recv(&mut self) -> Option<ObservedMessage> {
+        self.0.recv().await
+    }
+}
+pub struct ResponderReceiver(mpsc::Receiver<ResponderRequest>);
+impl ResponderReceiver {
+    pub async fn recv(&mut self) -> Option<ResponderRequest> {
+        self.0.recv().await
+    }
+}
+pub struct ResponderRequest {
+    pub message: HostMessage,
+    reply: Option<oneshot::Sender<HostMessage>>,
+}
+impl ResponderRequest {
+    pub fn reply(mut self, message: HostMessage) -> Result<(), MessagingError> {
+        self.reply
+            .take()
+            .ok_or(MessagingError::AlreadyReplied)?
+            .send(message)
+            .map_err(|_| MessagingError::Closed)
+    }
+}
+
+const RESERVED: u8 = 0;
+const BOUND: u8 = 1;
+const CLOSING: u8 = 2;
+const CLOSED: u8 = 3;
+
+const MAX_TOMBSTONES: usize = 1024;
+
+struct Tombstones {
+    subjects: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl Tombstones {
+    fn insert(&mut self, subject: String) {
+        if !self.subjects.insert(subject.clone()) {
+            return;
+        }
+        self.order.push_back(subject);
+        while self.order.len() > MAX_TOMBSTONES {
+            if let Some(expired) = self.order.pop_front() {
+                self.subjects.remove(&expired);
+            }
         }
     }
+
+    fn contains(&self, subject: &str) -> bool {
+        self.subjects.contains(subject)
+    }
+}
+
+struct WorkloadData {
+    lifecycle: AtomicU8,
+    pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<RoutedMessage>>>>,
+    tombstones: Mutex<Tombstones>,
+    observers: RwLock<Vec<mpsc::Sender<ObservedMessage>>>,
+    responders: RwLock<Vec<(String, mpsc::Sender<ResponderRequest>)>>,
+    activity: AtomicUsize,
+    activity_changed: Notify,
+}
+
+impl WorkloadData {
+    fn new(state: u8) -> Self {
+        Self {
+            lifecycle: AtomicU8::new(state),
+            pending_requests: Arc::default(),
+            tombstones: Mutex::new(Tombstones {
+                subjects: HashSet::new(),
+                order: VecDeque::new(),
+            }),
+            observers: RwLock::new(Vec::new()),
+            responders: RwLock::new(Vec::new()),
+            activity: AtomicUsize::new(0),
+            activity_changed: Notify::new(),
+        }
+    }
+    fn require_bound(&self) -> Result<(), MessagingError> {
+        match self.lifecycle.load(Ordering::Acquire) {
+            BOUND => Ok(()),
+            CLOSING | CLOSED => Err(MessagingError::Closed),
+            _ => Err(MessagingError::NotBound),
+        }
+    }
+    fn begin(self: &Arc<Self>) -> Activity {
+        self.activity.fetch_add(1, Ordering::AcqRel);
+        Activity(self.clone())
+    }
+}
+impl Default for WorkloadData {
+    fn default() -> Self {
+        Self::new(BOUND)
+    }
+}
+struct PendingRequestGuard {
+    inbox: String,
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<RoutedMessage>>>>,
 }
 
 impl Drop for PendingRequestGuard {
     fn drop(&mut self) {
-        if let Ok(mut pending_requests) = self.pending_requests.try_write() {
-            pending_requests.remove(&self.key);
-            return;
-        }
-
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let key = self.key.clone();
-        let pending_requests = self.pending_requests.clone();
-        runtime.spawn(async move {
-            pending_requests.write().await.remove(&key);
-        });
+        self.pending.lock().unwrap().remove(&self.inbox);
     }
 }
 
-/// Per-component tracking data. Each handler component has its own subject
-/// subscriptions and inbox queue, so a published message is delivered only to
-/// the components whose subscriptions match its subject.
+struct Activity(Arc<WorkloadData>);
+impl Drop for Activity {
+    fn drop(&mut self) {
+        if self.0.activity.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.activity_changed.notify_waiters();
+        }
+    }
+}
+
 struct ComponentData {
     cancel_token: tokio_util::sync::CancellationToken,
     task_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Subjects this component subscribes to (NATS tokens: `*` one token,
-    /// `>` one or more trailing tokens). Empty means "receive everything",
-    /// preserving the single-handler behavior of earlier versions.
     subscriptions: Vec<String>,
-    /// This component's inbox. `publish`/`request` push matching messages
-    /// here; the component's processing task drains it.
-    inbox: Inbox,
-    notify: Arc<Notify>,
+    inbox: InboxSender,
+    receiver: Option<mpsc::Receiver<RoutedMessage>>,
 }
 
 /// Returns whether `subject` matches NATS subscription `pattern`, where `*`
@@ -167,29 +284,34 @@ fn subscriptions_match(subscriptions: &[String], subject: &str) -> bool {
 async fn route_to_subscribers(
     plugin: &InMemoryMessaging,
     workload_id: &str,
+    data: &Arc<WorkloadData>,
     msg: &RoutedMessage,
-) -> Result<(), String> {
-    let targets: Vec<(Inbox, Arc<Notify>)> = {
-        let lock = plugin.tracker.read().await;
-        let Some(item) = lock.workloads.get(workload_id) else {
-            return Err("workload state not found".to_string());
-        };
+) -> Result<(), MessagingError> {
+    let targets = {
+        let tracker = plugin.tracker.read().await;
+        let item = tracker
+            .workloads
+            .get(workload_id)
+            .ok_or(MessagingError::Closed)?;
         item.components
             .values()
-            .filter(|c| subscriptions_match(&c.subscriptions, &msg.message.subject))
-            .map(|c| (c.inbox.clone(), c.notify.clone()))
-            .collect()
+            .filter(|component| subscriptions_match(&component.subscriptions, &msg.message.subject))
+            .map(|component| component.inbox.clone())
+            .collect::<Vec<_>>()
     };
-
-    for (inbox, notify) in targets {
-        {
-            let mut queue = inbox.write().await;
-            if queue.len() >= MAX_QUEUE_SIZE {
-                return Err("message queue full".to_string());
-            }
-            queue.push_back(msg.clone());
-        }
-        notify.notify_one();
+    let mut permits = Vec::with_capacity(targets.len());
+    for target in targets {
+        permits.push(target.try_reserve_owned().map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => MessagingError::QueueFull,
+            mpsc::error::TrySendError::Closed(_) => MessagingError::Closed,
+        })?);
+    }
+    for permit in permits {
+        permit.send(RoutedMessage {
+            message: msg.message.clone(),
+            propagation: msg.propagation.clone(),
+            _activity: Some(data.begin()),
+        });
     }
     Ok(())
 }
@@ -201,7 +323,7 @@ async fn route_to_subscribers(
 /// a full NATS server is not needed.
 #[derive(Clone)]
 pub struct InMemoryMessaging {
-    tracker: Arc<RwLock<WorkloadTracker<WorkloadData, ComponentData>>>,
+    tracker: Arc<RwLock<WorkloadTracker<Arc<WorkloadData>, ComponentData>>>,
     meters: Arc<RwLock<Meters>>,
 }
 
@@ -223,22 +345,313 @@ impl InMemoryMessaging {
         subject: &str,
         body: Vec<u8>,
     ) -> Result<(), String> {
-        route_to_subscribers(
-            self,
+        self.publish_core(
             workload_id,
-            &types::BrokerMessage {
+            HostMessage {
                 subject: subject.to_string(),
                 reply_to: None,
                 body,
+                trace_context: None,
             },
+            MessageOrigin::HostInjected,
         )
         .await
+        .map_err(|error| error.to_string())
     }
 }
 
 impl Default for InMemoryMessaging {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(Clone)]
+pub struct InMemoryMessagingDriver {
+    plugin: InMemoryMessaging,
+    workload_id: Arc<str>,
+}
+
+impl InMemoryMessaging {
+    pub async fn reserve_workload(
+        &self,
+        workload_id: impl Into<String>,
+    ) -> Result<InMemoryMessagingDriver, MessagingError> {
+        let workload_id = workload_id.into();
+        let mut tracker = self.tracker.write().await;
+        if tracker.workloads.contains_key(&workload_id) {
+            return Err(MessagingError::AlreadyReserved);
+        }
+        tracker.workloads.insert(
+            workload_id.clone(),
+            crate::plugin::WorkloadTrackerItem {
+                workload_data: Some(Arc::new(WorkloadData::new(RESERVED))),
+                components: HashMap::new(),
+            },
+        );
+        Ok(InMemoryMessagingDriver {
+            plugin: self.clone(),
+            workload_id: workload_id.into(),
+        })
+    }
+
+    pub fn driver(&self, workload_id: impl Into<Arc<str>>) -> InMemoryMessagingDriver {
+        InMemoryMessagingDriver {
+            plugin: self.clone(),
+            workload_id: workload_id.into(),
+        }
+    }
+}
+
+impl InMemoryMessagingDriver {
+    async fn data(&self) -> Result<Arc<WorkloadData>, MessagingError> {
+        let tracker = self.plugin.tracker.read().await;
+        let data = tracker
+            .get_workload_data(&self.workload_id)
+            .cloned()
+            .ok_or(MessagingError::NotBound)?;
+        data.require_bound()?;
+        Ok(data)
+    }
+
+    pub async fn observe(&self, capacity: usize) -> Result<ObservationReceiver, MessagingError> {
+        let data = self.data().await?;
+        let (sender, receiver) = mpsc::channel(capacity.max(1));
+        let mut observers = data.observers.write().await;
+        data.require_bound()?;
+        observers.push(sender);
+        Ok(ObservationReceiver(receiver))
+    }
+
+    pub async fn register_responder(
+        &self,
+        subject: impl Into<String>,
+        capacity: usize,
+    ) -> Result<ResponderReceiver, MessagingError> {
+        let data = self.data().await?;
+        let (sender, receiver) = mpsc::channel(capacity.max(1));
+        let mut responders = data.responders.write().await;
+        data.require_bound()?;
+        responders.push((subject.into(), sender));
+        Ok(ResponderReceiver(receiver))
+    }
+
+    pub async fn publish(&self, message: HostMessage) -> Result<(), MessagingError> {
+        self.plugin
+            .publish_core(&self.workload_id, message, MessageOrigin::HostInjected)
+            .await
+    }
+
+    pub async fn request(
+        &self,
+        message: HostMessage,
+        timeout: Duration,
+    ) -> Result<HostMessage, MessagingError> {
+        self.plugin
+            .request_core(
+                &self.workload_id,
+                message,
+                timeout,
+                MessageOrigin::HostInjected,
+            )
+            .await
+    }
+
+    pub async fn wait_idle(&self) -> Result<(), MessagingError> {
+        let data = self.data().await?;
+        loop {
+            let notified = data.activity_changed.notified();
+            if data.activity.load(Ordering::Acquire) == 0 {
+                return Ok(());
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn close(&self) -> Result<(), MessagingError> {
+        self.plugin.close_workload(&self.workload_id).await
+    }
+}
+
+fn to_routed(message: HostMessage) -> RoutedMessage {
+    RoutedMessage {
+        message: types::BrokerMessage {
+            subject: message.subject,
+            reply_to: message.reply_to,
+            body: message.body,
+        },
+        propagation: message.trace_context.map(|context| PropagationContext {
+            traceparent: context.traceparent,
+            tracestate: context.tracestate,
+        }),
+        _activity: None,
+    }
+}
+
+fn to_host(message: &RoutedMessage) -> HostMessage {
+    HostMessage {
+        subject: message.message.subject.clone(),
+        reply_to: message.message.reply_to.clone(),
+        body: message.message.body.clone(),
+        trace_context: message.propagation.as_ref().map(|context| TraceContext {
+            traceparent: context.traceparent.clone(),
+            tracestate: context.tracestate.clone(),
+        }),
+    }
+}
+
+impl InMemoryMessaging {
+    async fn observe_message(
+        data: &WorkloadData,
+        operation: ObservedOperation,
+        message: HostMessage,
+    ) {
+        let mut senders = data.observers.write().await;
+        senders.retain(|sender| {
+            match sender.try_send(ObservedMessage {
+                operation,
+                origin: MessageOrigin::Guest,
+                message: message.clone(),
+            }) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            }
+        });
+    }
+
+    async fn publish_core(
+        &self,
+        workload_id: &str,
+        message: HostMessage,
+        origin: MessageOrigin,
+    ) -> Result<(), MessagingError> {
+        let data = self
+            .tracker
+            .read()
+            .await
+            .get_workload_data(workload_id)
+            .cloned()
+            .ok_or(MessagingError::NotBound)?;
+        data.require_bound()?;
+        let _operation = data.begin();
+        let routed = to_routed(message.clone());
+        let sender = data
+            .pending_requests
+            .lock()
+            .unwrap()
+            .remove(&message.subject);
+        let is_reply =
+            sender.is_some() || data.tombstones.lock().unwrap().contains(&message.subject);
+        if is_reply {
+            data.tombstones
+                .lock()
+                .unwrap()
+                .insert(message.subject.clone());
+            if origin == MessageOrigin::Guest {
+                Self::observe_message(&data, ObservedOperation::Reply, message).await;
+            }
+            if let Some(sender) = sender {
+                let _ = sender.send(routed);
+            }
+            return Ok(());
+        }
+        if origin == MessageOrigin::Guest {
+            Self::observe_message(&data, ObservedOperation::Publish, message).await;
+        }
+        route_to_subscribers(self, workload_id, &data, &routed).await
+    }
+
+    async fn request_core(
+        &self,
+        workload_id: &str,
+        mut message: HostMessage,
+        timeout: Duration,
+        origin: MessageOrigin,
+    ) -> Result<HostMessage, MessagingError> {
+        let data = self
+            .tracker
+            .read()
+            .await
+            .get_workload_data(workload_id)
+            .cloned()
+            .ok_or(MessagingError::NotBound)?;
+        data.require_bound()?;
+        let _request_activity = data.begin();
+        let deadline = tokio::time::Instant::now() + timeout;
+        let inbox = format!("_INBOX.{}", uuid::Uuid::new_v4());
+        message.reply_to = Some(inbox.clone());
+        let (sender, mut receiver) = oneshot::channel();
+        data.pending_requests
+            .lock()
+            .unwrap()
+            .insert(inbox.clone(), sender);
+        let _pending_guard = PendingRequestGuard {
+            inbox: inbox.clone(),
+            pending: Arc::clone(&data.pending_requests),
+        };
+        data.tombstones.lock().unwrap().insert(inbox.clone());
+        let mut responder_replies = tokio::task::JoinSet::new();
+        if origin == MessageOrigin::Guest {
+            Self::observe_message(&data, ObservedOperation::Request, message.clone()).await;
+            let mut responders = data.responders.write().await;
+            responders.retain(|(pattern, responder)| {
+                if !subject_matches(pattern, &message.subject) {
+                    return !responder.is_closed();
+                }
+                let (reply_sender, reply_receiver) = oneshot::channel();
+                match responder.try_send(ResponderRequest {
+                    message: message.clone(),
+                    reply: Some(reply_sender),
+                }) {
+                    Ok(()) => {
+                        responder_replies.spawn(async move { reply_receiver.await.ok() });
+                        true
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => true,
+                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                }
+            });
+        }
+        let routed = to_routed(message);
+        if let Err(error) = route_to_subscribers(self, workload_id, &data, &routed).await {
+            responder_replies.abort_all();
+            while responder_replies.join_next().await.is_some() {}
+            return Err(error);
+        }
+        let result = loop {
+            tokio::select! {
+                reply = &mut receiver => break reply.map_err(|_| MessagingError::Closed).map(|reply| to_host(&reply)),
+                responder = responder_replies.join_next(), if !responder_replies.is_empty() => {
+                    if let Some(Ok(Some(reply))) = responder {
+                        self.publish_core(workload_id, HostMessage { subject: inbox.clone(), ..reply }, MessageOrigin::Guest).await?;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => break Err(MessagingError::Timeout),
+            }
+        };
+        responder_replies.abort_all();
+        while responder_replies.join_next().await.is_some() {}
+        result
+    }
+
+    async fn close_workload(&self, workload_id: &str) -> Result<(), MessagingError> {
+        let data = self
+            .tracker
+            .read()
+            .await
+            .get_workload_data(workload_id)
+            .cloned()
+            .ok_or(MessagingError::Closed)?;
+        let previous = data.lifecycle.swap(CLOSING, Ordering::AcqRel);
+        if previous == CLOSED {
+            return Ok(());
+        }
+        data.pending_requests.lock().unwrap().clear();
+        data.observers.write().await.clear();
+        data.responders.write().await.clear();
+        data.lifecycle.store(CLOSED, Ordering::Release);
+        data.activity_changed.notify_waiters();
+        Ok(())
     }
 }
 
@@ -266,72 +679,36 @@ impl<T> HostWithStore<T> for SharedCtx {
         parent_context: Option<bindings::wasmcloud::observability::propagation::TraceContext>,
     ) -> wasmtime::Result<Result<types::BrokerMessage, String>> {
         let (plugin, workload_id) = plugin_and_workload(store)?;
-        let span = producer_span("request", &subject, body.len(), parent_context);
-
-        let pending_requests = {
-            let lock = plugin.tracker.read().await;
-            match lock.get_workload_data(&workload_id) {
-                Some(data) => data.pending_requests.clone(),
-                None => wasmtime::bail!("workload state not found"),
-            }
+        let span = producer_span("request", &subject, body.len(), parent_context.clone());
+        let message = HostMessage {
+            subject,
+            reply_to: None,
+            body,
+            trace_context: parent_context.map(|context| TraceContext {
+                traceparent: context.traceparent,
+                tracestate: context.tracestate,
+            }),
         };
-
-        // Generate a unique reply-to subject
-        let reply_to = format!("_INBOX.{}", uuid::Uuid::new_v4());
-
-        // Create a oneshot channel for the response
-        let (tx, rx) = oneshot::channel();
-
-        // Register the pending request
+        match plugin
+            .request_core(
+                &workload_id,
+                message,
+                Duration::from_millis(timeout_ms.into()),
+                MessageOrigin::Guest,
+            )
+            .await
         {
-            let mut lock = pending_requests.write().await;
-            lock.insert(reply_to.clone(), tx);
-        }
-        let _pending_request_guard =
-            PendingRequestGuard::new(reply_to.clone(), pending_requests.clone());
-
-        // Create the request message with reply_to set
-        let msg = routed_message(
-            types::BrokerMessage {
-                subject,
-                reply_to: Some(reply_to.clone()),
-                body,
-            },
-            &span,
-        );
-
-        debug!(subject = %msg.message.subject, reply_to = %msg.message.reply_to.as_deref().unwrap_or("<none>"), "Sending request");
-        // Route the request to subscribers of its subject.
-        if let Err(error) = route_to_subscribers(&plugin, &workload_id, &msg).await {
-            super::record_messaging_error(&span, "messaging-broker-failed", &error);
-            return Ok(Err(error));
-        }
-
-        // Wait for the response with timeout
-        let timeout_duration = std::time::Duration::from_millis(timeout_ms as u64);
-        match tokio::time::timeout(timeout_duration, rx).await {
-            Ok(Ok(response)) => {
+            Ok(message) => {
                 span.record("messaging.operation.outcome", "success");
-                Ok(Ok(response.message))
+                Ok(Ok(types::BrokerMessage {
+                    subject: message.subject,
+                    reply_to: message.reply_to,
+                    body: message.body,
+                }))
             }
-            Ok(Err(_)) => {
-                // Channel was dropped without sending
-                warn!("request channel closed without response");
-                super::record_messaging_error(
-                    &span,
-                    "messaging-broker-failed",
-                    "request channel closed without response",
-                );
-                Ok(Err("request channel closed without response".to_string()))
-            }
-            Err(_) => {
-                warn!("request timed out after {timeout_ms}ms");
-                super::record_messaging_error(
-                    &span,
-                    "messaging-request-timeout",
-                    &format!("request timed out after {timeout_ms}ms"),
-                );
-                Ok(Err(format!("request timed out after {timeout_ms}ms")))
+            Err(error) => {
+                super::record_messaging_error(&span, "messaging-broker-failed", &error.to_string());
+                Ok(Err(error.to_string()))
             }
         }
     }
@@ -343,40 +720,32 @@ impl<T> HostWithStore<T> for SharedCtx {
         parent_context: Option<bindings::wasmcloud::observability::propagation::TraceContext>,
     ) -> wasmtime::Result<Result<(), String>> {
         let (plugin, workload_id) = plugin_and_workload(store)?;
-        let span = producer_span("publish", &msg.subject, msg.body.len(), parent_context);
-        let msg = routed_message(msg, &span);
-        let pending_requests = {
-            let lock = plugin.tracker.read().await;
-            match lock.get_workload_data(&workload_id) {
-                Some(data) => data.pending_requests.clone(),
-                None => wasmtime::bail!("workload state not found"),
-            }
+        let span = producer_span(
+            "publish",
+            &msg.subject,
+            msg.body.len(),
+            parent_context.clone(),
+        );
+        let message = HostMessage {
+            subject: msg.subject,
+            reply_to: msg.reply_to,
+            body: msg.body,
+            trace_context: parent_context.map(|context| TraceContext {
+                traceparent: context.traceparent,
+                tracestate: context.tracestate,
+            }),
         };
-
+        match plugin
+            .publish_core(&workload_id, message, MessageOrigin::Guest)
+            .await
         {
-            let mut lock = pending_requests.write().await;
-            // Check if this is a reply to a pending request. Reply subjects
-            // (`_INBOX.*`) are routed here, not to subscribers.
-            if let Some(sender) = lock.remove(&msg.message.subject) {
-                debug!(subject = %msg.message.subject, reply_to = %msg.message.reply_to.as_deref().unwrap_or("<none>"), "Responding message");
-                // This is a response to a request - send it via the oneshot channel
-                let _ = sender.send(msg);
-                span.record("messaging.operation.outcome", "success");
-                return Ok(Ok(()));
-            }
-        }
-
-        debug!(subject = %msg.message.subject, reply_to = %msg.message.reply_to.as_deref().unwrap_or("<none>"), "Publishing message");
-
-        // Regular publish - deliver to every subscriber of this subject.
-        match route_to_subscribers(&plugin, &workload_id, &msg).await {
             Ok(()) => {
                 span.record("messaging.operation.outcome", "success");
                 Ok(Ok(()))
             }
             Err(error) => {
-                super::record_messaging_error(&span, "messaging-broker-failed", &error);
-                Ok(Err(error))
+                super::record_messaging_error(&span, "messaging-broker-failed", &error.to_string());
+                Ok(Err(error.to_string()))
             }
         }
     }
@@ -412,10 +781,16 @@ impl HostPlugin for InMemoryMessaging {
             return Ok(());
         }
 
-        self.tracker
-            .write()
-            .await
-            .add_unresolved_workload(workload, WorkloadData::default());
+        let mut tracker = self.tracker.write().await;
+        if let Some(data) = tracker.get_workload_data(workload.id()) {
+            data.lifecycle
+                .compare_exchange(RESERVED, BOUND, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|state| {
+                    anyhow::anyhow!("workload cannot be bound from lifecycle state {state}")
+                })?;
+            return Ok(());
+        }
+        tracker.add_unresolved_workload(workload, Arc::new(WorkloadData::new(BOUND)));
         Ok(())
     }
 
@@ -455,14 +830,15 @@ impl HostPlugin for InMemoryMessaging {
         // the running service when one is registered).
         if super::exports_messaging_handler(&component_handle.world()) {
             debug!(?subscriptions, "Tracking component in in-memory messaging");
+            let (inbox, receiver) = mpsc::channel(MAX_QUEUE_SIZE);
             self.tracker.write().await.add_component(
                 component_handle,
                 ComponentData {
                     cancel_token: tokio_util::sync::CancellationToken::new(),
                     task_handle: None,
                     subscriptions,
-                    inbox: Arc::default(),
-                    notify: Arc::new(Notify::new()),
+                    inbox,
+                    receiver: Some(receiver),
                 },
             );
         }
@@ -475,16 +851,15 @@ impl HostPlugin for InMemoryMessaging {
         workload: &ResolvedWorkload,
         component_id: &str,
     ) -> anyhow::Result<()> {
-        let (inbox, notify, cancel_token) = {
-            let lock = self.tracker.read().await;
-            match lock.get_component_data(component_id) {
-                Some(data) => (
-                    data.inbox.clone(),
-                    data.notify.clone(),
-                    data.cancel_token.clone(),
-                ),
-                None => return Ok(()),
-            }
+        let (mut inbox, cancel_token) = {
+            let mut tracker = self.tracker.write().await;
+            let Some(data) = tracker.get_component_data_mut(component_id) else {
+                return Ok(());
+            };
+            let Some(receiver) = data.receiver.take() else {
+                anyhow::bail!("messaging processor already started");
+            };
+            (receiver, data.cancel_token.clone())
         };
 
         // A long-lived handler service has no per-component instance to
@@ -512,21 +887,25 @@ impl HostPlugin for InMemoryMessaging {
         let fuel_meter = self.meters.read().await.fuel_consumption.clone();
 
         let handle = tokio::spawn(async move {
+            let mut handlers = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
+                        handlers.abort_all();
+                        while handlers.join_next().await.is_some() {}
                         break;
                     }
-                    _ = notify.notified() => {
-                        // Drain every message queued since the last wakeup, so a
-                        // coalesced notification can't strand a message.
-                        loop {
-                        let msg = inbox.write().await.pop_front();
-
-                        let Some(msg) = msg else {
+                    _ = handlers.join_next(), if !handlers.is_empty() => {}
+                    message = inbox.recv() => {
+                        let Some(msg) = message else {
+                            while handlers.join_next().await.is_some() {}
                             break;
                         };
-
+                        let workload = workload.clone();
+                        let component_id = component_id.clone();
+                        let pre = pre.clone();
+                        let fuel_meter = fuel_meter.clone();
+                        handlers.spawn(async move {
                         let parent = msg.propagation.as_ref().and_then(|context| context_from_propagation(context).ok());
                         let invalid_parent = msg.propagation.as_ref().is_some_and(|context| context_from_propagation(context).is_err());
                         let msg = msg.message;
@@ -586,7 +965,7 @@ impl HostPlugin for InMemoryMessaging {
                                     warn!(subject = %msg.subject, error = %e, "failed to deliver message to trigger service")
                                 }
                             }
-                            continue;
+                            return;
                         }
 
                         let Some(pre) = &pre else {
@@ -595,13 +974,13 @@ impl HostPlugin for InMemoryMessaging {
                                 component_id = %component_id,
                                 "no trigger service registered and no per-message instance; dropping message"
                             );
-                            continue;
+                            return;
                         };
                         let mut store = match workload.new_store(&component_id).await {
                             Err(error) => {
                                 super::record_messaging_error(&span, "messaging-consumer-setup-failed", &error.to_string());
                                 warn!("failed to create store for component {component_id}: {error}");
-                                continue;
+                                return;
                             }
                             Ok(store) => store,
                         };
@@ -610,14 +989,14 @@ impl HostPlugin for InMemoryMessaging {
                             Err(error) => {
                                 super::record_messaging_error(&span, "messaging-consumer-setup-failed", &error.to_string());
                                 warn!("failed to instantiate component {component_id}: {error}");
-                                continue;
+                                return;
                             }
                             Ok(proxy) => proxy,
                         };
 
                         let fuel_meter = fuel_meter.clone();
 
-                        tokio::spawn(async move {
+                        {
                             let handler_span = span.clone();
                             let result = fuel_meter.observe(
                                 &[
@@ -652,8 +1031,8 @@ impl HostPlugin for InMemoryMessaging {
                                     warn!(error = %error, "handler invocation failed");
                                 }
                             };
-                        });
                         }
+                        });
                     }
                 }
             }
@@ -675,36 +1054,56 @@ impl HostPlugin for InMemoryMessaging {
         workload_id: &str,
         _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
-        // Clean up tracker
-        let workload_cleanup = |_| async {};
-        let component_cleanup = |component_data: ComponentData| async move {
-            component_data.cancel_token.cancel();
-            if let Some(handle) = component_data.task_handle {
-                handle.abort();
+        let item = {
+            let mut tracker = self.tracker.write().await;
+            let item = tracker.workloads.remove(workload_id);
+            if let Some(item) = &item {
+                for component_id in item.components.keys() {
+                    tracker.components.remove(component_id);
+                }
             }
+            item
         };
-
-        self.tracker
-            .write()
-            .await
-            .remove_workload_with_cleanup(workload_id, workload_cleanup, component_cleanup)
-            .await;
-
+        let Some(item) = item else {
+            return Ok(());
+        };
+        let data = item.workload_data;
+        if let Some(data) = &data {
+            data.lifecycle.store(CLOSING, Ordering::Release);
+        }
+        let shutdown = tokio::spawn(async move {
+            if let Some(data) = &data {
+                data.pending_requests.lock().unwrap().clear();
+            }
+            for component in item.components.into_values() {
+                component.cancel_token.cancel();
+                if let Some(handle) = component.task_handle {
+                    let _ = handle.await;
+                }
+            }
+            if let Some(data) = data {
+                data.lifecycle.store(CLOSED, Ordering::Release);
+                data.activity_changed.notify_waiters();
+            }
+        });
+        shutdown.await.context("messaging shutdown task failed")?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc, time::Duration};
-
+    use super::{
+        BOUND, HostMessage, InMemoryMessaging, InMemoryMessagingDriver, MessageOrigin,
+        MessagingError, ObservedOperation, RoutedMessage, subject_matches, subscriptions_match,
+        types,
+    };
+    use crate::observability::{PropagationContext, context_from_propagation, inject_context};
     use opentelemetry::trace::{
         SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
     };
-    use tokio::sync::{RwLock, oneshot};
-
-    use super::{PendingRequestGuard, RoutedMessage, subject_matches, subscriptions_match, types};
-    use crate::observability::{PropagationContext, context_from_propagation, inject_context};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     fn context(trace: u128, span: u64) -> opentelemetry::Context {
         opentelemetry::Context::new().with_remote_span_context(SpanContext::new(
@@ -748,6 +1147,7 @@ mod tests {
         let routed = RoutedMessage {
             message: message.clone(),
             propagation: Some(propagation),
+            _activity: None,
         };
 
         assert_eq!(routed.message.subject, message.subject);
@@ -766,6 +1166,7 @@ mod tests {
         let missing = RoutedMessage {
             message: message.clone(),
             propagation: None,
+            _activity: None,
         };
         assert!(missing.propagation.is_none());
         let malformed = RoutedMessage {
@@ -774,35 +1175,9 @@ mod tests {
                 traceparent: "malformed".into(),
                 tracestate: None,
             }),
+            _activity: None,
         };
         assert!(context_from_propagation(malformed.propagation.as_ref().unwrap()).is_err());
-    }
-
-    #[tokio::test]
-    async fn dropped_pending_request_is_removed() {
-        let pending_requests = Arc::new(RwLock::new(HashMap::new()));
-        let (sender, _receiver) = oneshot::channel();
-        pending_requests
-            .write()
-            .await
-            .insert("_INBOX.cancelled".to_string(), sender);
-
-        let guard =
-            PendingRequestGuard::new("_INBOX.cancelled".to_string(), pending_requests.clone());
-        let write_lock = pending_requests.write().await;
-        drop(guard);
-        drop(write_lock);
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if pending_requests.read().await.is_empty() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("pending request cleanup timed out");
     }
 
     #[test]
@@ -843,5 +1218,221 @@ mod tests {
         let subs = vec!["tasks.leet".to_string()];
         assert!(subscriptions_match(&subs, "tasks.leet"));
         assert!(!subscriptions_match(&subs, "tasks.reverse"));
+    }
+
+    async fn bound_driver() -> (InMemoryMessaging, InMemoryMessagingDriver) {
+        let plugin = InMemoryMessaging::new();
+        let driver = plugin.reserve_workload("test").await.unwrap();
+        let data = plugin
+            .tracker
+            .read()
+            .await
+            .get_workload_data("test")
+            .cloned()
+            .unwrap();
+        data.lifecycle.store(BOUND, Ordering::Release);
+        (plugin, driver)
+    }
+
+    fn message(subject: &str, body: &[u8]) -> HostMessage {
+        HostMessage {
+            subject: subject.to_string(),
+            reply_to: None,
+            body: body.to_vec(),
+            trace_context: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn host_injection_is_not_observed_but_guest_publish_is() {
+        let (plugin, driver) = bound_driver().await;
+        let mut observations = driver.observe(4).await.unwrap();
+        driver.publish(message("events", b"host")).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), observations.recv())
+                .await
+                .is_err()
+        );
+        plugin
+            .publish_core("test", message("events", b"guest"), MessageOrigin::Guest)
+            .await
+            .unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(1), observations.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed.operation, ObservedOperation::Publish);
+        assert_eq!(observed.message.body, b"guest");
+    }
+
+    #[tokio::test]
+    async fn explicit_responder_replies_to_guest_request() {
+        let (plugin, driver) = bound_driver().await;
+        let mut responder = driver.register_responder("rpc.*", 1).await.unwrap();
+        let response = tokio::spawn(async move {
+            let request = responder.recv().await.unwrap();
+            request.reply(message("ignored", b"reply")).unwrap();
+        });
+        let reply = plugin
+            .request_core(
+                "test",
+                message("rpc.echo", b"request"),
+                Duration::from_secs(1),
+                MessageOrigin::Guest,
+            )
+            .await
+            .unwrap();
+        response.await.unwrap();
+        assert_eq!(reply.body, b"reply");
+    }
+
+    #[tokio::test]
+    async fn request_timeout_cleans_pending_and_idle_activity() {
+        let (plugin, driver) = bound_driver().await;
+        let result = driver
+            .request(message("nobody", b"request"), Duration::from_millis(10))
+            .await;
+        assert_eq!(result, Err(MessagingError::Timeout));
+        driver.wait_idle().await.unwrap();
+        let data = plugin
+            .tracker
+            .read()
+            .await
+            .get_workload_data("test")
+            .cloned()
+            .unwrap();
+        assert!(data.pending_requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropped_request_cleans_pending_synchronously() {
+        let (plugin, driver) = bound_driver().await;
+        let request = tokio::spawn(async move {
+            driver
+                .request(message("nobody", b"request"), Duration::from_secs(60))
+                .await
+        });
+        tokio::task::yield_now().await;
+        request.abort();
+        let _ = request.await;
+        let data = plugin
+            .tracker
+            .read()
+            .await
+            .get_workload_data("test")
+            .cloned()
+            .unwrap();
+        assert!(data.pending_requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_observer_and_responder_do_not_delay_request_deadline() {
+        let (plugin, driver) = bound_driver().await;
+        let _observer = driver.observe(1).await.unwrap();
+        plugin
+            .publish_core("test", message("event", b"first"), MessageOrigin::Guest)
+            .await
+            .unwrap();
+        plugin
+            .publish_core("test", message("event", b"second"), MessageOrigin::Guest)
+            .await
+            .unwrap();
+
+        let _responder = driver.register_responder("rpc", 1).await.unwrap();
+        let started = tokio::time::Instant::now();
+        let result = plugin
+            .request_core(
+                "test",
+                message("rpc", b"request"),
+                Duration::from_millis(20),
+                MessageOrigin::Guest,
+            )
+            .await;
+        assert_eq!(result, Err(MessagingError::Timeout));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn tombstones_evict_oldest_at_cap() {
+        let mut tombstones = super::Tombstones {
+            subjects: Default::default(),
+            order: Default::default(),
+        };
+        for index in 0..=super::MAX_TOMBSTONES {
+            tombstones.insert(index.to_string());
+        }
+        assert_eq!(tombstones.order.len(), super::MAX_TOMBSTONES);
+        assert!(!tombstones.contains("0"));
+        assert!(tombstones.contains(&super::MAX_TOMBSTONES.to_string()));
+    }
+
+    #[tokio::test]
+    async fn registration_blocked_during_close_is_rejected() {
+        let (plugin, driver) = bound_driver().await;
+        let data = plugin
+            .tracker
+            .read()
+            .await
+            .get_workload_data("test")
+            .cloned()
+            .unwrap();
+        let observers = data.observers.write().await;
+        let registering = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.observe(1).await }
+        });
+        tokio::task::yield_now().await;
+        let closing = tokio::spawn({
+            let driver = driver.clone();
+            async move { driver.close().await }
+        });
+        while data.lifecycle.load(Ordering::Acquire) != super::CLOSING {
+            tokio::task::yield_now().await;
+        }
+        drop(observers);
+        closing.await.unwrap().unwrap();
+        assert!(matches!(
+            registering.await.unwrap(),
+            Err(MessagingError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reservation_prebind_duplicate_and_close() {
+        let plugin = InMemoryMessaging::new();
+        let driver = plugin.reserve_workload("test").await.unwrap();
+        assert_eq!(
+            driver.publish(message("event", b"body")).await,
+            Err(MessagingError::NotBound)
+        );
+        assert!(matches!(
+            plugin.reserve_workload("test").await,
+            Err(MessagingError::AlreadyReserved)
+        ));
+        let data = plugin
+            .tracker
+            .read()
+            .await
+            .get_workload_data("test")
+            .cloned()
+            .unwrap();
+        data.lifecycle.store(BOUND, Ordering::Release);
+        let mut observer = driver.observe(1).await.unwrap();
+        let mut responder = driver.register_responder("event", 1).await.unwrap();
+        driver.close().await.unwrap();
+        assert_eq!(observer.recv().await, None);
+        assert!(responder.recv().await.is_none());
+        assert_eq!(
+            driver.publish(message("event", b"body")).await,
+            Err(MessagingError::Closed)
+        );
+        assert!(matches!(
+            driver.observe(1).await,
+            Err(MessagingError::Closed)
+        ));
+        assert!(matches!(
+            driver.register_responder("event", 1).await,
+            Err(MessagingError::Closed)
+        ));
     }
 }
