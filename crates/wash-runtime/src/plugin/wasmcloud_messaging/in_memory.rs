@@ -908,6 +908,7 @@ impl HostPlugin for InMemoryMessaging {
                         handlers.spawn(async move {
                         let parent = msg.propagation.as_ref().and_then(|context| context_from_propagation(context).ok());
                         let invalid_parent = msg.propagation.as_ref().is_some_and(|context| context_from_propagation(context).is_err());
+                        let _activity_guard = msg._activity;
                         let msg = msg.message;
                         debug!(subject = %msg.subject, reply_to = %msg.reply_to.as_deref().unwrap_or("<none>"), "Processing message");
 
