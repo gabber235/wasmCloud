@@ -36,7 +36,16 @@ workspace = true
 default = ["wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "washlet", "wasi-otel", "wasi-webgpu", "wasm_component_model_implements"]
 oci = ["dep:oci-client", "dep:oci-wasm", "dep:docker_credential", "dep:sha2", "dep:wit-component"]
 wasi-otel = []
-washlet = ["oci"]
+washlet = [
+    "oci",
+    "dep:tonic",
+    "dep:pbjson",
+    "dep:pbjson-types",
+    "dep:prost",
+    "dep:tonic-prost",
+    "dep:tonic-prost-build",
+    "dep:pbjson-build",
+]
 wasi-config = []
 wasi-logging = []
 wasi-blobstore = []
@@ -102,7 +111,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
-tonic = { workspace = true, features = [
+tonic = { workspace = true, optional = true, features = [
     "gzip",
     "tls-aws-lc",
     "transport",
@@ -112,10 +121,10 @@ tonic = { workspace = true, features = [
 ] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "ansi", "time", "json"] }
 tracing-opentelemetry = { workspace = true }
-pbjson = { workspace = true, default-features = true }
-pbjson-types = { workspace = true, default-features = true }
-prost = { workspace = true, default-features = true }
-tonic-prost = { workspace = true, default-features = true }
+pbjson = { workspace = true, optional = true, default-features = true }
+pbjson-types = { workspace = true, optional = true, default-features = true }
+prost = { workspace = true, optional = true, default-features = true }
+tonic-prost = { workspace = true, optional = true, default-features = true }
 opentelemetry = { workspace = true, features = ["trace", "metrics", "logs"] }
 opentelemetry-appender-tracing = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["logs"] }
@@ -158,8 +167,8 @@ wasi-webgpu-wasmtime = { version = "0.2", optional = true }
 # adapter provider.
 [build-dependencies]
 anyhow = { workspace = true, default-features = true }
-tonic-prost-build = { workspace = true, default-features = true }
-pbjson-build = { workspace = true, default-features = true }
+tonic-prost-build = { workspace = true, optional = true, default-features = true }
+pbjson-build = { workspace = true, optional = true, default-features = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
