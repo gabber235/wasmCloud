@@ -9,11 +9,13 @@
 //! test fixtures are built separately by `cargo xtask build-fixtures`
 //! (see /xtask).
 
-use std::env;
-use std::fs;
+#[cfg(feature = "washlet")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "washlet")]
+use std::{env, fs};
 
 /// Returns the path to the workspace root directory (the dir holding `Cargo.lock`).
+#[cfg(feature = "washlet")]
 fn workspace_dir() -> anyhow::Result<PathBuf> {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let mut current_path = PathBuf::from(manifest_dir);
@@ -31,6 +33,7 @@ fn workspace_dir() -> anyhow::Result<PathBuf> {
     }
 }
 
+#[cfg(feature = "washlet")]
 fn compile_protos(workspace_dir: &Path, out_dir: &Path) {
     let top_proto_dir = workspace_dir.join("proto");
     let proto_dir = top_proto_dir.join("wasmcloud/runtime/v2");
@@ -66,12 +69,20 @@ fn compile_protos(workspace_dir: &Path, out_dir: &Path) {
 }
 
 fn main() {
+    // The protobuf API is only consumed by the remote washlet transport.
+    // Embedded hosts intentionally avoid that transport and must not require
+    // protoc merely to compile the local runtime boundary.
+    #[cfg(not(feature = "washlet"))]
+    return;
+
+    #[cfg(feature = "washlet")]
     let out_dir = PathBuf::from(
         env::var("OUT_DIR").expect("failed to look up `OUT_DIR` from environment variables"),
     );
-    let workspace_dir = workspace_dir().expect("failed to get workspace dir");
-
-    compile_protos(&workspace_dir, &out_dir);
-
-    println!("cargo:rerun-if-changed=build.rs");
+    #[cfg(feature = "washlet")]
+    {
+        let workspace_dir = workspace_dir().expect("failed to get workspace dir");
+        compile_protos(&workspace_dir, &out_dir);
+        println!("cargo:rerun-if-changed=build.rs");
+    }
 }
