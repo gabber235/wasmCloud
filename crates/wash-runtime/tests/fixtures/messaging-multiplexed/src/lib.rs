@@ -7,7 +7,7 @@ mod bindings {
 
 use bindings::exports::wasi::http::handler::Guest as Handler;
 use bindings::wasi::http::types::{ErrorCode, Fields, Request, Response};
-use bindings::wasmcloud::messaging0_4_0::types::BrokerMessage;
+use bindings::wasmcloud::messaging::types::BrokerMessage;
 
 struct Component;
 
