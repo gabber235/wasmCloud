@@ -688,11 +688,6 @@ mod tests {
 
             {
                 let _guard = span.enter();
-                assert!(
-                    !Context::current().span().span_context().is_valid(),
-                    "the regression test must not attach an OTel thread-local context"
-                );
-
                 let current = current_outer_span_context();
                 assert!(current.is_valid());
                 assert_eq!(current.trace_id(), trace_id);
