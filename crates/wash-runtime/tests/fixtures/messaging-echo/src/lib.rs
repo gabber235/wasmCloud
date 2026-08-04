@@ -1,4 +1,4 @@
-use crate::bindings::wasmcloud::messaging0_4_0::{consumer, types::BrokerMessage};
+use crate::bindings::wasmcloud::messaging::{consumer, types::BrokerMessage};
 
 mod bindings {
     use crate::Component;
@@ -13,7 +13,7 @@ mod bindings {
 
 struct Component;
 
-impl bindings::exports::wasmcloud::messaging0_4_0::handler::Guest for Component {
+impl bindings::exports::wasmcloud::messaging::handler::Guest for Component {
     async fn handle_message(msg: BrokerMessage) -> Result<(), String> {
         if let Some(reply_to) = msg.reply_to {
             let reply = BrokerMessage {
