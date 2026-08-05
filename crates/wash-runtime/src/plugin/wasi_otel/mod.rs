@@ -73,12 +73,21 @@ pub struct WasiOtelConfig {
     /// metrics, and logs. Defaults to the plugin id (`wasi-otel`).
     #[builder(default = WASI_OTEL_ID.to_string(), into)]
     pub service_name: String,
+    /// Creates the span processor used for each bound component. When absent,
+    /// spans are exported through the configured OTLP endpoint.
+    pub span_processor_factory: Option<Arc<dyn WasiOtelSpanProcessorFactory>>,
 }
 
 impl Default for WasiOtelConfig {
     fn default() -> Self {
         Self::builder().build()
     }
+}
+
+/// Creates an OpenTelemetry span processor for a bound component.
+pub trait WasiOtelSpanProcessorFactory: Send + Sync + std::fmt::Debug + 'static {
+    /// Creates a processor associated with the supplied component resource.
+    fn create(&self, resource: &opentelemetry_sdk::Resource) -> Box<dyn SpanProcessor>;
 }
 
 enum SpanSubmission {
@@ -143,7 +152,7 @@ impl ComponentContext {
 
 fn component_context(
     component_id: Arc<str>,
-    span_processor: BatchSpanProcessor,
+    span_processor: Box<dyn SpanProcessor>,
     capacity: usize,
 ) -> ComponentContext {
     let (submissions, receiver) = mpsc::sync_channel(capacity);
@@ -214,12 +223,38 @@ pub struct WasiOtel {
 
 impl Default for WasiOtel {
     fn default() -> Self {
+        Self::new(WasiOtelConfig::default())
+    }
+}
+
+impl WasiOtel {
+    /// Creates a plugin with explicit OpenTelemetry configuration.
+    pub fn new(config: WasiOtelConfig) -> Self {
         Self {
-            config: WasiOtelConfig::default(),
+            config,
             tracker: Arc::new(RwLock::new(WorkloadTracker::default())),
             meter_provider: Arc::new(RwLock::new(None)),
             logger_provider: Arc::new(RwLock::new(None)),
         }
+    }
+
+    fn create_span_processor(
+        &self,
+        resource: &opentelemetry_sdk::Resource,
+    ) -> anyhow::Result<Box<dyn SpanProcessor>> {
+        if let Some(factory) = &self.config.span_processor_factory {
+            return Ok(factory.create(resource));
+        }
+
+        let span_exporter = SpanExporter::builder()
+            .with_tonic()
+            .build()
+            .map_err(|error| {
+                anyhow::anyhow!("Failed to create component span exporter: {error}")
+            })?;
+        let mut span_processor = BatchSpanProcessor::builder(span_exporter).build();
+        span_processor.set_resource(resource);
+        Ok(Box::new(span_processor))
     }
 }
 
@@ -329,21 +364,15 @@ impl HostPlugin for WasiOtel {
             bail!("Service can not be tracked");
         };
 
-        let span_exporter = SpanExporter::builder()
-            .with_tonic()
-            .build()
-            .map_err(|error| {
-                anyhow::anyhow!("Failed to create component span exporter: {error}")
-            })?;
-        let mut span_processor = BatchSpanProcessor::builder(span_exporter).build();
-        span_processor.set_resource(&component_resource(
+        let resource = component_resource(
             &self.config,
             component_handle.id(),
             component_handle.name(),
             component_handle.workload_id(),
             component_handle.workload_name(),
             component_handle.workload_namespace(),
-        ));
+        );
+        let span_processor = self.create_span_processor(&resource)?;
 
         let context = component_context(
             Arc::from(component_handle.id()),
@@ -650,9 +679,47 @@ mod tests {
         let mut processor = BatchSpanProcessor::builder(exporter.clone()).build();
         processor.set_resource(&resource);
         (
-            component_context(Arc::from(component_id), processor, 16),
+            component_context(Arc::from(component_id), Box::new(processor), 16),
             exporter,
         )
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingState {
+        resources: Mutex<Vec<opentelemetry_sdk::Resource>>,
+        spans: Mutex<Vec<SpanData>>,
+        lifecycle: Mutex<Vec<&'static str>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordingFactory(Arc<RecordingState>);
+
+    impl WasiOtelSpanProcessorFactory for RecordingFactory {
+        fn create(&self, resource: &opentelemetry_sdk::Resource) -> Box<dyn SpanProcessor> {
+            self.0.resources.lock().unwrap().push(resource.clone());
+            Box::new(RecordingProcessor(Arc::clone(&self.0)))
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingProcessor(Arc<RecordingState>);
+
+    impl SpanProcessor for RecordingProcessor {
+        fn on_start(&self, _span: &mut opentelemetry_sdk::trace::Span, _cx: &Context) {}
+
+        fn on_end(&self, span: SpanData) {
+            self.0.spans.lock().unwrap().push(span);
+        }
+
+        fn force_flush(&self) -> OTelSdkResult {
+            self.0.lifecycle.lock().unwrap().push("flush");
+            Ok(())
+        }
+
+        fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
+            self.0.lifecycle.lock().unwrap().push("shutdown");
+            Ok(())
+        }
     }
 
     fn attribute(resource: &opentelemetry_sdk::Resource, key: &str) -> String {
@@ -778,6 +845,103 @@ mod tests {
         );
 
         assert_eq!(attribute(&resource, "service.name"), "orders");
+    }
+
+    #[test]
+    fn custom_factory_receives_resource_and_processor_lifecycle() {
+        let state = Arc::new(RecordingState::default());
+        let config = WasiOtelConfig::builder()
+            .span_processor_factory(Arc::new(RecordingFactory(Arc::clone(&state))))
+            .build();
+        let plugin = WasiOtel::new(config.clone());
+        let resource = component_resource(
+            &config,
+            "component-id",
+            "orders",
+            "instance-id",
+            "orders-rollout",
+            "shop",
+        );
+        let processor = plugin.create_span_processor(&resource).unwrap();
+        let context = component_context(Arc::from("component-id"), processor, 16);
+
+        context.submit(span(0x1111, 0xaaaa, 0x1010, "captured"));
+        context.shutdown();
+
+        let resources = state.resources.lock().unwrap();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(attribute(&resources[0], "service.name"), "orders");
+        assert_eq!(attribute(&resources[0], "service.namespace"), "shop");
+        assert_eq!(
+            attribute(&resources[0], "service.instance.id"),
+            "instance-id"
+        );
+        assert_eq!(
+            attribute(&resources[0], "wasmcloud.workload.name"),
+            "orders-rollout"
+        );
+        assert_eq!(
+            attribute(&resources[0], "wasmcloud.component.name"),
+            "orders"
+        );
+        assert_eq!(
+            attribute(&resources[0], "wasmcloud.component.id"),
+            "component-id"
+        );
+        drop(resources);
+
+        assert_eq!(state.spans.lock().unwrap()[0].name, "captured");
+        assert_eq!(
+            state.lifecycle.lock().unwrap().as_slice(),
+            &["flush", "shutdown"]
+        );
+    }
+
+    #[test]
+    fn factory_processors_keep_component_resources_isolated() {
+        let state = Arc::new(RecordingState::default());
+        let config = WasiOtelConfig::builder()
+            .span_processor_factory(Arc::new(RecordingFactory(Arc::clone(&state))))
+            .build();
+        let plugin = WasiOtel::new(config.clone());
+
+        for (component_id, component_name) in
+            [("component-a", "orders"), ("component-b", "billing")]
+        {
+            let resource = component_resource(
+                &config,
+                component_id,
+                component_name,
+                component_id,
+                component_name,
+                "shop",
+            );
+            let processor = plugin.create_span_processor(&resource).unwrap();
+            component_context(Arc::from(component_id), processor, 1).shutdown();
+        }
+
+        let resources = state.resources.lock().unwrap();
+        assert_eq!(resources.len(), 2);
+        assert_eq!(
+            attribute(&resources[0], "wasmcloud.component.name"),
+            "orders"
+        );
+        assert_eq!(
+            attribute(&resources[1], "wasmcloud.component.name"),
+            "billing"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_plugin_keeps_otlp_processor_path() {
+        let plugin = WasiOtel::default();
+        assert_eq!(plugin.config.service_name, WASI_OTEL_ID);
+        assert!(plugin.config.span_processor_factory.is_none());
+
+        let processor = plugin
+            .create_span_processor(&opentelemetry_sdk::Resource::builder_empty().build())
+            .unwrap();
+        processor.shutdown().unwrap();
     }
 
     #[test]
