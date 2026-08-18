@@ -6,7 +6,7 @@ use wash_runtime::{
     engine::Engine,
     host::{
         HostApi, HostBuilder,
-        http::{DevRouter, HttpServer},
+        http::{DevRouter, Ingress},
     },
     plugin::wasmcloud_messaging::InMemoryMessaging,
     types::{Component, LocalResources, Workload, WorkloadStartRequest, WorkloadState},
@@ -30,13 +30,14 @@ fn component(name: &str, wasm: &'static [u8]) -> Component {
         local_resources,
         pool_size: 1,
         max_invocations: 100,
+        max_concurrency: 1,
     }
 }
 
 #[tokio::test]
 async fn async_request_replies_between_components() -> Result<()> {
     let engine = Engine::builder().build()?;
-    let http = HttpServer::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
+    let http = Ingress::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
     let addr = http.addr();
     let host = HostBuilder::new()
         .with_engine(engine)

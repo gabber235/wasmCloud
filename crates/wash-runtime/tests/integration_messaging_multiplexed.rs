@@ -26,7 +26,7 @@ use wash_runtime::{
     engine::Engine,
     host::{
         HostApi, HostBuilder,
-        http::{DevRouter, HttpServer},
+        http::{DevRouter, Ingress},
     },
     plugin::wasmcloud_messaging::{
         BrokerMessage, MultiplexedMessaging, NatsMsgProvider, TraceContext,
@@ -235,7 +235,7 @@ async fn real_guest_routes_named_async_imports() -> Result<()> {
     });
 
     let engine = Engine::builder().build()?;
-    let http = HttpServer::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
+    let http = Ingress::new(DevRouter::default(), "127.0.0.1:0".parse()?).await?;
     let addr = http.addr();
     let plugin = MultiplexedMessaging::new().with_provider(Arc::new(NatsMsgProvider));
     let host = HostBuilder::new()
@@ -259,6 +259,7 @@ async fn real_guest_routes_named_async_imports() -> Result<()> {
                 local_resources: LocalResources::default(),
                 pool_size: 1,
                 max_invocations: 100,
+                max_concurrency: 1,
             }],
             host_interfaces: vec![
                 WitInterface {
