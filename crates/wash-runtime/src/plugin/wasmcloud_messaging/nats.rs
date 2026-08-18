@@ -41,20 +41,6 @@ fn propagation_context(
     }
 }
 
-fn producer_span(
-    operation: &'static str,
-    destination: &str,
-    payload_size: usize,
-    parent: Option<bindings::wasmcloud::observability::propagation::TraceContext>,
-) -> tracing::Span {
-    producer_span_with_parent(
-        operation,
-        destination,
-        payload_size,
-        parent.map(propagation_context),
-    )
-}
-
 pub(super) fn producer_span_with_parent(
     operation: &'static str,
     destination: &str,
@@ -90,8 +76,17 @@ pub(super) fn producer_span_with_parent(
     span
 }
 
-pub(super) fn headers_for_span(span: &tracing::Span) -> async_nats::HeaderMap {
-    let propagation = inject_context(&span.context());
+pub(super) fn headers_for_span(
+    span: &tracing::Span,
+    parent: Option<PropagationContext>,
+) -> async_nats::HeaderMap {
+    let mut propagation = inject_context(&span.context());
+    if propagation.traceparent.is_empty()
+        && let Some(parent) = parent
+        && let Ok(context) = context_from_propagation(&parent)
+    {
+        propagation = inject_context(&context);
+    }
     let mut headers = async_nats::HeaderMap::new();
     if !propagation.traceparent.is_empty() {
         headers.insert("traceparent", propagation.traceparent);
@@ -199,8 +194,9 @@ impl<T> HostWithStore<T> for SharedCtx {
         parent_context: Option<bindings::wasmcloud::observability::propagation::TraceContext>,
     ) -> wasmtime::Result<Result<types::BrokerMessage, String>> {
         let plugin = plugin(store)?;
-        let span = producer_span("request", &subject, body.len(), parent_context);
-        let headers = headers_for_span(&span);
+        let parent = parent_context.map(propagation_context);
+        let span = producer_span_with_parent("request", &subject, body.len(), parent.clone());
+        let headers = headers_for_span(&span, parent);
         let result = async {
             match tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms as u64),
@@ -243,8 +239,10 @@ impl<T> HostWithStore<T> for SharedCtx {
         parent_context: Option<bindings::wasmcloud::observability::propagation::TraceContext>,
     ) -> wasmtime::Result<Result<(), String>> {
         let plugin = plugin(store)?;
-        let span = producer_span("publish", &msg.subject, msg.body.len(), parent_context);
-        let headers = headers_for_span(&span);
+        let parent = parent_context.map(propagation_context);
+        let span =
+            producer_span_with_parent("publish", &msg.subject, msg.body.len(), parent.clone());
+        let headers = headers_for_span(&span, parent);
         let result = async {
             if let Some(reply_to) = msg.reply_to {
                 plugin

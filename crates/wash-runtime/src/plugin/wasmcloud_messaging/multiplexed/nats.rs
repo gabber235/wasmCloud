@@ -29,13 +29,14 @@ impl MsgBackend for NatsMsgBackend {
         timeout_ms: u32,
         parent: Option<TraceContext>,
     ) -> Result<BrokerMessage, String> {
+        let parent = parent.map(parent_context);
         let span = super::super::nats::producer_span_with_parent(
             "request",
             &subject,
             body.len(),
-            parent.map(parent_context),
+            parent.clone(),
         );
-        let headers = super::super::nats::headers_for_span(&span);
+        let headers = super::super::nats::headers_for_span(&span, parent);
         let timeout = std::time::Duration::from_millis(timeout_ms as u64);
         let result = async {
             match tokio::time::timeout(
@@ -77,13 +78,14 @@ impl MsgBackend for NatsMsgBackend {
         msg: BrokerMessage,
         parent: Option<TraceContext>,
     ) -> Result<(), String> {
+        let parent = parent.map(parent_context);
         let span = super::super::nats::producer_span_with_parent(
             "publish",
             &msg.subject,
             msg.body.len(),
-            parent.map(parent_context),
+            parent.clone(),
         );
-        let headers = super::super::nats::headers_for_span(&span);
+        let headers = super::super::nats::headers_for_span(&span, parent);
         let result = async {
             if let Some(reply_to) = msg.reply_to {
                 self.client

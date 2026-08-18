@@ -42,7 +42,7 @@ use hyper_util::{
 use opentelemetry::{KeyValue, context::FutureExt, trace::TraceContextExt};
 use opentelemetry_semantic_conventions::attribute::{
     HTTP_REQUEST_METHOD, HTTP_RESPONSE_BODY_SIZE, HTTP_RESPONSE_STATUS_CODE, OTEL_STATUS_CODE,
-    RPC_GRPC_STATUS_CODE, SERVER_ADDRESS, SERVER_PORT, URL_FULL, URL_PATH,
+    SERVER_ADDRESS, SERVER_PORT, URL_FULL, URL_PATH,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -60,6 +60,8 @@ use wasmtime_wasi_http::{
         types::{HostFutureIncomingResponse, IncomingResponse, OutgoingRequestConfig},
     },
 };
+
+const RPC_RESPONSE_STATUS_CODE: &str = "rpc.response.status_code";
 
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
@@ -1821,7 +1823,7 @@ fn outbound_client_span<B>(request: &mut hyper::Request<B>) -> tracing::Span {
         { SERVER_ADDRESS } = request.uri().host().unwrap_or_default(),
         { SERVER_PORT } = tracing::field::Empty,
         { HTTP_RESPONSE_STATUS_CODE } = tracing::field::Empty,
-        { RPC_GRPC_STATUS_CODE } = tracing::field::Empty,
+        { RPC_RESPONSE_STATUS_CODE } = tracing::field::Empty,
         { OTEL_STATUS_CODE } = tracing::field::Empty,
     );
     if let Some(port) = request.uri().port_u16() {
@@ -1927,12 +1929,8 @@ fn record_outgoing_result(
 /// them; a status delivered in actual trailers (the streaming-success case) is
 /// not read here.
 fn record_grpc_status(headers: &hyper::HeaderMap) {
-    if let Some(code) = headers
-        .get("grpc-status")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<i64>().ok())
-    {
-        tracing::Span::current().record(RPC_GRPC_STATUS_CODE, code);
+    if let Some(code) = headers.get("grpc-status").and_then(|v| v.to_str().ok()) {
+        tracing::Span::current().record(RPC_RESPONSE_STATUS_CODE, code);
     }
 }
 
@@ -2348,21 +2346,9 @@ fn send_grpc_request(
     config: OutgoingRequestConfig,
     tls: Arc<rustls::ClientConfig>,
 ) -> HostFutureIncomingResponse {
-    let span = outbound_client_span(request.method(), request.uri());
-    let handle = wasmtime_wasi::runtime::spawn(
-        async move {
-            let result = send_grpc_request_handler(request, config, tls).await;
-            match &result {
-                Ok(incoming) => {
-                    record_outbound_status(incoming.resp.status());
-                    record_grpc_status(incoming.resp.headers());
-                }
-                Err(_) => record_outbound_error(),
-            }
-            Ok(result)
-        }
-        .instrument(span),
-    );
+    let handle = wasmtime_wasi::runtime::spawn(async move {
+        Ok(send_grpc_request_handler(request, config, tls).await)
+    });
     HostFutureIncomingResponse::pending(handle)
 }
 
