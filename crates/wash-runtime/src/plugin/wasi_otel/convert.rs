@@ -276,29 +276,48 @@ fn span_context(value: &WitSpanContext) -> Result<SpanContext, SpanConversionErr
 fn json_value(key: &str, raw: &str) -> Result<Value, SpanConversionError> {
     let value: serde_json::Value = serde_json::from_str(raw)
         .map_err(|_| SpanConversionError::UnsupportedAttribute(key.to_string()))?;
+    let unsupported = || SpanConversionError::UnsupportedAttribute(key.to_string());
     match value {
         serde_json::Value::String(v) => Ok(v.into()),
         serde_json::Value::Bool(v) => Ok(v.into()),
-        serde_json::Value::Number(v) if v.is_i64() => Ok(v.as_i64().unwrap().into()),
-        serde_json::Value::Number(v) if v.is_f64() => Ok(v.as_f64().unwrap().into()),
+        serde_json::Value::Number(v) if v.is_i64() => {
+            v.as_i64().map(Value::from).ok_or_else(unsupported)
+        }
+        serde_json::Value::Number(v) if v.is_f64() => {
+            v.as_f64().map(Value::from).ok_or_else(unsupported)
+        }
         serde_json::Value::Array(v) if v.iter().all(serde_json::Value::is_string) => {
             Ok(Value::Array(Array::String(
                 v.into_iter()
-                    .map(|v| v.as_str().unwrap().to_string().into())
-                    .collect(),
+                    .map(|v| v.as_str().map(|value| value.to_string().into()))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(unsupported)?,
             )))
         }
         serde_json::Value::Array(v) if v.iter().all(serde_json::Value::is_boolean) => {
             Ok(Value::Array(Array::Bool(
-                v.into_iter().map(|v| v.as_bool().unwrap()).collect(),
+                v.iter()
+                    .map(serde_json::Value::as_bool)
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(unsupported)?,
             )))
         }
-        serde_json::Value::Array(v) if v.iter().all(serde_json::Value::is_i64) => Ok(Value::Array(
-            Array::I64(v.into_iter().map(|v| v.as_i64().unwrap()).collect()),
-        )),
-        serde_json::Value::Array(v) if v.iter().all(serde_json::Value::is_f64) => Ok(Value::Array(
-            Array::F64(v.into_iter().map(|v| v.as_f64().unwrap()).collect()),
-        )),
+        serde_json::Value::Array(v) if v.iter().all(serde_json::Value::is_i64) => {
+            Ok(Value::Array(Array::I64(
+                v.iter()
+                    .map(serde_json::Value::as_i64)
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(unsupported)?,
+            )))
+        }
+        serde_json::Value::Array(v) if v.iter().all(serde_json::Value::is_f64) => {
+            Ok(Value::Array(Array::F64(
+                v.iter()
+                    .map(serde_json::Value::as_f64)
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(unsupported)?,
+            )))
+        }
         _ => Err(SpanConversionError::UnsupportedAttribute(key.to_string())),
     }
 }

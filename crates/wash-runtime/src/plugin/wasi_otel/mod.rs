@@ -91,7 +91,7 @@ pub trait WasiOtelSpanProcessorFactory: Send + Sync + std::fmt::Debug + 'static 
 }
 
 enum SpanSubmission {
-    Span(SpanData),
+    Span(Box<SpanData>),
     Shutdown,
 }
 
@@ -107,7 +107,7 @@ impl ComponentContext {
     fn submit(&self, span: SpanData) {
         if self
             .submissions
-            .try_send(SpanSubmission::Span(span))
+            .try_send(SpanSubmission::Span(Box::new(span)))
             .is_ok()
         {
             return;
@@ -159,7 +159,7 @@ fn component_context(
     let dropped_spans = Arc::new(AtomicU64::new(0));
     let worker = std::thread::spawn(move || {
         while let Ok(SpanSubmission::Span(span)) = receiver.recv() {
-            span_processor.on_end(span);
+            span_processor.on_end(*span);
         }
         if let Err(error) = span_processor.force_flush() {
             tracing::warn!(error = %error, exception.slug = "wasi-otel-component-flush-failed", "Failed to flush component spans");
@@ -569,7 +569,7 @@ impl<'a> bindings::wasi::otel::tracing::Host for ActiveCtx<'a> {
             );
 
             let tracker = plugin.tracker.read().await;
-            if let Some(component) = tracker.get_component_data(&self.component_id.to_string()) {
+            if let Some(component) = tracker.get_component_data(self.component_id.as_ref()) {
                 match try_into_sdk_span_data(span_data, Some(&outer_span_context)) {
                     Ok(span) => component.submit(span),
                     Err(error) => tracing::warn!(
