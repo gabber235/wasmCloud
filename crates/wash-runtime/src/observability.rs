@@ -2,9 +2,66 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 
 use anyhow::Context;
 
+use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
+use opentelemetry::trace::{TraceContextExt, TracerProvider};
+use opentelemetry::{Context as OtelContext, KeyValue};
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use std::time::Duration;
 
-use opentelemetry::{KeyValue, trace::TracerProvider};
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PropagationContext {
+    pub traceparent: String,
+    pub tracestate: Option<String>,
+}
+
+#[derive(Debug)]
+struct PropagationCarrier(PropagationContext);
+
+impl Extractor for PropagationCarrier {
+    fn get(&self, key: &str) -> Option<&str> {
+        match key {
+            "traceparent" => Some(&self.0.traceparent),
+            "tracestate" => self.0.tracestate.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        vec!["traceparent", "tracestate"]
+    }
+}
+
+impl Injector for PropagationCarrier {
+    fn set(&mut self, key: &str, value: String) {
+        match key {
+            "traceparent" => self.0.traceparent = value,
+            "tracestate" => self.0.tracestate = Some(value),
+            _ => {}
+        }
+    }
+}
+
+pub fn context_from_propagation(value: &PropagationContext) -> anyhow::Result<OtelContext> {
+    if let Some(state) = &value.tracestate {
+        let _: opentelemetry::trace::TraceState =
+            state.parse().context("invalid W3C tracestate")?;
+    }
+    let context = TraceContextPropagator::new().extract(&PropagationCarrier(value.clone()));
+    anyhow::ensure!(
+        context.span().span_context().is_valid(),
+        "invalid W3C trace context"
+    );
+    Ok(context)
+}
+
+pub fn inject_context(context: &OtelContext) -> PropagationContext {
+    let mut carrier = PropagationCarrier(PropagationContext {
+        traceparent: String::new(),
+        tracestate: None,
+    });
+    TraceContextPropagator::new().inject_context(context, &mut carrier);
+    carrier.0
+}
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_sdk::Resource;
 use opentelemetry_semantic_conventions::attribute::ERROR_TYPE;
@@ -90,9 +147,18 @@ pub fn initialize_observability(
         .with_ansi(ansi_colors)
         .with_filter(fmt_filter);
 
+    opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+
     let otel_enabled = std::env::vars().any(|(key, _)| key.starts_with("OTEL_"));
     if !otel_enabled {
-        Registry::default().with(fmt_layer).init();
+        let tracer_provider = opentelemetry_sdk::trace::TracerProviderBuilder::default().build();
+        let otel_tracer_layer = tracing_opentelemetry::layer()
+            .with_tracer(tracer_provider.tracer("runtime"))
+            .with_filter(EnvFilter::new(log_level.as_str()));
+        Registry::default()
+            .with(fmt_layer)
+            .with(otel_tracer_layer)
+            .init();
 
         // Nothing to flush: `flush` finds no registered shutdown and returns.
         return Ok(Box::new(flush));

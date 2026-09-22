@@ -48,7 +48,7 @@ use opentelemetry::KeyValue;
 use opentelemetry::context::FutureExt;
 use opentelemetry_semantic_conventions::attribute::{
     ERROR_TYPE, HTTP_REQUEST_METHOD, HTTP_RESPONSE_BODY_SIZE, HTTP_RESPONSE_STATUS_CODE,
-    OTEL_STATUS_CODE, RPC_GRPC_STATUS_CODE, SERVER_ADDRESS, SERVER_PORT, URL_FULL, URL_PATH,
+    OTEL_STATUS_CODE, RPC_RESPONSE_STATUS_CODE, SERVER_ADDRESS, SERVER_PORT, URL_FULL, URL_PATH,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -2271,7 +2271,7 @@ fn outbound_client_span(method: &hyper::Method, uri: &hyper::Uri) -> tracing::Sp
         { SERVER_ADDRESS } = uri.host().unwrap_or_default(),
         { SERVER_PORT } = tracing::field::Empty,
         { HTTP_RESPONSE_STATUS_CODE } = tracing::field::Empty,
-        { RPC_GRPC_STATUS_CODE } = tracing::field::Empty,
+        { RPC_RESPONSE_STATUS_CODE } = tracing::field::Empty,
         { OTEL_STATUS_CODE } = tracing::field::Empty,
     );
     if let Some(port) = uri.port_u16() {
@@ -2308,7 +2308,29 @@ fn record_grpc_status(headers: &hyper::HeaderMap) {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<i64>().ok())
     {
-        tracing::Span::current().record(RPC_GRPC_STATUS_CODE, code);
+        tracing::Span::current().record(
+            RPC_RESPONSE_STATUS_CODE,
+            match code {
+                0 => "OK",
+                1 => "CANCELLED",
+                2 => "UNKNOWN",
+                3 => "INVALID_ARGUMENT",
+                4 => "DEADLINE_EXCEEDED",
+                5 => "NOT_FOUND",
+                6 => "ALREADY_EXISTS",
+                7 => "PERMISSION_DENIED",
+                8 => "RESOURCE_EXHAUSTED",
+                9 => "FAILED_PRECONDITION",
+                10 => "ABORTED",
+                11 => "OUT_OF_RANGE",
+                12 => "UNIMPLEMENTED",
+                13 => "INTERNAL",
+                14 => "UNAVAILABLE",
+                15 => "DATA_LOSS",
+                16 => "UNAUTHENTICATED",
+                _ => "UNKNOWN",
+            },
+        );
     }
 }
 
