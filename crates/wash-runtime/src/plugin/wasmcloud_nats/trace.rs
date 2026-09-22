@@ -17,10 +17,10 @@ pub(super) fn parent(headers: &async_nats::HeaderMap) -> Option<opentelemetry::C
 }
 
 pub(super) fn set_parent(span: &tracing::Span, parent: Option<opentelemetry::Context>) {
-    if let Some(parent) = parent {
-        if let Err(error) = span.set_parent(parent) {
-            tracing::warn!(%error, "cannot attach NATS trace context");
-        }
+    if let Some(parent) = parent
+        && let Err(error) = span.set_parent(parent)
+    {
+        tracing::warn!(%error, "cannot attach NATS trace context");
     }
 }
 
@@ -40,7 +40,20 @@ pub(super) fn producer(
     if !context.traceparent.is_empty() {
         let headers = headers.get_or_insert_with(async_nats::HeaderMap::new);
         headers.insert("traceparent", context.traceparent.as_str());
-        headers.remove("tracestate");
+        if context.tracestate.is_none() && headers.get("tracestate").is_some() {
+            *headers = headers
+                .iter()
+                .filter(|(name, _)| {
+                    let name: &str = name.as_ref();
+                    name != "tracestate"
+                })
+                .flat_map(|(name, values)| {
+                    values
+                        .iter()
+                        .map(move |value| (name.clone(), value.clone()))
+                })
+                .collect();
+        }
         if let Some(state) = context.tracestate {
             headers.insert("tracestate", state.as_str());
         }

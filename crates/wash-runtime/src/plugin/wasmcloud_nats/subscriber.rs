@@ -2141,6 +2141,8 @@ pub(super) async fn spawn_core_subscriptions(
         });
     }
 
+    // Readiness requires the server to have processed every subscription.
+    super::synchronize(&conn.client).await?;
     Ok(())
 }
 

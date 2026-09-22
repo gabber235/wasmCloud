@@ -16,6 +16,7 @@ pub(super) struct Activity {
 pub(super) struct Delivery(pub Arc<Activity>);
 impl Drop for Delivery {
     fn drop(&mut self) {
+        self.0.generation.fetch_add(1, Ordering::SeqCst);
         self.0.pending.fetch_sub(1, Ordering::SeqCst);
         self.0.changed.notify_waiters();
     }
@@ -94,4 +95,19 @@ mod tests {
         drop(activity.reader());
         assert!(activity.fence().await.is_err());
     }
+}
+
+/// Waits for the broker to process commands previously sent by this client.
+/// A local buffer flush does not provide this ordering guarantee.
+pub async fn synchronize(client: &async_nats::Client) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use futures::StreamExt as _;
+    let inbox = client.new_inbox();
+    let mut sentinel = client.subscribe(inbox.clone()).await?;
+    client.publish(inbox, bytes::Bytes::new()).await?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), sentinel.next())
+        .await
+        .context("NATS synchronization timed out")?
+        .context("NATS synchronization subscription closed")?;
+    Ok(())
 }

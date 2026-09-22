@@ -82,3 +82,5 @@ pub(super) mod kv_bindings {
 pub const PLUGIN_NATS_ID: &str = "wasmcloud-nats";
 
 const NATS_VERSION: &str = "0.1.0";
+
+pub use activity::synchronize;

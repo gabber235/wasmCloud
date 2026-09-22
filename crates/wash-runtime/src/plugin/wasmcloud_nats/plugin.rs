@@ -116,7 +116,7 @@ impl WasmcloudNats {
 
     /// Waits for queued and executing Core NATS deliveries to finish.
     ///
-    /// Callers must stop producing input and flush their clients first. The caller
+    /// Callers must stop producing input and synchronize their clients first. The caller
     /// owns the timeout. This does not wait for JetStream or KV delivery loops.
     pub async fn wait_core_idle(&self, workload_id: &str) -> anyhow::Result<()> {
         let connections = self.connections.bindings_for(workload_id).await;
@@ -126,8 +126,12 @@ impl WasmcloudNats {
                 .values()
                 .map(|c| c.activity.generation())
                 .collect();
-            for conn in connections.values() {
-                conn.client.flush().await?;
+            // First settle every producer connection, then every consumer connection.
+            // A message can cross connections while the first round is in progress.
+            for _ in 0..2 {
+                for conn in connections.values() {
+                    super::synchronize(&conn.client).await?;
+                }
             }
             for conn in connections.values() {
                 conn.activity.fence().await?;
