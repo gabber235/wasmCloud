@@ -221,6 +221,7 @@ pub mod abandon;
 pub mod ctx;
 pub mod dispatch;
 pub mod guest_memory;
+pub(crate) mod guest_trace;
 pub(crate) mod instance_driver;
 pub(crate) mod instance_pool;
 pub use instance_pool::{InstancePolicy, ReclaimPolicy};

@@ -45,11 +45,16 @@ const DEFAULT_OTLP_GRPC_ENDPOINT: &str = "http://localhost:4317";
 mod bindings {
     wasmtime::component::bindgen!({
         world: "otel",
-        imports: { default: async | trappable },
+        imports: {
+            "wasi:otel/tracing.outer-span-context": store | trappable,
+            default: async | trappable,
+        },
     });
 }
 
-use bindings::wasi::otel::tracing::{SpanContext as WitSpanContext, TraceFlags as WitTraceFlags};
+use bindings::wasi::otel::tracing::SpanContext as WitSpanContext;
+#[cfg(test)]
+use bindings::wasi::otel::tracing::TraceFlags as WitTraceFlags;
 
 /// Configuration for the [`WasiOtel`] plugin.
 ///
@@ -587,29 +592,16 @@ impl<'a> bindings::wasi::otel::tracing::Host for ActiveCtx<'a> {
         }
         Ok(())
     }
+}
 
-    async fn outer_span_context(&mut self) -> wasmtime::Result<WitSpanContext> {
-        // Host calls are instrumented with `tracing::Span`, so bridge through the
-        // tracing-opentelemetry layer instead of the OTel thread-local context.
-        let span_context = current_outer_span_context();
-
-        if span_context.is_valid() {
-            tracing::info!(
-                trace_id = %format!("{:032x}", span_context.trace_id()),
-                span_id = %format!("{:016x}", span_context.span_id()),
-                "Returning outer span context"
-            );
-            Ok(otel_span_context_to_wit(&span_context))
-        } else {
-            tracing::info!("No valid outer span context available");
-            Ok(WitSpanContext {
-                trace_id: String::new(),
-                span_id: String::new(),
-                trace_flags: WitTraceFlags::empty(),
-                is_remote: false,
-                trace_state: vec![],
-            })
-        }
+impl<T: Send> bindings::wasi::otel::tracing::HostWithStore<T> for SharedCtx {
+    fn outer_span_context(
+        mut host: wasmtime::component::Access<'_, T, Self>,
+    ) -> wasmtime::Result<WitSpanContext> {
+        let span = crate::engine::guest_trace::current(&mut host);
+        let context = span.context();
+        let span_context = context.span();
+        Ok(otel_span_context_to_wit(span_context.span_context()))
     }
 }
 

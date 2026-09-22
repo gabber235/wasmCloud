@@ -1026,6 +1026,7 @@ pub type WorkloadHandles = Arc<
 /// a oneshot for its response and the abandonment flag of the [`DispatchedCall`]
 /// enforcing its deadline (see [`crate::engine::abandon`]).
 pub struct ServiceHttpJob {
+    pub span: tracing::Span,
     pub req: hyper::Request<hyper::body::Incoming>,
     pub resp_tx: tokio::sync::oneshot::Sender<anyhow::Result<hyper::Response<HyperOutgoingBody>>>,
     pub abandoned: Arc<AbandonFlag>,
@@ -2204,6 +2205,7 @@ async fn handle_http_request<T: Router>(
         // a waiter out here can abandon the call (see `crate::engine::abandon`).
         let call = DispatchedCall::new("HTTP (service)", crate::timeouts::http_response());
         let job = ServiceHttpJob {
+            span: tracing::Span::current(),
             req,
             resp_tx,
             abandoned: call.flag(),
@@ -2585,6 +2587,7 @@ async fn invoke_component_handler(
             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
             let call = DispatchedCall::new("HTTP (pooled)", crate::timeouts::http_response());
             let job = InstanceJob::Http(Box::new(ServiceHttpJob {
+                span: tracing::Span::current(),
                 req,
                 resp_tx,
                 abandoned: call.flag(),

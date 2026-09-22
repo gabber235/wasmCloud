@@ -232,12 +232,14 @@ impl PreparedIngress {
         match self {
             PreparedIngress::Http { service, rx } => {
                 while let Some(ServiceHttpJob {
+                    span,
                     req,
                     resp_tx,
                     abandoned,
                 }) = rx.recv().await
                 {
                     if let Err(e) = accessor.spawn(HttpTask {
+                        span,
                         service: Arc::clone(service),
                         req,
                         resp_tx,

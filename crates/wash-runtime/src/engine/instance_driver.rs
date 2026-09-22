@@ -473,6 +473,7 @@ impl InstanceDriver {
                         let spawned = match job {
                             InstanceJob::Http(job) => {
                                 let ServiceHttpJob {
+                                    span,
                                     req,
                                     resp_tx,
                                     abandoned,
@@ -488,6 +489,7 @@ impl InstanceDriver {
                                     continue;
                                 };
                                 accessor.spawn(HttpTask {
+                                    span,
                                     service,
                                     req,
                                     resp_tx,

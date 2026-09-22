@@ -152,25 +152,28 @@ pub(crate) async fn handle_component_request_p3(
                     // to the client without waiting for `io_fut` (request-body
                     // upload) to finish in the `join!` below.
                     let handler_fut = async move {
-                        let response = match service.handle(store, wasi_req).await {
-                            Ok(Ok(response)) => response,
-                            Ok(Err(error_code)) => {
-                                tracing::error!(?error_code, "P3 HTTP handler returned error");
-                                if let Some(tx) = parts_tx.take() {
-                                    let (mut head, ()) = hyper::Response::new(()).into_parts();
-                                    head.status = hyper::StatusCode::INTERNAL_SERVER_ERROR;
-                                    let _ = tx.send(Ok(head));
+                        let response =
+                            match invoke(&service, store, wasi_req, tracing::Span::current()).await
+                            {
+                                Ok(Ok(response)) => response,
+                                Ok(Err(error_code)) => {
+                                    tracing::error!(?error_code, "P3 HTTP handler returned error");
+                                    if let Some(tx) = parts_tx.take() {
+                                        let (mut head, ()) = hyper::Response::new(()).into_parts();
+                                        head.status = hyper::StatusCode::INTERNAL_SERVER_ERROR;
+                                        let _ = tx.send(Ok(head));
+                                    }
+                                    return Ok(());
                                 }
-                                return Ok(());
-                            }
-                            Err(e) => {
-                                if let Some(tx) = parts_tx.take() {
-                                    let _ =
-                                        tx.send(Err(anyhow::anyhow!(e).context("P3 handler trap")));
+                                Err(e) => {
+                                    if let Some(tx) = parts_tx.take() {
+                                        let _ = tx.send(Err(
+                                            anyhow::anyhow!(e).context("P3 handler trap")
+                                        ));
+                                    }
+                                    return Ok(());
                                 }
-                                return Ok(());
-                            }
-                        };
+                            };
                         // `into_http`'s `fut` reports the body-delivery outcome
                         // back to the guest (it resolves the future returned by
                         // `wasi:http/types.response#new`). Resolve it once we have
@@ -263,6 +266,30 @@ pub(crate) async fn handle_component_request_p3(
     }
     .boxed_unsync();
     Ok(hyper::Response::from_parts(head, body))
+}
+
+/// Invoke the P3 handler under context owned by its guest task.
+pub(crate) async fn invoke(
+    service: &Service,
+    accessor: &wasmtime::component::Accessor<crate::engine::ctx::SharedCtx>,
+    request: wasmtime_wasi_http::p3::Request,
+    span: tracing::Span,
+) -> wasmtime::Result<Result<wasmtime_wasi_http::p3::Response, ErrorCode>> {
+    let request = accessor.with(|mut access| access.get().table.push(request))?;
+    let (response,) = crate::engine::guest_trace::call(
+        accessor,
+        service.wasi_http_handler().func_handle(),
+        (request,),
+    )
+    .instrument(span)
+    .await?;
+    match response {
+        Ok(response) => accessor
+            .with(|mut access| access.get().table.delete(response))
+            .map(Ok)
+            .map_err(Into::into),
+        Err(error) => Ok(Err(error)),
+    }
 }
 
 #[cfg(test)]

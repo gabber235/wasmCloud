@@ -58,6 +58,7 @@ impl hyper::body::Body for ChannelBody {
 /// `run_concurrent` returns an error and the service supervisor restarts (and
 /// re-registers) a fresh instance. See `test_trigger_service_http_restarts_on_fault`.
 pub(crate) struct HttpTask {
+    pub(crate) span: tracing::Span,
     pub(crate) service: Arc<Service>,
     pub(crate) req: hyper::Request<hyper::body::Incoming>,
     pub(crate) resp_tx:
@@ -75,6 +76,7 @@ pub(crate) struct HttpTask {
 impl AccessorTask<SharedCtx> for HttpTask {
     async fn run(self, accessor: &Accessor<SharedCtx>) -> wasmtime::Result<()> {
         let HttpTask {
+            span,
             service,
             req,
             resp_tx,
@@ -116,27 +118,28 @@ impl AccessorTask<SharedCtx> for HttpTask {
         let mut resp_tx = Some(resp_tx);
 
         let handler_fut = async move {
-            let response = match service.handle(accessor, wasi_req).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(error_code)) => {
-                    tracing::error!(?error_code, "service HTTP handler returned error");
-                    if let Some(tx) = resp_tx.take() {
-                        let resp = hyper::Response::builder()
-                            .status(500)
-                            .body(HyperOutgoingBody::default())
-                            .map_err(anyhow::Error::from);
-                        let _ = tx.send(resp);
+            let response =
+                match crate::host::http_p3::invoke(&service, accessor, wasi_req, span).await {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(error_code)) => {
+                        tracing::error!(?error_code, "service HTTP handler returned error");
+                        if let Some(tx) = resp_tx.take() {
+                            let resp = hyper::Response::builder()
+                                .status(500)
+                                .body(HyperOutgoingBody::default())
+                                .map_err(anyhow::Error::from);
+                            let _ = tx.send(resp);
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
-                }
-                Err(e) => {
-                    if let Some(tx) = resp_tx.take() {
-                        let _ =
-                            tx.send(Err(anyhow::anyhow!(e).context("service HTTP handler trap")));
+                    Err(e) => {
+                        if let Some(tx) = resp_tx.take() {
+                            let _ = tx
+                                .send(Err(anyhow::anyhow!(e).context("service HTTP handler trap")));
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
-                }
-            };
+                };
 
             // `into_http`'s future reports the body-delivery outcome back to the
             // guest; resolve it once the body has been fully forwarded.

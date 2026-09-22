@@ -81,9 +81,13 @@ impl JsProxy {
         let p = &self.0;
         store
             .run_concurrent(async move |accessor| {
-                p.wasmcloud_nats_jetstream_handler()
-                    .call_handle_message(accessor, handle)
-                    .await
+                crate::engine::guest_trace::call(
+                    accessor,
+                    p.wasmcloud_nats_jetstream_handler().func_handle_message(),
+                    (handle,),
+                )
+                .await
+                .map(|(result,)| result)
             })
             .await?
     }
@@ -181,10 +185,13 @@ impl GuestCall for CoreDeliveryJob {
                     return Ok(Some("host"));
                 }
             };
-            match proxy
-                .wasmcloud_nats_core_handler()
-                .call_handle_message(accessor, msg)
-                .await
+            match crate::engine::guest_trace::call(
+                accessor,
+                proxy.wasmcloud_nats_core_handler().func_handle_message(),
+                (msg,),
+            )
+            .await
+            .map(|(result,)| result)
             {
                 Ok(inner) => {
                     // The guest's own `result<_, string>`: it ran and said no,
@@ -242,10 +249,13 @@ impl GuestCall for KvDeliveryJob {
                     return Ok(Some("host"));
                 }
             };
-            match proxy
-                .wasmcloud_nats_kv_handler()
-                .call_handle_event(accessor, bucket, entry)
-                .await
+            match crate::engine::guest_trace::call(
+                accessor,
+                proxy.wasmcloud_nats_kv_handler().func_handle_event(),
+                (bucket, entry),
+            )
+            .await
+            .map(|(result,)| result)
             {
                 Ok(inner) => {
                     // The guest's own `result<_, string>`: it ran and said no,

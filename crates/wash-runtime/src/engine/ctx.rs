@@ -62,6 +62,7 @@ impl wasmtime_wasi_tls::TlsProvider for SharedTlsProvider {
 
 /// Shared context for linked components
 pub struct SharedCtx {
+    pub(crate) guest_traces: super::guest_trace::GuestTraces,
     /// Current active context
     pub active_ctx: Ctx,
     /// The resource table used to manage resources in the Wasmtime store.
@@ -117,6 +118,7 @@ pub struct CallerIdentity {
 impl SharedCtx {
     pub fn new(context: Ctx) -> Self {
         Self {
+            guest_traces: Default::default(),
             active_ctx: context,
             table: ResourceTable::new(),
             contexts: Default::default(),
@@ -242,6 +244,8 @@ impl wasmtime::component::HasData for SharedCtx {
 
 pub fn extract_active_ctx(ctx: &mut SharedCtx) -> ActiveCtx<'_> {
     ActiveCtx {
+        #[cfg(feature = "wasi-otel")]
+        guest_traces: &ctx.guest_traces,
         table: &mut ctx.table,
         ctx: &mut ctx.active_ctx,
     }
@@ -255,6 +259,8 @@ pub fn extract_sockets(ctx: &mut SharedCtx) -> crate::sockets::WasiSocketsCtxVie
 }
 
 pub struct ActiveCtx<'a> {
+    #[cfg(feature = "wasi-otel")]
+    pub(crate) guest_traces: &'a super::guest_trace::GuestTraces,
     pub table: &'a mut wasmtime::component::ResourceTable,
     pub ctx: &'a mut Ctx,
 }

@@ -9,7 +9,7 @@ The fork follows native `wasmcloud:nats@0.1.0`. Typewriter components import Cor
 
 - `049e0c1d1`, `19e660466`, `e742187d8`: retire the private async messaging contract, template, and migration documentation. Native NATS provides async operations, headers, typed errors, and JetStream acknowledgements.
 - `3a045389a`, `264e5ed02`, `3cc7f9fa8`: retain exact guest span conversion, component resource identity, W3C propagation, and OpenTelemetry 0.32 compatibility.
-- `6d5a026de`, `1d5e899d1`: migrate propagation into native NATS headers and the shared HTTP boundary. `GuestJob` carries the invocation span across pooled concurrent dispatch.
+- `6d5a026de`, `1d5e899d1`: migrate propagation into native NATS headers and the shared HTTP boundary. `GuestJob` carries the invocation span to dispatch. Native NATS and HTTP calls then associate it with the Wasmtime guest task ID, so host imports recover the correct context while concurrent calls interleave.
 - `9d154ec20`: retain component log capture and deterministic HTTP shutdown. Replace the in memory messaging test transport with isolated real NATS and the production plugin.
 - `6bf96376e`: replace custom runtime activity tracking with Core NATS queued delivery ownership, completion generations, broker synchronization, and reader fences.
 - `8bcc2ee6e`: retire protobuf build dependency gating. The upstream runtime no longer has that build script.
@@ -23,6 +23,10 @@ System subjects follow normal host subject grants. There is no special `$SYS` pr
 ## Interface entry configuration
 
 Component selectors and subscription lists belong to their individual interface entries. Upstream folded them into one connection configuration, which rejected composed workloads or copied a subscription onto the wrong handler. The binding schema now preserves entry settings while resolving connections, credentials, grants, and other shared settings once per binding. Host ownership checks still apply to entry settings.
+
+## Concurrent trace ownership
+
+The Wasmtime scheduler executes guest code outside the future awaiting its result. Instrumenting that future alone loses the context at host imports. Each native NATS delivery and P3 HTTP request registers its ingress span against the guest task ID; the OpenTelemetry boundary resolves the nearest registered caller through the async call stack. An owned registration removes the context on completion, failure, or cancellation. Concurrent calls share a store without sharing trace identity.
 
 ## Completion contract
 

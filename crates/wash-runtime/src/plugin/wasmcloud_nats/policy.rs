@@ -419,7 +419,6 @@ mod tests {
                 subject_allow: subjects.iter().map(|s| s.to_string()).collect(),
                 stream_allow: streams.iter().map(|s| s.to_string()).collect(),
                 bucket_allow: buckets.iter().map(|s| s.to_string()).collect(),
-                ..Default::default()
             },
             Vec::new(),
         )
