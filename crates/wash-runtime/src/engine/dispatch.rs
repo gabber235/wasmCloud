@@ -49,6 +49,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use anyhow::{Context as _, bail};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::task::AbortOnDropHandle;
+use tracing::Instrument as _;
 use wasmtime::component::{Accessor, AccessorTask, Instance, InstancePre};
 
 use crate::engine::ctx::SharedCtx;
@@ -166,6 +167,7 @@ pub trait GuestCall: Send + 'static {
 /// Opaque: a job is minted by [`DispatchTarget::dispatch`] and is only ever
 /// handed to the instance that runs it.
 pub struct GuestJob {
+    span: tracing::Span,
     call: Box<dyn GuestCall>,
     reply: oneshot::Sender<anyhow::Result<()>>,
     /// The abandonment flag of the dispatched call enforcing this job's
@@ -193,6 +195,7 @@ impl GuestJob {
         attributes: Arc<[opentelemetry::KeyValue]>,
     ) -> Self {
         Self {
+            span: tracing::Span::current(),
             call,
             reply,
             abandoned,
@@ -222,6 +225,7 @@ impl GuestJob {
         instance: Instance,
     ) -> anyhow::Result<()> {
         let GuestJob {
+            span,
             call,
             reply: _,
             abandoned,
@@ -229,7 +233,9 @@ impl GuestJob {
         } = self;
         store
             .run_concurrent(async move |accessor| {
-                serve(accessor, instance, call, abandoned, attributes, None).await
+                serve(accessor, instance, call, abandoned, attributes, None)
+                    .instrument(span)
+                    .await
             })
             .await
             .map_err(|e| anyhow::anyhow!("dispatched call store faulted: {e:#}"))?
@@ -262,12 +268,15 @@ impl AccessorTask<SharedCtx> for GuestTask {
             pool_slot,
         } = self;
         let GuestJob {
+            span,
             call,
             reply,
             abandoned,
             attributes,
         } = job;
-        let outcome = serve(accessor, instance, call, abandoned, attributes, pool_slot).await;
+        let outcome = serve(accessor, instance, call, abandoned, attributes, pool_slot)
+            .instrument(span)
+            .await;
         // The dispatcher may have gone; the call still ran, because a guest
         // subtask cannot be cancelled from the host.
         let _ = reply.send(outcome);

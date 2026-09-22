@@ -35,6 +35,7 @@ const BUCKET_BACKING_STREAM_PREFIXES: &[&str] = &["KV_", "OBJ_"];
 /// Compiled per-workload grant.
 #[derive(Debug, Clone)]
 pub struct PolicyEngine {
+    auth_callout_subscription: bool,
     subject_allow: Vec<NatsSubjectPattern>,
     /// The subject grant as written. Kept because a bind-time check needs the
     /// literal subjects an operator named, which a compiled pattern no longer
@@ -230,6 +231,7 @@ fn reaches_reserved(pattern: &str, lattice_prefixes: &[String]) -> bool {
 impl PolicyEngine {
     pub fn new(spec: &PolicySpec, lattice_prefixes: Vec<String>) -> Self {
         Self {
+            auth_callout_subscription: spec.auth_callout_subscription,
             subject_allow: spec
                 .subject_allow
                 .iter()
@@ -326,7 +328,9 @@ impl PolicyEngine {
     pub fn check_subscription(&self, pattern: &str) -> Result<(), Denied> {
         // A wildcard cannot be allowed to straddle into a reserved space, so
         // reject any pattern whose literal head could reach one.
-        if self.is_reserved(pattern) || reaches_reserved(pattern, &self.lattice_prefixes) {
+        if !(self.auth_callout_subscription && pattern == "$SYS.REQ.USER.AUTH")
+            && (self.is_reserved(pattern) || reaches_reserved(pattern, &self.lattice_prefixes))
+        {
             return Err(Denied::Reserved);
         }
         let requested = NatsSubjectPattern::parse(pattern);
@@ -419,9 +423,41 @@ mod tests {
                 subject_allow: subjects.iter().map(|s| s.to_string()).collect(),
                 stream_allow: streams.iter().map(|s| s.to_string()).collect(),
                 bucket_allow: buckets.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
             },
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn auth_capability_only_permits_exact_granted_subscription() {
+        let subject = "$SYS.REQ.USER.AUTH";
+        let p = PolicyEngine::new(
+            &PolicySpec {
+                auth_callout_subscription: true,
+                subject_allow: vec![subject.into()],
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        assert_eq!(p.check_subscription(subject), Ok(()));
+        assert_eq!(p.check_subject(subject), Err(Denied::Reserved));
+        for pattern in ["$SYS.>", "$SYS.REQ.USER.*", "$SYS.REQ.USER.OTHER", ">"] {
+            assert_eq!(p.check_subscription(pattern), Err(Denied::Reserved));
+        }
+        let ordinary = engine(&[subject], &[], &[]);
+        assert_eq!(ordinary.check_subscription(subject), Err(Denied::Reserved));
+        let ungranted = PolicyEngine::new(
+            &PolicySpec {
+                auth_callout_subscription: true,
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        assert_eq!(
+            ungranted.check_subscription(subject),
+            Err(Denied::NotGranted)
+        );
     }
 
     #[test]

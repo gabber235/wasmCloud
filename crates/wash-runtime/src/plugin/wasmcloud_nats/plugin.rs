@@ -114,6 +114,34 @@ impl WasmcloudNats {
         self
     }
 
+    /// Waits for queued and executing Core NATS deliveries to finish.
+    ///
+    /// Callers must stop producing input and flush their clients first. The caller
+    /// owns the timeout. This does not wait for JetStream or KV delivery loops.
+    pub async fn wait_core_idle(&self, workload_id: &str) -> anyhow::Result<()> {
+        let connections = self.connections.bindings_for(workload_id).await;
+        anyhow::ensure!(!connections.is_empty(), "no NATS workload connections");
+        loop {
+            let generations: Vec<_> = connections
+                .values()
+                .map(|c| c.activity.generation())
+                .collect();
+            for conn in connections.values() {
+                conn.client.flush().await?;
+            }
+            for conn in connections.values() {
+                conn.activity.fence().await?;
+            }
+            if connections
+                .values()
+                .zip(generations)
+                .all(|(c, g)| c.activity.generation() == g)
+            {
+                return Ok(());
+            }
+        }
+    }
+
     /// Resolves the connection a plain, unlabeled call goes out on.
     pub(super) async fn conn_for(&self, workload_id: &str) -> Option<Arc<ConnHandle>> {
         self.connections.get(workload_id).await
@@ -128,6 +156,7 @@ impl WasmcloudNats {
     async fn open_bindings(
         &self,
         workload_id: &str,
+        workload_identity: &str,
         bindings: Vec<(&str, HashMap<String, String>)>,
         opened: &mut bool,
     ) -> anyhow::Result<()> {
@@ -180,6 +209,7 @@ impl WasmcloudNats {
             // `get-by-sequence` — indistinguishable from an empty stream, and
             // silent. The config can never return a message, so say so once at
             // bind rather than leaving it to be debugged from the outside.
+            config.scope_to_workload(workload_identity)?;
             if !config.policy.stream_allow.is_empty() && config.policy.subject_allow.is_empty() {
                 tracing::warn!(
                     workload_id,
@@ -737,7 +767,14 @@ impl HostPlugin for WasmcloudNats {
             "opening wasmcloud:nats bindings"
         );
         let mut opened = false;
-        let result = self.open_bindings(workload_id, bindings, &mut opened).await;
+        let result = self
+            .open_bindings(
+                workload_id,
+                &format!("{}/{}", workload.namespace(), workload.name()),
+                bindings,
+                &mut opened,
+            )
+            .await;
         if result.is_err() && opened {
             self.connections.release(workload_id).await;
         }
@@ -1337,7 +1374,12 @@ mod tests {
         let merged = HashMap::from([("core-subscriptions".to_string(), "orders.new".to_string())]);
 
         let err = plugin
-            .open_bindings("wl", vec![(UNNAMED_BINDING, merged)], &mut opened)
+            .open_bindings(
+                "wl",
+                "test/workload",
+                vec![(UNNAMED_BINDING, merged)],
+                &mut opened,
+            )
             .await
             .expect_err("no servers reached the plugin");
         let msg = err.to_string();
@@ -1380,7 +1422,12 @@ mod tests {
 
         let mut opened = false;
         let err = plugin
-            .open_bindings("wl", vec![(UNNAMED_BINDING, merged)], &mut opened)
+            .open_bindings(
+                "wl",
+                "test/workload",
+                vec![(UNNAMED_BINDING, merged)],
+                &mut opened,
+            )
             .await
             .expect_err("nothing is listening on nats://host:4222");
         let msg = err.to_string();
@@ -1469,6 +1516,26 @@ mod tests {
 
     /// A refusal from the host's declaration fails the bind, and names the
     /// binding it came from.
+    #[test]
+    fn workload_cannot_grant_itself_the_auth_callout_exception() {
+        let declared = PluginBindingSet::new(super::super::PLUGIN_NATS_ID)
+            .with_workload_config(WorkloadConfigPolicy::Deny)
+            .with_binding("default", HashMap::new());
+        let plugin = WasmcloudNats::new();
+        for (key, value) in [
+            ("auth-callout-subscription", "true"),
+            ("auth-callout-workload", "other/attacker"),
+        ] {
+            let result = declared.resolve(
+                "default",
+                &HashMap::from([(key.to_string(), value.to_string())]),
+                &super::super::binding_schema(),
+                &|key: &str, host: &str, workload: &str| plugin.narrows(key, host, workload),
+            );
+            assert!(result.is_err(), "workload supplied privileged key: {key}");
+        }
+    }
+
     #[test]
     fn a_refused_workload_key_fails_the_bind() {
         let declared = PluginBindingSet::new(super::super::PLUGIN_NATS_ID)

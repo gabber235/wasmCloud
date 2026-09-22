@@ -43,6 +43,7 @@ const CREDS_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 
 /// A live connection plus everything derived from the config that opened it.
 pub struct ConnHandle {
+    pub(super) activity: Arc<super::activity::Activity>,
     /// Bumped every time the client (re)connects.
     ///
     /// A JetStream push subscription cannot survive a server restart — an
@@ -473,6 +474,7 @@ impl ConnectionRegistry {
                 u64::try_from(config.limits.subscription_capacity_bytes).unwrap_or(u64::MAX),
             )),
             pending_replies: std::sync::Mutex::new(HashMap::new()),
+            activity: Arc::new(super::activity::Activity::default()),
         });
 
         let mut workloads = self.workloads.write().await;

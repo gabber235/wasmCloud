@@ -80,6 +80,8 @@ const fn workload(canonical: &'static str) -> Key {
 /// Everything else is the workload's: what it does within the grant.
 pub const KEYS: &[Key] = &[
     // Connection — where the binding points and as whom.
+    host("auth-callout-subscription"),
+    host("auth-callout-workload"),
     host("servers"),
     host("name"),
     host("jetstream-domain"),

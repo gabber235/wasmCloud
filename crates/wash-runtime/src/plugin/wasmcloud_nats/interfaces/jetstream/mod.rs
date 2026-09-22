@@ -9,7 +9,7 @@ use std::time::Duration;
 use async_nats::jetstream;
 use async_nats::jetstream::consumer::FromConsumer as _;
 use futures::StreamExt as _;
-use tracing::{debug, warn};
+use tracing::{Instrument as _, debug, warn};
 use wasmtime::component::{Accessor, Resource};
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx};
@@ -100,10 +100,11 @@ impl<T: 'static + Send> labeled_js::HostWithStore<T> for SharedCtx {
                 "jetstream publish: caller-supplied reply-to is ignored"
             );
         }
-        let headers = match outbound_headers(msg.headers.as_deref()) {
+        let mut headers = match outbound_headers(msg.headers.as_deref()) {
             Ok(h) => h,
             Err(e) => return Ok(Err(e)),
         };
+        let span = super::super::trace::producer("persist", &msg.subject, &mut headers);
         if let Err(e) = check_payload(msg.body.len(), headers.as_ref(), &conn) {
             return Ok(Err(e));
         }
@@ -112,9 +113,15 @@ impl<T: 'static + Send> labeled_js::HostWithStore<T> for SharedCtx {
             Some(headers) => {
                 conn.jetstream
                     .publish_with_headers(msg.subject, headers, msg.body.into())
+                    .instrument(span.clone())
                     .await
             }
-            None => conn.jetstream.publish(msg.subject, msg.body.into()).await,
+            None => {
+                conn.jetstream
+                    .publish(msg.subject, msg.body.into())
+                    .instrument(span.clone())
+                    .await
+            }
         };
         let ack_future = match ack_future {
             Ok(f) => f,
@@ -127,7 +134,7 @@ impl<T: 'static + Send> labeled_js::HostWithStore<T> for SharedCtx {
             }
         };
 
-        match ack_future.await {
+        match async move { ack_future.await }.instrument(span).await {
             Ok(ack) => Ok(Ok(js::PublishAck {
                 stream_name: ack.stream,
                 sequence: ack.sequence,

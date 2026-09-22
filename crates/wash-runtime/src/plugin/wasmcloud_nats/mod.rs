@@ -5,6 +5,7 @@
 //! in `config`, and the long-lived subscription loops it spawns are in
 //! `subscriber`.
 
+mod activity;
 pub(super) mod config;
 pub(super) mod conn;
 pub(super) mod interfaces;
@@ -15,6 +16,7 @@ pub(super) mod macros;
 mod plugin;
 pub(super) mod policy;
 mod subscriber;
+mod trace;
 pub(super) mod warm;
 
 pub use plugin::{ComponentData, WasmcloudNats};

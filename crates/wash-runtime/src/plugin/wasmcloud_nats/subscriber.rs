@@ -1216,6 +1216,7 @@ pub(super) async fn spawn_jetstream_subscriptions(
 
                             delivered_this_cycle = true;
 
+                            let parent = raw.headers.as_ref().and_then(super::trace::parent);
                             let subject_str = raw.subject.to_string();
                             let (sequence, delivery_count) = match raw.info() {
                                 Ok(i) => (i.stream_sequence, i.delivered as u32),
@@ -1389,6 +1390,8 @@ pub(super) async fn spawn_jetstream_subscriptions(
                                 sequence,
                                 stream = %sub.stream,
                             );
+
+                            super::trace::set_parent(&span, parent);
 
                             // Kept so the handle can be cleared before the
                             // store is parked; see the delete below.
@@ -1890,10 +1893,12 @@ fn record_shed(
 fn spawn_core_reader(
     subject: String,
     mut messages: async_nats::Subscriber,
-    deliveries: tokio::sync::mpsc::Sender<async_nats::Message>,
+    deliveries: tokio::sync::mpsc::Sender<(async_nats::Message, super::activity::Delivery)>,
+    activity: Arc<super::activity::Activity>,
     backlog: Arc<CoreBacklog>,
     cancel_token: CancellationToken,
 ) {
+    let mut fences = activity.reader();
     tokio::spawn(async move {
         let mut last_report = None;
         loop {
@@ -1901,9 +1906,14 @@ fn spawn_core_reader(
             // task parked on a subscription that may never deliver again: the
             // closed channel is only noticed on the next message to arrive.
             let message = tokio::select! {
+                biased;
                 next = messages.next() => match next {
                     Some(m) => m,
                     None => break,
+                },
+                fence = fences.recv() => {
+                    if let Some(fence) = fence { let _ = fence.send(()); }
+                    continue;
                 },
                 _ = cancel_token.cancelled() => break,
             };
@@ -1914,7 +1924,7 @@ fn spawn_core_reader(
                 continue;
             }
 
-            match deliveries.try_send(message) {
+            match deliveries.try_send((message, activity.begin())) {
                 Ok(()) => {
                     backlog.queue(len);
                 }
@@ -1996,6 +2006,22 @@ pub(super) async fn spawn_core_subscriptions(
         }
         .with_context(|| format!("failed to subscribe to core subject '{}'", sub.subject))?;
 
+        let backlog = Arc::new(CoreBacklog::new(
+            conn.limits.subscription_capacity,
+            conn.limits.subscription_capacity_bytes,
+            host_budget,
+        ));
+        let (deliveries, mut inbound) =
+            tokio::sync::mpsc::channel(conn.limits.subscription_capacity);
+        spawn_core_reader(
+            sub.subject.clone(),
+            messages,
+            deliveries,
+            conn.activity.clone(),
+            backlog.clone(),
+            cancel_token.clone(),
+        );
+
         tokio::spawn(async move {
             // A SUB the server refuses is refused after the fact: the
             // subscription is accepted locally and simply never delivers, so
@@ -2007,20 +2033,6 @@ pub(super) async fn spawn_core_subscriptions(
             // from the backlog it fills, so that waiting for a handler permit
             // never means leaving the client's channel unread. See
             // `spawn_core_reader` for what that costs when it is not done.
-            let backlog = Arc::new(CoreBacklog::new(
-                conn.limits.subscription_capacity,
-                conn.limits.subscription_capacity_bytes,
-                host_budget,
-            ));
-            let (deliveries, mut inbound) =
-                tokio::sync::mpsc::channel(conn.limits.subscription_capacity);
-            spawn_core_reader(
-                sub.subject.clone(),
-                messages,
-                deliveries,
-                backlog.clone(),
-                cancel_token.clone(),
-            );
 
             loop {
                 // Taken before a message is, so that waiting for capacity
@@ -2038,7 +2050,7 @@ pub(super) async fn spawn_core_subscriptions(
 
                 tokio::select! {
                     maybe_msg = inbound.recv() => {
-                        let raw = match maybe_msg {
+                        let (raw, activity) = match maybe_msg {
                             None => break,
                             Some(m) => m,
                         };
@@ -2056,6 +2068,7 @@ pub(super) async fn spawn_core_subscriptions(
                             conn.grant_reply(reply);
                         }
 
+                        let parent = raw.headers.as_ref().and_then(super::trace::parent);
                         let subject_label = raw.subject.to_string();
                         let msg = core_bindings::wasmcloud::nats::types::NatsMessage {
                             subject: subject_label.clone(),
@@ -2077,11 +2090,13 @@ pub(super) async fn spawn_core_subscriptions(
                             "incoming_nats_core_message",
                             subject = %subject_label,
                         );
+                        super::trace::set_parent(&span, parent);
                         let workload = workload.clone();
                         let target = target.clone();
                         let delivery_cancel = cancel_token.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
+                            let _activity = activity;
                             let result = run_delivery(&workload, &target, job, reply_rx, call, &delivery_cancel)
                                 .instrument(span)
                                 .await;

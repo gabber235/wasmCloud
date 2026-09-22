@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use tracing::debug;
+use tracing::{Instrument as _, debug};
 use wasmtime::component::Accessor;
 
 use crate::engine::ctx::{ActiveCtx, SharedCtx};
@@ -115,7 +115,7 @@ impl<T: 'static + Send> labeled_core::HostWithStore<T> for SharedCtx {
                 .dropped(&subject, size, ledger::PublishDrop::Refused);
             return Ok(Err(e));
         }
-        let headers = match outbound_headers(headers.as_deref()) {
+        let mut headers = match outbound_headers(headers.as_deref()) {
             Ok(h) => h,
             Err(e) => {
                 conn.publishes
@@ -123,6 +123,7 @@ impl<T: 'static + Send> labeled_core::HostWithStore<T> for SharedCtx {
                 return Ok(Err(e));
             }
         };
+        let span = super::trace::producer("publish", &subject, &mut headers);
         if let Err(e) = check_payload(body.len(), headers.as_ref(), &conn) {
             conn.publishes
                 .dropped(&subject, size, ledger::PublishDrop::Refused);
@@ -131,24 +132,28 @@ impl<T: 'static + Send> labeled_core::HostWithStore<T> for SharedCtx {
 
         let payload: Bytes = body.into();
         let subject_label = subject.clone();
-        let result = match (reply_to, headers) {
-            (Some(reply_to), Some(headers)) => {
-                conn.client
-                    .publish_with_reply_and_headers(subject, reply_to, headers, payload)
-                    .await
+        let result = async {
+            match (reply_to, headers) {
+                (Some(reply_to), Some(headers)) => {
+                    conn.client
+                        .publish_with_reply_and_headers(subject, reply_to, headers, payload)
+                        .await
+                }
+                (Some(reply_to), None) => {
+                    conn.client
+                        .publish_with_reply(subject, reply_to, payload)
+                        .await
+                }
+                (None, Some(headers)) => {
+                    conn.client
+                        .publish_with_headers(subject, headers, payload)
+                        .await
+                }
+                (None, None) => conn.client.publish(subject, payload).await,
             }
-            (Some(reply_to), None) => {
-                conn.client
-                    .publish_with_reply(subject, reply_to, payload)
-                    .await
-            }
-            (None, Some(headers)) => {
-                conn.client
-                    .publish_with_headers(subject, headers, payload)
-                    .await
-            }
-            (None, None) => conn.client.publish(subject, payload).await,
-        };
+        }
+        .instrument(span)
+        .await;
 
         match &result {
             // The wire is as far as a core publish can be followed. What this
@@ -191,10 +196,11 @@ impl<T: 'static + Send> labeled_core::HostWithStore<T> for SharedCtx {
                 "request: caller-supplied reply-to is ignored; replies use the per-workload inbox"
             );
         }
-        let headers = match outbound_headers(headers.as_deref()) {
+        let mut headers = match outbound_headers(headers.as_deref()) {
             Ok(h) => h,
             Err(e) => return Ok(Err(e)),
         };
+        let span = super::trace::producer("request", &subject, &mut headers);
         if let Err(e) = check_payload(body.len(), headers.as_ref(), &conn) {
             return Ok(Err(e));
         }
@@ -210,33 +216,33 @@ impl<T: 'static + Send> labeled_core::HostWithStore<T> for SharedCtx {
             }
         };
 
-        let resp =
-            match tokio::time::timeout(Duration::from_millis(timeout_ms as u64), request_future)
-                .await
-            {
-                Ok(Ok(m)) => m,
-                Ok(Err(e)) => {
-                    // The client's own `request-timeout-ms` can fire below the
-                    // guest timeout, and is still a timeout, not a transport fault.
-                    return Ok(Err(match e.kind() {
-                        async_nats::RequestErrorKind::NoResponders => {
-                            types::NatsError::NoResponders
-                        }
-                        async_nats::RequestErrorKind::TimedOut => {
-                            types::NatsError::Timeout(format!("request timed out: {e}"))
-                        }
-                        async_nats::RequestErrorKind::MaxPayloadExceeded => {
-                            types::NatsError::MaxPayloadExceeded(conn.max_payload())
-                        }
-                        _ => types::NatsError::Connection(format!("failed to send request: {e}")),
-                    }));
-                }
-                Err(_) => {
-                    return Ok(Err(types::NatsError::Timeout(format!(
-                        "request timed out after {timeout_ms}ms"
-                    ))));
-                }
-            };
+        let resp = match tokio::time::timeout(
+            Duration::from_millis(timeout_ms as u64),
+            request_future.instrument(span),
+        )
+        .await
+        {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => {
+                // The client's own `request-timeout-ms` can fire below the
+                // guest timeout, and is still a timeout, not a transport fault.
+                return Ok(Err(match e.kind() {
+                    async_nats::RequestErrorKind::NoResponders => types::NatsError::NoResponders,
+                    async_nats::RequestErrorKind::TimedOut => {
+                        types::NatsError::Timeout(format!("request timed out: {e}"))
+                    }
+                    async_nats::RequestErrorKind::MaxPayloadExceeded => {
+                        types::NatsError::MaxPayloadExceeded(conn.max_payload())
+                    }
+                    _ => types::NatsError::Connection(format!("failed to send request: {e}")),
+                }));
+            }
+            Err(_) => {
+                return Ok(Err(types::NatsError::Timeout(format!(
+                    "request timed out after {timeout_ms}ms"
+                ))));
+            }
+        };
 
         Ok(Ok(build_nats_message(
             resp.subject.as_ref(),
