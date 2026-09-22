@@ -15,6 +15,12 @@ use crate::config::{HttpClientTrustRoots, load_config};
 
 #[derive(Debug, Clone, Args)]
 pub struct HostCommand {
+    /// Credentials for the scheduler connection.
+    #[arg(long, env = "SCHEDULER_NATS_CREDENTIALS")]
+    pub scheduler_nats_creds: Option<PathBuf>,
+    /// Credentials for the data connection.
+    #[arg(long, env = "DATA_NATS_CREDENTIALS")]
+    pub data_nats_creds: Option<PathBuf>,
     /// The host group label to assign to the host
     #[arg(long = "host-group", default_value = "default")]
     pub host_group: String,
@@ -606,6 +612,18 @@ impl HostCommand {
 
 impl CliCommand for HostCommand {
     async fn handle(&self, ctx: &CliContext) -> anyhow::Result<CommandOutput> {
+        self.handle_with_plugins(ctx, Vec::new()).await
+    }
+}
+
+impl HostCommand {
+    /// Runs the standard host lifecycle with additional native capabilities.
+    /// Duplicate plugin identifiers fail during host construction.
+    pub async fn handle_with_plugins(
+        &self,
+        ctx: &CliContext,
+        plugins: Vec<Arc<dyn wash_runtime::plugin::HostPlugin>>,
+    ) -> anyhow::Result<CommandOutput> {
         // Validated before anything is connected or built. A bad size is a typo
         // in a flag, and reporting it after a NATS dial has already failed
         // buries the actionable error under an unrelated one. The resolved
@@ -652,6 +670,7 @@ impl CliCommand for HostCommand {
             self.scheduler_nats_url.clone(),
             wash_runtime::washlet::NatsConnectionOptions {
                 request_timeout: None,
+                credentials: self.scheduler_nats_creds.clone(),
                 tls_ca: self.scheduler_nats_tls_ca.clone(),
                 tls_first: self.scheduler_nats_tls_first,
                 tls_cert: self.scheduler_nats_tls_cert.clone(),
@@ -666,6 +685,7 @@ impl CliCommand for HostCommand {
             self.data_nats_url.clone(),
             wash_runtime::washlet::NatsConnectionOptions {
                 request_timeout: None,
+                credentials: self.data_nats_creds.clone(),
                 tls_ca: self.data_nats_tls_ca.clone(),
                 tls_first: self.data_nats_tls_first,
                 tls_cert: self.data_nats_tls_cert.clone(),
@@ -832,6 +852,10 @@ impl CliCommand for HostCommand {
                     ]),
             ))?
             .with_meters(Meters::new(ctx.meters()));
+
+        for plugin in plugins {
+            cluster_host_builder = cluster_host_builder.with_plugin(plugin)?;
+        }
 
         #[cfg(feature = "wasm_component_model_implements")]
         {

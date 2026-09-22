@@ -142,7 +142,7 @@ impl ClusterHostBuilder {
         self
     }
 
-    pub fn with_plugin<T: HostPlugin>(mut self, plugin: Arc<T>) -> anyhow::Result<Self> {
+    pub fn with_plugin(mut self, plugin: Arc<dyn HostPlugin>) -> anyhow::Result<Self> {
         self.host_builder = self.host_builder.with_plugin(plugin)?;
         Ok(self)
     }
@@ -595,6 +595,8 @@ pub async fn run_cluster_host(
 /// Configuration options for NATS connections
 #[derive(Debug, Clone, Default)]
 pub struct NatsConnectionOptions {
+    /// Credentials for the host connection, loaded before connecting.
+    pub credentials: Option<PathBuf>,
     /// Request timeout for NATS operations
     pub request_timeout: Option<Duration>,
     /// Path to TLS CA certificate file for NATS connection
@@ -626,6 +628,12 @@ pub async fn connect_nats(
     options: NatsConnectionOptions,
 ) -> Result<async_nats::Client, anyhow::Error> {
     let mut opts = async_nats::ConnectOptions::new();
+    if let Some(path) = options.credentials {
+        opts = opts
+            .credentials_file(path)
+            .await
+            .context("loading NATS credentials")?;
+    }
 
     if let Some(timeout) = options.request_timeout {
         opts = opts.request_timeout(Some(timeout));
