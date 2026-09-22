@@ -610,15 +610,19 @@ fn binding_name(interface: &WitInterface) -> &str {
 /// lands rather than after. It is also not about NATS: "one label is one
 /// config" is a property of every plugin that serves named bindings.
 ///
-/// What remains is the read side. By the time this runs, every entry of a
-/// label already carries the same resolved map, so taking the first is taking
-/// all of them.
+/// Shared connection settings have already been resolved. Selectors and
+/// subscriptions remain on their original entries and do not configure sockets.
 fn bindings_by_name<'a>(bound: &[&'a WitInterface]) -> Vec<(&'a str, HashMap<String, String>)> {
     let mut merged: BTreeMap<&str, HashMap<String, String>> = BTreeMap::new();
     for interface in bound {
-        merged
-            .entry(binding_name(interface))
-            .or_insert_with(|| interface.config.clone());
+        merged.entry(binding_name(interface)).or_insert_with(|| {
+            interface
+                .config
+                .iter()
+                .filter(|(key, _)| !super::keys::find(key).is_some_and(|key| key.entry))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        });
     }
     merged.into_iter().collect()
 }
@@ -1205,7 +1209,7 @@ mod tests {
     }
 
     #[test]
-    fn split_entries_fold_into_one_binding() {
+    fn split_entries_share_connection_without_subscription_settings() {
         let entries = [
             entry(
                 "wasmcloud:nats/types,core,jetstream@0.1.0",
@@ -1232,10 +1236,7 @@ mod tests {
         assert_eq!(parsed.servers, vec!["nats://localhost:4222"]);
         assert_eq!(parsed.policy.subject_allow, vec!["orders.>"]);
         assert_eq!(parsed.policy.stream_allow, vec!["ORDERS"]);
-        assert_eq!(
-            config.get("jetstream-subscriptions").map(String::as_str),
-            Some("ORDERS:orders.eu.>")
-        );
+        assert!(!config.contains_key("jetstream-subscriptions"));
     }
 
     #[test]

@@ -2698,7 +2698,7 @@ impl UnresolvedWorkload {
                     plugin_component_bindings
                         .iter()
                         .map(|(_, interfaces)| {
-                            declared.apply_resolved(interfaces, &resolved_by_name)
+                            declared.apply_resolved(interfaces, &resolved_by_name, &schema)
                         })
                         .collect();
 

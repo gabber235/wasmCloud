@@ -20,6 +20,10 @@ The fork follows native `wasmcloud:nats@0.1.0`. Typewriter components import Cor
 
 System subjects follow normal host subject grants. There is no special `$SYS` prohibition or auth callout exception machinery. Production grants `$SYS.REQ.USER.AUTH` explicitly alongside application subjects. Other system subjects remain unavailable without a matching host grant. Workloads cannot widen those grants when `workloadConfig = deny`.
 
+## Interface entry configuration
+
+Component selectors and subscription lists belong to their individual interface entries. Upstream folded them into one connection configuration, which rejected composed workloads or copied a subscription onto the wrong handler. The binding schema now preserves entry settings while resolving connections, credentials, grants, and other shared settings once per binding. Host ownership checks still apply to entry settings.
+
 ## Completion contract
 
 `wasmcloud_nats::synchronize` waits for a broker round trip on the client's own inbox. `Client::flush` alone only flushes the client buffer.

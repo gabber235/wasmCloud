@@ -28,6 +28,8 @@ pub struct Key {
     pub aliases: &'static [&'static str],
     /// Who may write it.
     pub ownership: KeyOwnership,
+    /// Whether this setting belongs to one interface entry rather than the binding.
+    pub entry: bool,
 }
 
 impl Key {
@@ -42,6 +44,7 @@ const fn host(canonical: &'static str) -> Key {
         canonical,
         aliases: &[],
         ownership: KeyOwnership::Host,
+        entry: false,
     }
 }
 
@@ -50,6 +53,7 @@ const fn host_aliased(canonical: &'static str, aliases: &'static [&'static str])
         canonical,
         aliases,
         ownership: KeyOwnership::Host,
+        entry: false,
     }
 }
 
@@ -59,6 +63,7 @@ const fn ceiling(canonical: &'static str) -> Key {
         canonical,
         aliases: &[],
         ownership: KeyOwnership::HostCeiling,
+        entry: false,
     }
 }
 
@@ -67,6 +72,14 @@ const fn workload(canonical: &'static str) -> Key {
         canonical,
         aliases: &[],
         ownership: KeyOwnership::Workload,
+        entry: false,
+    }
+}
+
+const fn entry(canonical: &'static str) -> Key {
+    Key {
+        entry: true,
+        ..workload(canonical)
     }
 }
 
@@ -106,10 +119,10 @@ pub const KEYS: &[Key] = &[
     workload("subscription-capacity-bytes"),
     workload("max-ack-pending"),
     workload("max-deliver"),
-    workload("jetstream-subscriptions"),
-    workload("core-subscriptions"),
-    workload("kv-watches"),
-    workload("component"),
+    entry("jetstream-subscriptions"),
+    entry("core-subscriptions"),
+    entry("kv-watches"),
+    entry("component"),
 ];
 
 /// The canonical spelling of `key`, for comparing two spellings of one key.
@@ -184,6 +197,11 @@ pub fn workload_owned() -> impl Iterator<Item = &'static str> {
     KEYS.iter()
         .filter(|key| key.ownership == KeyOwnership::Workload)
         .flat_map(Key::spellings)
+}
+
+/// Settings retained on each selector and handler interface entry.
+pub fn entry_owned() -> impl Iterator<Item = &'static str> {
+    KEYS.iter().filter(|key| key.entry).flat_map(Key::spellings)
 }
 
 #[cfg(test)]

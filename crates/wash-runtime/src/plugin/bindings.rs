@@ -200,6 +200,7 @@ impl KeyOwnership {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BindingSchema {
     ownership: BTreeMap<String, KeyOwnership>,
+    entry_keys: std::collections::BTreeSet<String>,
     closed: bool,
 }
 
@@ -246,6 +247,26 @@ impl BindingSchema {
         self = self.classify(keys, KeyOwnership::Workload);
         self.closed = true;
         self
+    }
+
+    /// Keep these workload settings on their original interface entry.
+    /// Connection settings and grants still resolve once per binding.
+    #[must_use]
+    pub fn and_entry_owned_keys<I, S>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for key in keys {
+            let key = canonical_key(key.as_ref());
+            self.ownership.insert(key.clone(), KeyOwnership::Workload);
+            self.entry_keys.insert(key);
+        }
+        self
+    }
+
+    fn is_entry_key(&self, key: &str) -> bool {
+        self.entry_keys.contains(&canonical_key(key))
     }
 
     fn classify<I, S>(mut self, keys: I, ownership: KeyOwnership) -> Self
@@ -679,6 +700,9 @@ impl PluginBindingSet {
 
             let config = folded.entry(binding).or_default();
             for (key, value) in pairs {
+                if schema.is_entry_key(key) {
+                    continue;
+                }
                 // Two spellings are one key only where the plugin says so.
                 // `subject_allow` and `subject-allow` are one grant, because
                 // `wasmcloud:nats` reads them as one. A pair of keys a *guest*
@@ -751,6 +775,23 @@ impl PluginBindingSet {
         schema: &BindingSchema,
         narrows: NarrowsFn<'_>,
     ) -> anyhow::Result<BTreeMap<String, HashMap<String, String>>> {
+        for interface in interfaces {
+            let mut entry = HashMap::new();
+            for (key, value) in &interface.config {
+                if schema.is_entry_key(key) {
+                    let key = canonical_key(key);
+                    if entry
+                        .insert(key.clone(), value.clone())
+                        .is_some_and(|old| old != *value)
+                    {
+                        anyhow::bail!("conflicting values for entry key `{key}`");
+                    }
+                }
+            }
+            if !entry.is_empty() {
+                self.resolve(self.binding_name(interface), &entry, schema, narrows)?;
+            }
+        }
         let borrowed: Vec<&WitInterface> = interfaces.iter().collect();
         let folded = self.fold_workload_entries(&borrowed, schema)?;
         if self.is_passthrough(schema) {
@@ -772,14 +813,14 @@ impl PluginBindingSet {
 
     /// Stamp the configs `resolve_by_name` produced back onto `interfaces`.
     ///
-    /// Every entry of one label carries the same folded, checked map, so a
-    /// plugin reading `interface.config` in either bind callback sees the whole
-    /// binding rather than the fragment that entry happened to declare.
+    /// Shared settings carry the resolved binding configuration. Entry settings
+    /// retain their original selector and subscription ownership.
     #[must_use]
     pub fn apply_resolved(
         &self,
         interfaces: &HashSet<WitInterface>,
         resolved: &BTreeMap<String, HashMap<String, String>>,
+        schema: &BindingSchema,
     ) -> HashSet<WitInterface> {
         interfaces
             .iter()
@@ -787,6 +828,11 @@ impl PluginBindingSet {
                 let mut stamped = interface.clone();
                 if let Some(config) = resolved.get(self.binding_name(interface)) {
                     stamped.config = config.clone();
+                    for (key, value) in &interface.config {
+                        if schema.is_entry_key(key) {
+                            layer_insert(&mut stamped.config, key, value, schema);
+                        }
+                    }
                 }
                 stamped
             })
@@ -1341,7 +1387,10 @@ mod tests {
             .unwrap();
         assert_eq!(resolved[""]["servers"], "nats://guest:4222");
         assert_eq!(resolved["some-label"]["bucket"], "cache");
-        assert_eq!(set.apply_resolved(&interfaces, &resolved), interfaces);
+        assert_eq!(
+            set.apply_resolved(&interfaces, &resolved, &BindingSchema::empty()),
+            interfaces
+        );
     }
 
     #[test]
@@ -2078,5 +2127,67 @@ mod tests {
             );
         }
         assert!("sometimes".parse::<WorkloadConfigPolicy>().is_err());
+    }
+    #[test]
+    fn entry_selectors_and_subscriptions_remain_distinct_with_shared_grants() {
+        let schema = nats_schema().and_entry_owned_keys(["component", "core-subscriptions"]);
+        let set = PluginBindingSet::new("wasmcloud-nats").with_base(map(&[
+            ("servers", "nats://host:4222"),
+            ("subject-allow", "orders.>"),
+        ]));
+        let interfaces = HashSet::from([
+            iface(
+                None,
+                &[
+                    ("component", "first"),
+                    ("core-subscriptions", "orders.first"),
+                ],
+            ),
+            iface(
+                None,
+                &[
+                    ("component", "second"),
+                    ("core_subscriptions", "orders.second"),
+                ],
+            ),
+        ]);
+        let resolved = set
+            .resolve_by_name(&interfaces, &schema, prefix_narrows())
+            .unwrap();
+        assert!(!resolved[""].contains_key("component"));
+        assert!(!resolved[""].contains_key("core-subscriptions"));
+        let applied = set.apply_resolved(&interfaces, &resolved, &schema);
+        assert_eq!(applied.len(), 2);
+        for interface in applied {
+            assert_eq!(interface.config["servers"], "nats://host:4222");
+            assert_eq!(interface.config["subject-allow"], "orders.>");
+            assert_eq!(
+                lookup(&interface.config, "core-subscriptions"),
+                Some(format!("orders.{}", interface.config["component"]).as_str())
+            );
+        }
+        let host_owned = set.with_host_owned_keys(["component"]);
+        assert!(
+            host_owned
+                .resolve_by_name(&interfaces, &schema, prefix_narrows())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn entry_aliases_cannot_disagree_within_one_entry() {
+        let schema = nats_schema().and_entry_owned_keys(["core-subscriptions"]);
+        let interfaces = HashSet::from([iface(
+            None,
+            &[
+                ("core-subscriptions", "first"),
+                ("core_subscriptions", "second"),
+            ],
+        )]);
+        assert!(
+            PluginBindingSet::new("wasmcloud-nats")
+                .resolve_by_name(&interfaces, &schema, prefix_narrows())
+                .is_err()
+        );
     }
 }
