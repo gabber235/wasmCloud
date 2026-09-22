@@ -44,8 +44,8 @@ use hyper_util::{
     rt::{TokioExecutor, TokioTimer},
     server::conn::auto,
 };
-use opentelemetry::KeyValue;
 use opentelemetry::context::FutureExt;
+use opentelemetry::{KeyValue, trace::TraceContextExt as _};
 use opentelemetry_semantic_conventions::attribute::{
     ERROR_TYPE, HTTP_REQUEST_METHOD, HTTP_RESPONSE_BODY_SIZE, HTTP_RESPONSE_STATUS_CODE,
     OTEL_STATUS_CODE, RPC_RESPONSE_STATUS_CODE, SERVER_ADDRESS, SERVER_PORT, URL_FULL, URL_PATH,
@@ -53,6 +53,7 @@ use opentelemetry_semantic_conventions::attribute::{
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tracing::{Instrument, debug, error, info, instrument, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use wasmtime::Store;
 use wasmtime::component::InstancePre;
 use wasmtime_wasi_http::{
@@ -611,20 +612,9 @@ impl OutgoingHandler for DefaultOutgoingHandler {
         config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
     ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
     {
-        // Spawn the send ourselves so the request can be wrapped in a client
-        // span and the response status recorded once it arrives.
-        let span = outbound_client_span(request.method(), request.uri());
         let client = self.clients().client(workload_id);
         let handle = wasmtime_wasi::runtime::spawn(
-            async move {
-                let result = client.send_request_p2(request, config).await;
-                match &result {
-                    Ok(incoming) => record_outbound_status(incoming.resp.status()),
-                    Err(_) => record_outbound_error(),
-                }
-                Ok(result)
-            }
-            .instrument(span),
+            async move { Ok(client.send_request_p2(request, config).await) }.in_current_span(),
         );
         Ok(HostFutureIncomingResponse::pending(handle))
     }
@@ -1156,6 +1146,7 @@ pub struct Ingress<T: Router, O: OutgoingHandler = DefaultOutgoingHandler> {
     /// Workloads whose long-lived trigger service serves messaging ingress directly.
     messaging_handlers: MessagingHandlers,
     shutdown_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
+    shutdown_result: Arc<std::sync::Mutex<Option<Result<(), String>>>>,
     tls_acceptor: Option<TlsAcceptor>,
     listener: Arc<tokio::sync::Mutex<Option<TcpListener>>>,
     /// Ceiling on the TCP connections this ingress holds at once, and the
@@ -1296,6 +1287,7 @@ impl<T: Router, O: OutgoingHandler> IngressBuilder<T, O> {
             service_handlers: Arc::default(),
             messaging_handlers: Arc::default(),
             shutdown_tx: Arc::new(RwLock::new(None)),
+            shutdown_result: Arc::new(std::sync::Mutex::new(None)),
             tls_acceptor,
             listener: Arc::new(tokio::sync::Mutex::new(Some(listener))),
             connections: ConnectionLimit::new(max_connections),
@@ -1394,8 +1386,9 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
         let guest_meter = self.meters.read().await.guest();
         let connections = self.connections.clone();
         let stopped = AcceptingGuard(connections.clone());
+        let shutdown_result = self.shutdown_result.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_http_server(
+            let result = run_http_server(
                 listener,
                 handler,
                 workload_handles,
@@ -1405,22 +1398,35 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
                 guest_meter,
                 connections,
             )
-            .await
-            {
-                error!(err = ?e, addr = ?addr, "HTTP server error");
+            .await;
+            if let Err(error) = &result {
+                error!(%error, ?addr, "HTTP server error");
             }
+            *shutdown_result
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) =
+                Some(result.map_err(|error| error.to_string()));
             drop(stopped);
         });
         Ok(())
     }
 
     async fn stop(&self) -> anyhow::Result<()> {
-        info!(addr = ?self.addr, "HTTP server stopping");
-        let mut shutdown_guard = self.shutdown_tx.write().await;
-        if let Some(tx) = shutdown_guard.take() {
+        if self.listener.lock().await.is_some() {
+            return Ok(());
+        }
+        if let Some(tx) = self.shutdown_tx.write().await.take() {
             let _ = tx.send(()).await;
         }
-        Ok(())
+        tokio::time::timeout(Duration::from_secs(11), self.connections.stopped())
+            .await
+            .context("timed out stopping HTTP ingress")?;
+        self.shutdown_result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .unwrap_or_else(|| Err("HTTP ingress task terminated without a result".into()))
+            .map_err(anyhow::Error::msg)
     }
 
     async fn stopped(&self) {
@@ -1582,45 +1588,49 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
     fn outgoing_request(
         &self,
         workload_id: &str,
-        request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
-        config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
+        mut request: hyper::Request<HyperOutgoingBody>,
+        config: OutgoingRequestConfig,
         allowed_hosts: &[AllowedHost],
-    ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
-    {
-        if let Err(e) =
-            self.router
-                .allow_outgoing_request(workload_id, &request, &config, allowed_hosts)
-        {
-            warn!(workload_id = %workload_id, err = %e, "outgoing request denied by allowed_hosts policy");
-            return Err(wasmtime_wasi_http::p2::HttpError::trap(
-                wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::HttpRequestDenied,
-            ));
+    ) -> wasmtime_wasi_http::p2::HttpResult<HostFutureIncomingResponse> {
+        let span = outbound_client_span(&mut request);
+        let result = {
+            let _entered = span.enter();
+            if let Err(error) =
+                self.router
+                    .allow_outgoing_request(workload_id, &request, &config, allowed_hosts)
+            {
+                warn!(workload_id, %error, "outgoing request denied by allowed_hosts policy");
+                Err(wasmtime_wasi_http::p2::HttpError::trap(
+                    wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::HttpRequestDenied,
+                ))
+            } else if is_grpc_request(&request) {
+                Ok(match self.outgoing_handler.grpc_transport(workload_id) {
+                    Some(client) => send_pooled_grpc_request(client, request, config),
+                    None => send_grpc_request(request, config, self.grpc_tls()),
+                })
+            } else {
+                self.outgoing_handler
+                    .send_request(workload_id, request, config)
+            }
+        };
+        match result {
+            Ok(future) => Ok(instrument_outgoing_response(future, span)),
+            Err(error) => {
+                record_outbound_error_on(&span);
+                Err(error)
+            }
         }
-        // The gRPC path is selected by the guest via a
-        // `content-type: application/grpc` header, and needs HTTP/2 rather
-        // than the HTTP/1.1 the ordinary egress pool speaks. A pooling
-        // handler serves it from its own per-workload HTTP/2 pool, under the
-        // same quota; otherwise the runtime opens a connection
-        // per request.
-        if is_grpc_request(&request) {
-            return Ok(match self.outgoing_handler.grpc_transport(workload_id) {
-                Some(client) => send_pooled_grpc_request(client, request, config),
-                None => send_grpc_request(request, config, self.grpc_tls()),
-            });
-        }
-        self.outgoing_handler
-            .send_request(workload_id, request, config)
     }
 
     fn outgoing_request_p3(
         &self,
         workload_id: &str,
-        request: hyper::Request<crate::host::http_p3::P3Body>,
+        mut request: hyper::Request<crate::host::http_p3::P3Body>,
         options: Option<wasmtime_wasi_http::p3::RequestOptions>,
         fut: crate::host::http_p3::P3RequestErrorFuture,
         allowed_hosts: &[AllowedHost],
     ) -> crate::host::http_p3::P3SendFuture {
-        let span = outbound_client_span(request.method(), request.uri());
+        let span = outbound_client_span(&mut request);
         let inner: crate::host::http_p3::P3SendFuture = if let Err(e) = self
             .router
             .allow_outgoing_request_p3(workload_id, &request, options, allowed_hosts)
@@ -1887,6 +1897,8 @@ async fn run_http_server<T: Router>(
     guest_meter: GuestMeter,
     connections: ConnectionLimit,
 ) -> anyhow::Result<()> {
+    let mut active_connections = tokio::task::JoinSet::new();
+    let (connection_shutdown_tx, _) = tokio::sync::watch::channel(false);
     let mut backoff = crate::host::accept::AcceptBackoff::default();
     let mut shed = 0u64;
     let mut shed_reported: Option<std::time::Instant> = None;
@@ -1895,6 +1907,9 @@ async fn run_http_server<T: Router>(
         // shutdown branch instead of needing a second copy of it.
         let pause = backoff.pause();
         tokio::select! {
+            Some(result) = active_connections.join_next(), if !active_connections.is_empty() => {
+                if let Err(error) = result { warn!(%error, "HTTP connection task failed"); }
+            }
             // Handle shutdown signal
             _ = shutdown_rx.recv() => {
                 info!("HTTP server received shutdown signal");
@@ -1937,7 +1952,8 @@ async fn run_http_server<T: Router>(
                         let tls_acceptor_clone = tls_acceptor.clone();
                         let handler_clone = handler.clone();
                         let guest_meter = guest_meter.clone();
-                        tokio::spawn(async move {
+                        let mut connection_shutdown = connection_shutdown_tx.subscribe();
+                        active_connections.spawn(async move {
                             // Held for the connection's life: its descriptor is
                             // only given back once hyper is done with it.
                             let _slot = slot;
@@ -1987,9 +2003,17 @@ async fn run_http_server<T: Router>(
                                         Ok(())
                                     }
                                     Ok(Ok(tls_stream)) => {
-                                        builder
-                                            .serve_connection_with_upgrades(TokioIo::new(tls_stream), service)
-                                            .await
+                                        {
+                                            let connection = builder.serve_connection_with_upgrades(TokioIo::new(tls_stream), service);
+                                            tokio::pin!(connection);
+                                            tokio::select! {
+                                                result = &mut connection => result,
+                                                _ = async { let _ = connection_shutdown.wait_for(|stopping| *stopping).await; } => {
+                                                    connection.as_mut().graceful_shutdown();
+                                                    connection.await
+                                                }
+                                            }
+                                        }
                                     }
                                     Ok(Err(e)) => {
                                         error!(addr = ?client_addr, err = ?e, "TLS handshake failed");
@@ -1998,9 +2022,17 @@ async fn run_http_server<T: Router>(
                                 }
                             } else {
                                 // Handle HTTP/h2c connection
-                                builder
-                                    .serve_connection_with_upgrades(TokioIo::new(client), service)
-                                    .await
+                                {
+                                            let connection = builder.serve_connection_with_upgrades(TokioIo::new(client), service);
+                                            tokio::pin!(connection);
+                                            tokio::select! {
+                                                result = &mut connection => result,
+                                                _ = async { let _ = connection_shutdown.wait_for(|stopping| *stopping).await; } => {
+                                                    connection.as_mut().graceful_shutdown();
+                                                    connection.await
+                                                }
+                                            }
+                                        }
                             }
                             };
 
@@ -2065,6 +2097,17 @@ async fn run_http_server<T: Router>(
         }
     }
 
+    drop(listener);
+    connection_shutdown_tx.send_replace(true);
+    let drained = tokio::time::timeout(Duration::from_secs(10), async {
+        while active_connections.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        active_connections.abort_all();
+        while active_connections.join_next().await.is_some() {}
+        anyhow::bail!("timed out draining HTTP connections");
+    }
     Ok(())
 }
 
@@ -2262,20 +2305,51 @@ fn record_response_status<B>(response: &hyper::Response<B>) {
 /// The span must be entered (e.g. via [`tracing::Instrument::instrument`]) for
 /// the duration of the request so that status recorded on the *current* span
 /// from inside the async work lands on this span.
-fn outbound_client_span(method: &hyper::Method, uri: &hyper::Uri) -> tracing::Span {
+fn outbound_client_span<B>(request: &mut hyper::Request<B>) -> tracing::Span {
     let span = tracing::info_span!(
         "outbound_http_request",
         otel.kind = "client",
-        { HTTP_REQUEST_METHOD } = %method,
-        { URL_FULL } = %uri,
-        { SERVER_ADDRESS } = uri.host().unwrap_or_default(),
+        otel.propagation.error = tracing::field::Empty,
+        exception.slug = tracing::field::Empty,
+        { HTTP_REQUEST_METHOD } = %request.method(),
+        { URL_FULL } = %request.uri(),
+        { SERVER_ADDRESS } = request.uri().host().unwrap_or_default(),
         { SERVER_PORT } = tracing::field::Empty,
         { HTTP_RESPONSE_STATUS_CODE } = tracing::field::Empty,
         { RPC_RESPONSE_STATUS_CODE } = tracing::field::Empty,
         { OTEL_STATUS_CODE } = tracing::field::Empty,
     );
-    if let Some(port) = uri.port_u16() {
+    if let Some(port) = request.uri().port_u16() {
         span.record(SERVER_PORT, port);
+    }
+
+    let has_trace_headers = request.headers().contains_key("traceparent")
+        || request.headers().contains_key("tracestate");
+    if has_trace_headers {
+        let extractor = opentelemetry_http::HeaderExtractor(request.headers());
+        let parent = opentelemetry::global::get_text_map_propagator(|propagator| {
+            propagator.extract(&extractor)
+        });
+        if parent.span().span_context().is_valid() {
+            if let Err(error) = span.set_parent(parent) {
+                warn!(%error, "failed to set outbound HTTP parent context");
+            }
+        } else {
+            span.record("otel.propagation.error", true);
+            span.record("exception.slug", "http-invalid-trace-context");
+        }
+    }
+
+    let context = span.context();
+    if context.span().span_context().is_valid() {
+        request.headers_mut().remove("traceparent");
+        request.headers_mut().remove("tracestate");
+        opentelemetry::global::get_text_map_propagator(|propagator| {
+            propagator.inject_context(
+                &context,
+                &mut opentelemetry_http::HeaderInjector(request.headers_mut()),
+            );
+        });
     }
     span
 }
@@ -2297,11 +2371,52 @@ fn record_outbound_error() {
     tracing::Span::current().record(OTEL_STATUS_CODE, "ERROR");
 }
 
-/// Record the gRPC status as `rpc.grpc.status_code` on the current span when the
-/// response carries a `grpc-status` header. gRPC errors are typically
-/// trailers-only responses that put the status in headers, so this captures
-/// them; a status delivered in actual trailers (the streaming-success case) is
-/// not read here.
+fn record_outbound_error_on(span: &tracing::Span) {
+    span.record(OTEL_STATUS_CODE, "ERROR");
+}
+
+fn instrument_outgoing_response(
+    future: HostFutureIncomingResponse,
+    span: tracing::Span,
+) -> HostFutureIncomingResponse {
+    use wasmtime_wasi_http::p2::types::HostFutureIncomingResponse::{Consumed, Pending, Ready};
+
+    match future {
+        Pending(handle) => HostFutureIncomingResponse::pending(wasmtime_wasi::runtime::spawn(
+            async move {
+                let result = handle.await;
+                record_outgoing_result(&result);
+                result
+            }
+            .instrument(span),
+        )),
+        Ready(result) => {
+            let _entered = span.enter();
+            record_outgoing_result(&result);
+            HostFutureIncomingResponse::ready(result)
+        }
+        Consumed => Consumed,
+    }
+}
+
+fn record_outgoing_result(
+    result: &wasmtime::Result<
+        Result<
+            wasmtime_wasi_http::p2::types::IncomingResponse,
+            wasmtime_wasi_http::p2::bindings::http::types::ErrorCode,
+        >,
+    >,
+) {
+    match result {
+        Ok(Ok(incoming)) => {
+            record_outbound_status(incoming.resp.status());
+            record_grpc_status(incoming.resp.headers());
+        }
+        Ok(Err(_)) | Err(_) => record_outbound_error(),
+    }
+}
+
+/// Record gRPC response status from headers. Streaming trailers are not read here.
 fn record_grpc_status(headers: &hyper::HeaderMap) {
     if let Some(code) = headers
         .get("grpc-status")
@@ -2759,20 +2874,8 @@ fn send_pooled_grpc_request(
     request: hyper::Request<HyperOutgoingBody>,
     config: OutgoingRequestConfig,
 ) -> HostFutureIncomingResponse {
-    let span = outbound_client_span(request.method(), request.uri());
     let handle = wasmtime_wasi::runtime::spawn(
-        async move {
-            let result = client.send_grpc_request_p2(request, config).await;
-            match &result {
-                Ok(incoming) => {
-                    record_outbound_status(incoming.resp.status());
-                    record_grpc_status(incoming.resp.headers());
-                }
-                Err(_) => record_outbound_error(),
-            }
-            Ok(result)
-        }
-        .instrument(span),
+        async move { Ok(client.send_grpc_request_p2(request, config).await) }.in_current_span(),
     );
     HostFutureIncomingResponse::pending(handle)
 }
@@ -2782,20 +2885,8 @@ fn send_grpc_request(
     config: OutgoingRequestConfig,
     tls: Arc<rustls::ClientConfig>,
 ) -> HostFutureIncomingResponse {
-    let span = outbound_client_span(request.method(), request.uri());
     let handle = wasmtime_wasi::runtime::spawn(
-        async move {
-            let result = send_grpc_request_handler(request, config, tls).await;
-            match &result {
-                Ok(incoming) => {
-                    record_outbound_status(incoming.resp.status());
-                    record_grpc_status(incoming.resp.headers());
-                }
-                Err(_) => record_outbound_error(),
-            }
-            Ok(result)
-        }
-        .instrument(span),
+        async move { Ok(send_grpc_request_handler(request, config, tls).await) }.in_current_span(),
     );
     HostFutureIncomingResponse::pending(handle)
 }
@@ -3032,6 +3123,65 @@ async fn send_grpc_request_p3_handler(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn outbound_http_preserves_guest_parent_and_injects_client_span() {
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing_subscriber::prelude::*;
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("http-test")));
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            let mut request = hyper::Request::builder()
+                .uri("https://example.test")
+                .header(
+                    "traceparent",
+                    "00-11111111111111111111111111111111-2222222222222222-01",
+                )
+                .header("tracestate", "vendor=value")
+                .body(())
+                .unwrap();
+            let span = super::outbound_client_span(&mut request);
+            let context = span.context();
+            let active = context.span();
+            let expected = format!(
+                "00-11111111111111111111111111111111-{}-01",
+                active.span_context().span_id()
+            );
+            assert_eq!(request.headers()["traceparent"], expected);
+            assert_eq!(request.headers()["tracestate"], "vendor=value");
+            assert_ne!(
+                active.span_context().span_id().to_string(),
+                "2222222222222222"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn stop_drains_connections_and_releases_listener() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let ingress = Ingress::builder(DevRouter::default(), "127.0.0.1:0".parse().unwrap())
+            .build()
+            .await
+            .unwrap();
+        ingress.start().await.unwrap();
+        let address = format!("127.0.0.1:{}", ingress.port());
+        let mut client = tokio::net::TcpStream::connect(&address).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: absent.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = [0u8; 1024];
+        assert!(client.read(&mut response).await.unwrap() > 0);
+        ingress.stop().await.unwrap();
+        ingress.stop().await.unwrap();
+        assert_eq!(client.read(&mut response).await.unwrap(), 0);
+        let listener = tokio::net::TcpListener::bind(&address).await.unwrap();
+        drop(listener);
+    }
+
     use super::*;
     use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
     use wasmtime_wasi_http::p2::types::OutgoingRequestConfig;
