@@ -97,8 +97,6 @@ pub struct TlsConfig {
 /// What a workload is permitted to reach. Empty means deny-all.
 #[derive(Debug, Default, Clone)]
 pub struct PolicySpec {
-    /// Host authorization for the exact NATS authentication subscription.
-    pub auth_callout_subscription: bool,
     pub subject_allow: Vec<String>,
     pub stream_allow: Vec<String>,
     pub bucket_allow: Vec<String>,
@@ -237,7 +235,6 @@ pub enum AckMode {
 /// A workload's complete NATS configuration.
 #[derive(Debug)]
 pub struct NatsConfig {
-    pub auth_callout_workload: Option<String>,
     pub servers: Vec<String>,
     pub name: Option<String>,
     pub jetstream_domain: Option<String>,
@@ -359,18 +356,6 @@ fn parse_auth(cfg: &HashMap<String, String>) -> anyhow::Result<NatsAuth> {
 }
 
 impl NatsConfig {
-    pub(super) fn scope_to_workload(&mut self, identity: &str) -> anyhow::Result<()> {
-        if self.policy.auth_callout_subscription {
-            anyhow::ensure!(
-                self.auth_callout_workload.is_some(),
-                "auth-callout-subscription requires an auth-callout-workload identity"
-            );
-            self.policy.auth_callout_subscription =
-                self.auth_callout_workload.as_deref() == Some(identity);
-        }
-        Ok(())
-    }
-
     /// Parses and validates a workload's config map.
     pub fn from_map(cfg: &HashMap<String, String>) -> anyhow::Result<Self> {
         let servers = list(cfg, "servers");
@@ -450,7 +435,6 @@ impl NatsConfig {
         }
 
         Ok(Self {
-            auth_callout_workload: get(cfg, "auth-callout-workload").map(str::to_owned),
             servers,
             name: get(cfg, "name").map(String::from),
             jetstream_domain: get(cfg, "jetstream-domain").map(String::from),
@@ -458,11 +442,6 @@ impl NatsConfig {
             auth: parse_auth(cfg)?,
             tls,
             policy: PolicySpec {
-                auth_callout_subscription: get(cfg, "auth-callout-subscription")
-                    .map(str::parse::<bool>)
-                    .transpose()
-                    .context("invalid auth-callout-subscription boolean")?
-                    .unwrap_or(false),
                 subject_allow: list(cfg, "subject-allow"),
                 stream_allow: list(cfg, "stream-allow"),
                 bucket_allow: list(cfg, "bucket-allow"),
@@ -534,7 +513,6 @@ impl NatsConfig {
             sorted.sort_unstable();
             sorted.hash(&mut hasher);
         }
-        self.policy.auth_callout_subscription.hash(&mut hasher);
         self.ack_mode.hash(&mut hasher);
         self.limits.max_in_flight.hash(&mut hasher);
         self.limits.subscription_capacity.hash(&mut hasher);
@@ -791,37 +769,6 @@ pub(super) fn subscription_spec(key: &str, binding: &str, value: String) -> Stri
 }
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn auth_callout_requires_host_selected_workload_identity() {
-        let base = std::collections::HashMap::from([
-            ("servers".into(), "nats://localhost:4222".into()),
-            ("auth-callout-subscription".into(), "true".into()),
-            ("auth-callout-workload".into(), "typewriter/auth".into()),
-            ("subject-allow".into(), "$SYS.REQ.USER.AUTH".into()),
-        ]);
-        for (identity, permitted) in [
-            ("typewriter/auth", true),
-            ("other/auth", false),
-            ("typewriter/other", false),
-        ] {
-            let mut config = super::NatsConfig::from_map(&base).unwrap();
-            config.scope_to_workload(identity).unwrap();
-            let policy = super::super::policy::PolicyEngine::new(&config.policy, vec![]);
-            assert_eq!(
-                policy.check_subscription("$SYS.REQ.USER.AUTH").is_ok(),
-                permitted
-            );
-        }
-        let mut missing = base;
-        missing.remove("auth-callout-workload");
-        assert!(
-            super::NatsConfig::from_map(&missing)
-                .unwrap()
-                .scope_to_workload("typewriter/auth")
-                .is_err()
-        );
-    }
-
     use super::*;
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {

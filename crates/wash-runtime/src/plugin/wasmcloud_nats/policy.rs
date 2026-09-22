@@ -10,11 +10,11 @@ use super::config::PolicySpec;
 ///
 /// `$JS.API` would bypass every stream and consumer check by driving the
 /// JetStream API directly; `$KV`/`$OBJ` would bypass bucket checks the same
-/// way; `$SYS` is the system account. `_nats_push.` is the plugin's own
+/// way. `_nats_push.` is the plugin's own
 /// JetStream delivery plane: a workload that could publish there would inject
 /// forged deliveries into another workload's handler, and one that could
 /// subscribe there would steal them.
-const RESERVED_SUBJECT_PREFIXES: &[&str] = &["$JS.", "$SYS.", "$KV.", "$OBJ.", "_nats_push."];
+const RESERVED_SUBJECT_PREFIXES: &[&str] = &["$JS.", "$KV.", "$OBJ.", "_nats_push."];
 
 /// The head token of every NATS inbox, shared or per-workload.
 ///
@@ -35,7 +35,6 @@ const BUCKET_BACKING_STREAM_PREFIXES: &[&str] = &["KV_", "OBJ_"];
 /// Compiled per-workload grant.
 #[derive(Debug, Clone)]
 pub struct PolicyEngine {
-    auth_callout_subscription: bool,
     subject_allow: Vec<NatsSubjectPattern>,
     /// The subject grant as written. Kept because a bind-time check needs the
     /// literal subjects an operator named, which a compiled pattern no longer
@@ -231,7 +230,6 @@ fn reaches_reserved(pattern: &str, lattice_prefixes: &[String]) -> bool {
 impl PolicyEngine {
     pub fn new(spec: &PolicySpec, lattice_prefixes: Vec<String>) -> Self {
         Self {
-            auth_callout_subscription: spec.auth_callout_subscription,
             subject_allow: spec
                 .subject_allow
                 .iter()
@@ -328,9 +326,7 @@ impl PolicyEngine {
     pub fn check_subscription(&self, pattern: &str) -> Result<(), Denied> {
         // A wildcard cannot be allowed to straddle into a reserved space, so
         // reject any pattern whose literal head could reach one.
-        if !(self.auth_callout_subscription && pattern == "$SYS.REQ.USER.AUTH")
-            && (self.is_reserved(pattern) || reaches_reserved(pattern, &self.lattice_prefixes))
-        {
+        if self.is_reserved(pattern) || reaches_reserved(pattern, &self.lattice_prefixes) {
             return Err(Denied::Reserved);
         }
         let requested = NatsSubjectPattern::parse(pattern);
@@ -430,32 +426,21 @@ mod tests {
     }
 
     #[test]
-    fn auth_capability_only_permits_exact_granted_subscription() {
+    fn system_subjects_follow_normal_host_grants() {
         let subject = "$SYS.REQ.USER.AUTH";
-        let p = PolicyEngine::new(
-            &PolicySpec {
-                auth_callout_subscription: true,
-                subject_allow: vec![subject.into()],
-                ..Default::default()
-            },
-            Vec::new(),
-        );
-        assert_eq!(p.check_subscription(subject), Ok(()));
-        assert_eq!(p.check_subject(subject), Err(Denied::Reserved));
-        for pattern in ["$SYS.>", "$SYS.REQ.USER.*", "$SYS.REQ.USER.OTHER", ">"] {
-            assert_eq!(p.check_subscription(pattern), Err(Denied::Reserved));
-        }
-        let ordinary = engine(&[subject], &[], &[]);
-        assert_eq!(ordinary.check_subscription(subject), Err(Denied::Reserved));
-        let ungranted = PolicyEngine::new(
-            &PolicySpec {
-                auth_callout_subscription: true,
-                ..Default::default()
-            },
-            Vec::new(),
+        let granted = engine(&[subject], &[], &[]);
+        assert_eq!(granted.check_subscription(subject), Ok(()));
+        assert_eq!(granted.check_subject(subject), Ok(()));
+        assert_eq!(
+            granted.check_subscription("$SYS.>"),
+            Err(Denied::NotGranted)
         );
         assert_eq!(
-            ungranted.check_subscription(subject),
+            granted.check_subject("$SYS.REQ.SERVER.PING"),
+            Err(Denied::NotGranted)
+        );
+        assert_eq!(
+            engine(&[], &[], &[]).check_subscription(subject),
             Err(Denied::NotGranted)
         );
     }
@@ -503,10 +488,6 @@ mod tests {
         let p = engine(&[">"], &[], &[]);
         assert_eq!(
             p.check_subject("$JS.API.STREAM.LIST"),
-            Err(Denied::Reserved)
-        );
-        assert_eq!(
-            p.check_subject("$SYS.REQ.SERVER.PING"),
             Err(Denied::Reserved)
         );
         assert_eq!(p.check_subject("$KV.config.key"), Err(Denied::Reserved));
