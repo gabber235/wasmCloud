@@ -35,6 +35,7 @@ permissions: {}
 
 jobs:
   bump:
+    if: github.repository == 'wasmCloud/wasmCloud'
     runs-on: ubuntu-latest
     permissions:
       contents: write

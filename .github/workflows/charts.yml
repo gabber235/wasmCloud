@@ -180,6 +180,7 @@ jobs:
     # the second clause; per-need success gate restores the implicit
     # success() check that `always()` disables.
     if: |
+      github.repository == 'wasmCloud/wasmCloud' &&
       always() &&
       (github.ref == 'refs/heads/main' || contains(github.event.pull_request.labels.*.name, 'canary')) &&
       needs.test.result == 'success'
@@ -208,7 +209,7 @@ jobs:
     # is skipped (only fires on PR), and without `always()` GHA marks
     # this skipped even when `test` succeeded. That would silently break
     # the chart release on every `vX.Y.Z` tag push.
-    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.test.result == 'success'
+    if: github.repository == 'wasmCloud/wasmCloud' && (always() && startsWith(github.ref, 'refs/tags/v') && needs.test.result == 'success')
     needs:
       - test
     permissions:

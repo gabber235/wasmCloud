@@ -224,6 +224,7 @@ jobs:
     # per-need `result == 'success'` gates restore the implicit success()
     # check that `always()` disables.
     if: |
+      github.repository == 'wasmCloud/wasmCloud' &&
       always() &&
       (github.ref == 'refs/heads/main' || contains(github.event.pull_request.labels.*.name, 'canary')) &&
       needs.lint.result == 'success' &&

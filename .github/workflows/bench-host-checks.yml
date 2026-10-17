@@ -24,6 +24,7 @@ permissions: {}
 
 jobs:
   runner-version:
+    if: github.repository == 'wasmCloud/wasmCloud'
     name: actions/runner version
     runs-on: ubuntu-latest
     timeout-minutes: 5

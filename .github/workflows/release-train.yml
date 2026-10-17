@@ -46,6 +46,7 @@ concurrency:
 
 jobs:
   gate:
+    if: github.repository == 'wasmCloud/wasmCloud'
     name: gate-release-train
     runs-on: ubuntu-latest
     outputs:

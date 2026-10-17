@@ -64,6 +64,7 @@ permissions:
 
 jobs:
   bench:
+    if: github.repository == 'wasmCloud/wasmCloud'
     name: ${{ inputs.bench }}
     runs-on: [self-hosted, bench, hetzner]
     timeout-minutes: 120

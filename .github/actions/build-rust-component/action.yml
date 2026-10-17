@@ -66,7 +66,7 @@ runs:
       run: wash build
 
     - name: Login to ghcr.io
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.image != ''
+      if: github.repository == 'wasmCloud/wasmCloud' && github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.image != ''
       uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
       with:
         registry: ghcr.io
@@ -75,7 +75,7 @@ runs:
 
     - name: Resolve version and component path
       id: resolve
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.image != ''
+      if: github.repository == 'wasmCloud/wasmCloud' && github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.image != ''
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
@@ -107,7 +107,7 @@ runs:
 
     - name: Publish or skip
       id: publish
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.image != ''
+      if: github.repository == 'wasmCloud/wasmCloud' && github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.image != ''
       uses: ./.github/actions/oci-push-with-digest
       with:
         ref: ${{ steps.resolve.outputs.ref }}

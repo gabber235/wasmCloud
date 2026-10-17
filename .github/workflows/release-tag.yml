@@ -550,6 +550,7 @@ jobs:
             "${SLACK_WEBHOOK_URL}"
 
   gate:
+    if: github.repository == 'wasmCloud/wasmCloud'
     name: gate-release-tag
     # Mirror release-train's ISO-week parity gate. workflow_run fires on
     # every release-train completion — including off-cycle weeks where

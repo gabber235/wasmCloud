@@ -52,6 +52,7 @@ jobs:
   # restricts to benches that actually move with wash-runtime changes so
   # a published tag doesn't tie up the bench host for ~4h.
   matrix:
+    if: github.repository == 'wasmCloud/wasmCloud'
     name: build matrix
     runs-on: ubuntu-latest
     timeout-minutes: 1
@@ -119,6 +120,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   bench:
+    if: github.repository == 'wasmCloud/wasmCloud'
     needs: matrix
     name: ${{ matrix.bench }}
     runs-on: [self-hosted, bench, hetzner]
