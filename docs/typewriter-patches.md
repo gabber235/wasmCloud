@@ -53,3 +53,11 @@ The Wasmtime scheduler executes guest code outside the future awaiting its resul
 Typewriter still imports native NATS `0.1.0`. Rebuild and exercise those actual components against the new host to verify compatible interface linking. The retired private messaging ABI remains unsupported.
 
 Publish host and component images before changing their GitOps references. Local infrastructure uses its own Git mirror; publishing the Infrastructure default branch can deploy to production and is a separate operation.
+
+## Fork binaries
+
+Run the `fork-release` GitHub Actions workflow on `main` with a new tag such as `typewriter-v2.10.3-1`. The upstream version must match the workspace version, and the final integer identifies the fork revision. Existing tags and releases cannot be replaced by this workflow.
+
+The workflow builds macOS arm64 and Linux arm64 and amd64 binaries with the default Cargo features. Linux targets glibc 2.17 and each binary is exercised in the Debian Bookworm environment used by Dagger. CLI and runtime tests, ingress lifetime tests, and NATS routing tests must pass before publication.
+
+Each release records its source commit, SHA256 checksums, and build provenance. Nix locks the explicit release metadata and verifies the macOS asset digest. Dagger pins the Linux URLs and digests from that same release. Advance all consumers together after their checks pass; `wash update` does not manage the Nix installation.
