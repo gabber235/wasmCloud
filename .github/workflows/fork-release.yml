@@ -124,7 +124,8 @@ jobs:
           CARGO_NET_RETRY: "10"
         run: |
           set -euo pipefail
-          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             cargo zigbuild --locked --release --target "${TARGET}.2.17" -p wash
           else
