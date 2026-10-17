@@ -586,7 +586,7 @@ impl InstanceDriver {
         let claimed = self
             .state
             .in_flight
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 (n < self.max_concurrency).then_some(n + 1)
             })
             .is_ok();
@@ -604,7 +604,7 @@ impl InstanceDriver {
         if let Some(limit) = self.max_invocations {
             match self
                 .admitted
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                     (n < limit).then_some(n + 1)
                 }) {
                 Ok(previous) => {
