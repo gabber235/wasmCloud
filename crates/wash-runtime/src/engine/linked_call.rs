@@ -159,7 +159,8 @@ pub(crate) struct EphemeralLinkedCall {
     /// this call ends up running in.
     pub(crate) pre: InstancePre<SharedCtx>,
     pub(crate) engine: wasmtime::Engine,
-    pub(crate) http_handler: Arc<dyn crate::host::http::HostHandler>,
+    /// See [`crate::host::http::live_handler`] for why this is weak.
+    pub(crate) http_handler: crate::host::HostRef,
     /// The meter of the host this call runs on; see
     /// [`crate::engine::abandon::StoreMetering`].
     pub(crate) invocation: crate::observability::InvocationMeter,
@@ -225,6 +226,7 @@ fn type_is_bridge_safe(ty: &Type) -> bool {
         Type::Stream(st) => st.ty().is_some_and(|e| bridgeable_element_type(&e)),
         Type::Future(ft) => ft.ty().is_some_and(|e| bridgeable_element_type(&e)),
         Type::List(t) => type_is_bridge_safe(&t.ty()),
+        Type::FixedLengthList(t) => type_is_bridge_safe(&t.ty()),
         Type::Option(t) => type_is_bridge_safe(&t.ty()),
         Type::Tuple(t) => t.types().all(|t| type_is_bridge_safe(&t)),
         Type::Record(t) => t.fields().all(|f| type_is_bridge_safe(&f.ty)),
@@ -259,7 +261,7 @@ pub(crate) fn func_is_bridge_safe(func_ty: &ComponentFunc) -> bool {
 
 async fn build_ctx_from_template(
     template: &ComponentCtxTemplate,
-    http_handler: Arc<dyn crate::host::http::HostHandler>,
+    http_handler: &crate::host::HostRef,
     all_volume_mounts: &[ResolvedVolumeMount],
     store_id: &str,
     is_service: bool,
@@ -285,17 +287,15 @@ async fn build_ctx_from_template(
     };
     // Keyed on the workload, not the component: a workload's components share
     // one allowance, the same way they share one virtual network.
-    let policy = Arc::new(sockets::policy::SocketPolicy {
-        allowed_hosts: Arc::clone(&template.local_resources.allowed_hosts),
-        host_loopback: Arc::clone(&template.local_resources.allowed_host_loopback_ports),
-        ..template
-            .socket_policy
-            .for_guest(kind, &template.workload_id)
-    });
+    let policy = Arc::new(template.socket_policy.for_guest(
+        kind,
+        &template.workload_id,
+        Arc::clone(&template.local_resources.allowed_hosts),
+        Arc::clone(&template.local_resources.allowed_host_loopback_ports),
+    ));
     let sockets_ctx = sockets::WasiSocketsCtx {
         socket_addr_check: sockets::SocketAddrCheck::new(move |addr, reason| {
-            let policy = Arc::clone(&policy);
-            Box::pin(async move { policy.decide(reason, addr) })
+            policy.decide(reason, addr)
         }),
         loopback: Arc::clone(&template.loopback),
         allowed_ip_name_lookups: Arc::clone(&template.local_resources.allowed_ip_name_lookups),
@@ -303,16 +303,11 @@ async fn build_ctx_from_template(
     };
 
     for mount in all_volume_mounts {
-        wasi_ctx_builder.preopened_dir(
-            &mount.host_path,
-            &mount.mount_path,
-            mount.dir_perms,
-            mount.file_perms,
-        )?;
+        wasi_ctx_builder.preopened_dir(&mount.host_path, &mount.mount_path, mount.perms)?;
     }
 
     let mut ctx_builder = Ctx::builder(template.workload_id.clone(), template.component_id.clone())
-        .with_http_handler(http_handler)
+        .with_host(http_handler)
         .with_wasi_ctx(wasi_ctx_builder.build())
         .with_sockets(sockets_ctx)
         .with_allowed_hosts(template.local_resources.allowed_hosts.clone());
@@ -333,20 +328,20 @@ async fn build_ctx_from_template(
 
 pub(crate) async fn new_store_from_templates(
     engine: &wasmtime::Engine,
-    http_handler: Arc<dyn crate::host::http::HostHandler>,
+    http_handler: &crate::host::HostRef,
     active: &ComponentCtxTemplate,
     linked: &[ComponentCtxTemplate],
     linked_instances: &[(Arc<str>, InstancePre<SharedCtx>)],
     is_service: bool,
 ) -> anyhow::Result<wasmtime::Store<SharedCtx>> {
-    let store_id = uuid::Uuid::new_v4().to_string();
+    let store_id = uuid::Uuid::now_v7().to_string();
     let all_volume_mounts = std::iter::once(active)
         .chain(linked.iter())
         .flat_map(|template| template.volume_mounts.clone())
         .collect::<Vec<_>>();
     let active_ctx = build_ctx_from_template(
         active,
-        http_handler.clone(),
+        http_handler,
         &all_volume_mounts,
         &store_id,
         is_service,
@@ -355,14 +350,9 @@ pub(crate) async fn new_store_from_templates(
     let mut shared_ctx = SharedCtx::new(active_ctx).with_guest_memory(&active.guest_memory);
 
     for linked in linked {
-        let linked_ctx = build_ctx_from_template(
-            linked,
-            http_handler.clone(),
-            &all_volume_mounts,
-            &store_id,
-            false,
-        )
-        .await?;
+        let linked_ctx =
+            build_ctx_from_template(linked, http_handler, &all_volume_mounts, &store_id, false)
+                .await?;
         shared_ctx
             .contexts
             .insert(linked.component_id.clone(), linked_ctx);
@@ -491,7 +481,7 @@ async fn new_ephemeral_store(
 
     let store = new_store_from_templates(
         &call.engine,
-        call.http_handler.clone(),
+        &call.http_handler,
         &active,
         &linked,
         &linked_instances,

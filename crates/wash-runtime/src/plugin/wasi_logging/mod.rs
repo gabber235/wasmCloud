@@ -70,9 +70,9 @@ impl TracingLogger {
 
 #[derive(Clone)]
 struct ComponentInfo {
+    workload_id: String,
     workload_name: String,
     workload_namespace: String,
-    component_id: String,
 }
 
 impl<'a> bindings::wasi::logging::logging::Host for ActiveCtx<'a> {
@@ -85,69 +85,72 @@ impl<'a> bindings::wasi::logging::logging::Host for ActiveCtx<'a> {
     ) -> wasmtime::Result<()> {
         let plugin = self.try_get_plugin::<TracingLogger>(PLUGIN_LOGGING_ID)?;
 
-        let component = plugin
+        // A call still running when its workload unbinds finds no entry; its
+        // message is still worth keeping, just without the names.
+        let info = plugin
             .components
             .read()
             .await
-            .get(&self.component_id.to_string())
-            .cloned()
-            .ok_or_else(|| wasmtime::format_err!("Component not found in TracingLogger plugin"))?;
-        let ComponentInfo {
-            workload_name,
-            workload_namespace,
-            component_id,
-        } = component;
+            .get(&*self.component_id)
+            .cloned();
+        let workload_name = info
+            .as_ref()
+            .map_or_else(String::new, |i| i.workload_name.clone());
+        let workload_namespace = info
+            .as_ref()
+            .map_or_else(String::new, |i| i.workload_namespace.clone());
+        let component_id = self.component_id.to_string();
         match level {
             Level::Trace => {
                 tracing::trace!(
-                    workload.component_id = component_id,
-                    workload.name = workload_name,
-                    workload.namespace = workload_namespace,
+                    workload.component_id = %component_id,
+                    workload.name = %workload_name,
+                    workload.namespace = %workload_namespace,
                     context,
                     "{message}"
                 )
             }
             Level::Debug => {
                 tracing::debug!(
-                    workload.component_id = component_id,
-                    workload.name = workload_name,
-                    workload.namespace = workload_namespace,
+                    workload.component_id = %component_id,
+                    workload.name = %workload_name,
+                    workload.namespace = %workload_namespace,
                     context,
                     "{message}"
                 )
             }
             Level::Info => {
                 tracing::info!(
-                    workload.component_id = component_id,
-                    workload.name = workload_name,
-                    workload.namespace = workload_namespace,
+                    workload.component_id = %component_id,
+                    workload.name = %workload_name,
+                    workload.namespace = %workload_namespace,
                     context,
                     "{message}"
                 )
             }
             Level::Warn => {
                 tracing::warn!(
-                    workload.component_id = component_id,
-                    workload.name = workload_name,
-                    workload.namespace = workload_namespace,
+                    workload.component_id = %component_id,
+                    workload.name = %workload_name,
+                    workload.namespace = %workload_namespace,
                     context,
                     "{message}"
                 )
             }
             Level::Error => {
                 tracing::error!(
-                    workload.component_id = component_id,
-                    workload.name = workload_name,
-                    workload.namespace = workload_namespace,
+                    workload.component_id = %component_id,
+                    workload.name = %workload_name,
+                    workload.namespace = %workload_namespace,
                     context,
                     "{message}"
                 )
             }
             Level::Critical => {
                 tracing::error!(
-                    workload.component_id = component_id,
-                    workload.name = workload_name,
-                    workload.namespace = workload_namespace,
+                    workload.component_id = %component_id,
+                    workload.name = %workload_name,
+                    workload.namespace = %workload_namespace,
                     context,
                     "{message}"
                 )
@@ -205,13 +208,58 @@ impl HostPlugin for TracingLogger {
         self.components.write().await.insert(
             component_handle.id().to_string(),
             ComponentInfo {
+                workload_id: component_handle.workload_id().to_string(),
                 workload_name: component_handle.workload_name().to_string(),
                 workload_namespace: component_handle.workload_namespace().to_string(),
-                component_id: component_handle.id().to_string(),
             },
         );
 
         Ok(())
+    }
+
+    async fn on_workload_unbind(
+        &self,
+        workload_id: &str,
+        _interfaces: WitInterfaces<'_>,
+    ) -> anyhow::Result<()> {
+        self.components
+            .write()
+            .await
+            .retain(|_, info| info.workload_id != workload_id);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(workload_id: &str) -> ComponentInfo {
+        ComponentInfo {
+            workload_id: workload_id.to_string(),
+            workload_name: "name".to_string(),
+            workload_namespace: "default".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unbind_forgets_only_that_workloads_components() {
+        let logger = TracingLogger::default();
+        {
+            let mut components = logger.components.write().await;
+            components.insert("a-1".to_string(), info("workload-a"));
+            components.insert("a-2".to_string(), info("workload-a"));
+            components.insert("b-1".to_string(), info("workload-b"));
+        }
+
+        let empty = HashSet::new();
+        logger
+            .on_workload_unbind("workload-a", WitInterfaces::new(&empty))
+            .await
+            .expect("unbind should succeed");
+
+        let components = logger.components.read().await;
+        assert_eq!(components.keys().collect::<Vec<_>>(), ["b-1"]);
     }
 }
 

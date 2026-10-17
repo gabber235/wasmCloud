@@ -26,9 +26,13 @@ members = [
     "http-ip-name-lookup",
     "keyvalue-counter",
     "keyvalue-implements",
+    "feeds-callee-a",
+    "feeds-callee-b",
+    "feeds-caller",
     "postgres-implements",
     # P3 fixtures (wasm32-wasip1 + reactor adapter)
     "http-handler-p3",
+    "http-local-caller-p3",
     "http-memory-grow",
     "http-ip-name-lookup-p3",
     "http-blobstore-p3",

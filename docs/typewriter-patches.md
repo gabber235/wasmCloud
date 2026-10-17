@@ -1,9 +1,9 @@
-# Typewriter patches on wasmCloud 2.9
+# Typewriter patches on wasmCloud 2.10.3
 
-Base: upstream `v2.9.0`, commit `68ebece9c537f8bb4b5c9999f274ec68d60f35a9`.
-Previous published fork: `76dc551a3a407d4dcb63d3303eab8c05a948fd28`.
+Base: upstream `v2.10.3`, commit `548bb21b6`.
+Previous published fork: `c8984bda3fadaf825d0b47f69a8041561fd3d32c`.
 
-The fork follows native `wasmcloud:nats@0.1.0`. Typewriter components import Core NATS and JetStream and export `core-handler`. The private `wasmcloud:messaging@0.4.0` contract and its custom transport implementations are retired.
+The fork provides native `wasmcloud:nats@0.1.2` and accepts compatible `0.1.0` imports through upstream interface matching. Typewriter components import Core NATS and JetStream and export `core-handler`. The private `wasmcloud:messaging@0.4.0` contract and its custom transport implementations are retired.
 
 ## Patch disposition
 
@@ -15,6 +15,16 @@ The fork follows native `wasmcloud:nats@0.1.0`. Typewriter components import Cor
 - `8bcc2ee6e`: retire protobuf build dependency gating. The upstream runtime no longer has that build script.
 - `e0a31f09d`, `ddfcc4996`, `76dc551a3`: retire fixture generation repairs tied to the private messaging ABI. Native plugin tests and Typewriter component tests provide the migration coverage.
 - `e20d4c0ec`: retain injectable component span processors. Tests capture telemetry per fixture without replacing production transport.
+
+## Upstream 2.10.3 reconciliation
+
+Retain exact guest span conversion, component resource identity, injectable processors and log sinks, invocation context ownership, NATS propagation, per entry subscriptions, and broker synchronization. Upstream does not yet provide these guarantees.
+
+Use upstream signal specific OpenTelemetry exporter configuration, workload logging cleanup, compatible WIT matching, binding aliases and required keys, plugin egress limits, and unified HTTP bodies. The shared HTTP boundary keeps trace parent propagation for both WASI generations. Ingress shutdown drains its owned connections before releasing upstream routing tables.
+
+Entry settings are validated against host ownership separately from required connection settings. A component selector does not need to repeat a connection value already supplied by its shared binding. Trace registrations release only their own task entry, protecting a newer invocation when Wasmtime reuses a task identifier.
+
+Security dependency updates follow upstream fixes: Wasmtime `48.0.6`, rustls `0.23.46`, and quinn-proto `0.11.19`. The fork retains OpenTelemetry `0.32` and tracing OpenTelemetry `0.33` for the existing host and test capture contract.
 
 ## Host policy
 
@@ -40,4 +50,6 @@ The Wasmtime scheduler executes guest code outside the future awaiting its resul
 
 ## Rollout constraint
 
-The old private messaging ABI and native NATS ABI are incompatible. Host images and component images must be published before their GitOps references change. A coordinated cutover must prevent old and new queue groups from simultaneously processing the same traffic. Publishing the Infrastructure default branch can trigger this rollout immediately.
+Typewriter still imports native NATS `0.1.0`. Rebuild and exercise those actual components against the new host to verify compatible interface linking. The retired private messaging ABI remains unsupported.
+
+Publish host and component images before changing their GitOps references. Local infrastructure uses its own Git mirror; publishing the Infrastructure default branch can deploy to production and is a separate operation.

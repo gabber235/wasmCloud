@@ -188,6 +188,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "feeds-callee-a"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "feeds-callee-b"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "feeds-caller"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -415,6 +436,13 @@ dependencies = [
 
 [[package]]
 name = "http-ip-name-lookup-p3"
+version = "0.0.0"
+dependencies = [
+ "wit-bindgen 0.60.0",
+]
+
+[[package]]
+name = "http-local-caller-p3"
 version = "0.0.0"
 dependencies = [
  "wit-bindgen 0.60.0",

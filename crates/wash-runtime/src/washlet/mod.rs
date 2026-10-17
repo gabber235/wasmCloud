@@ -168,6 +168,12 @@ impl ClusterHostBuilder {
         self.host_builder.http_handler()
     }
 
+    /// Reference for a component plugin built before the cluster host.
+    #[cfg(feature = "host-component-plugins")]
+    pub fn host_ref(&self) -> crate::host::HostRef {
+        self.host_builder.host_ref()
+    }
+
     /// Registers the multiplexed plugin set. See
     /// [`crate::host::HostBuilder::with_multiplexed_plugins`].
     #[cfg(feature = "wasm_component_model_implements")]
@@ -263,13 +269,15 @@ impl ClusterHostBuilder {
     }
 }
 
-/// Why the command loop stopped turning. Both run the same shutdown; they
+/// Why the command loop stopped turning. All run the same shutdown; they
 /// differ only in what the host reports afterwards.
 enum Ended {
     /// The cleanup future was awaited.
     Requested,
     /// The HTTP ingress' accept loop returned.
     IngressStopped,
+    /// A command task panicked or was cancelled.
+    CommandPanicked(tokio::task::JoinError),
 }
 
 pub struct ClusterHost {
@@ -403,9 +411,13 @@ impl ClusterHost {
                         // exists" for the life of the host. Taking the host
                         // down is what a panic here did before commands ran as
                         // their own tasks, and a restart is what clears it.
+                        //
+                        // Fatal by way of the shutdown below: skipping
+                        // `host.stop()` would leave the ingress accepting and
+                        // the plugins bound on a host that is already finished.
                         Some(finished) = commands.join_next() => {
                             if let Err(e) = finished {
-                                return Err(anyhow!("command task failed: {e}"));
+                                break Ended::CommandPanicked(e);
                             }
                         }
                         // OCI cache cleanup
@@ -568,6 +580,10 @@ impl ClusterHost {
                             "HTTP ingress stopped accepting connections; \
                              the host can no longer serve traffic"
                         ))
+                    }
+                    Ended::CommandPanicked(e) => {
+                        stopped?;
+                        Err(anyhow!("command task failed: {e}"))
                     }
                 }
             }

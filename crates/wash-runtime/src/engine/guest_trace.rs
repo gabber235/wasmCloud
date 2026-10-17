@@ -10,20 +10,24 @@ use wasmtime::component::{Accessor, ComponentNamedList, GuestTaskId, Lift, Lower
 use wasmtime::{AsContextMut, component::Access};
 
 #[derive(Clone, Default)]
-pub(crate) struct GuestTraces(Arc<Mutex<HashMap<GuestTaskId, tracing::Span>>>);
+pub(crate) struct GuestTraces(Arc<Mutex<HashMap<GuestTaskId, Arc<tracing::Span>>>>);
 
 struct Registration {
     traces: GuestTraces,
     task: GuestTaskId,
+    span: Arc<tracing::Span>,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        self.traces
-            .0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.task);
+        let mut traces = self.traces.0.lock().unwrap_or_else(|e| e.into_inner());
+        // Task identifiers can be reused before an older host future is dropped.
+        if traces
+            .get(&self.task)
+            .is_some_and(|span| Arc::ptr_eq(span, &self.span))
+        {
+            traces.remove(&self.task);
+        }
     }
 }
 
@@ -37,7 +41,7 @@ where
     Params: ComponentNamedList + Lower + 'static,
     Return: ComponentNamedList + Lift + 'static,
 {
-    let span = tracing::Span::current();
+    let span = Arc::new(tracing::Span::current());
     let (pending, _registration) = accessor.with(|mut access| -> wasmtime::Result<_> {
         let pending = function.start_call_concurrent(&mut access, params)?;
         let traces = access.get().guest_traces.clone();
@@ -46,8 +50,8 @@ where
             .0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(task, span);
-        wasmtime::Result::Ok((pending, Registration { traces, task }))
+            .insert(task, Arc::clone(&span));
+        wasmtime::Result::Ok((pending, Registration { traces, task, span }))
     })?;
     function.finish_call_concurrent(accessor, pending).await
 }
@@ -68,7 +72,7 @@ pub(crate) fn current<T>(access: &mut Access<'_, T, SharedCtx>) -> tracing::Span
         .unwrap_or_else(|e| e.into_inner());
     tasks
         .into_iter()
-        .find_map(|task| traces.get(&task).cloned())
+        .find_map(|task| traces.get(&task).map(|span| span.as_ref().clone()))
         .unwrap_or_else(tracing::Span::current)
 }
 
@@ -127,6 +131,37 @@ mod tests {
                         let mut access =
                             Access::<SharedCtx, SharedCtx>::new(store, extract_active_ctx);
                         let span = current(&mut access);
+                        if id == 0 {
+                            let task = access
+                                .as_context_mut()
+                                .async_call_stack()
+                                .unwrap()
+                                .next()
+                                .unwrap();
+                            let traces = GuestTraces::default();
+                            let previous = Arc::new(span.clone());
+                            traces.0.lock().unwrap().insert(task, Arc::clone(&previous));
+                            let stale = Registration {
+                                traces: traces.clone(),
+                                task,
+                                span: previous,
+                            };
+                            let replacement = Arc::new(span.clone());
+                            traces
+                                .0
+                                .lock()
+                                .unwrap()
+                                .insert(task, Arc::clone(&replacement));
+                            let active = Registration {
+                                traces: traces.clone(),
+                                task,
+                                span: replacement,
+                            };
+                            drop(stale);
+                            assert_eq!(traces.0.lock().unwrap().len(), 1);
+                            drop(active);
+                            assert!(traces.0.lock().unwrap().is_empty());
+                        }
                         let context = span.context().span().span_context().clone();
                         if id == 2 {
                             wasmtime::bail!("intentional guest trap");

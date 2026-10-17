@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use anyhow::Context as _;
+use anyhow::{Context as _, bail};
 use clap::Args;
 use tracing::info;
 use wash_runtime::{
@@ -133,6 +133,46 @@ pub struct HostCommand {
         default_value = "webpki"
     )]
     pub http_client_trust_roots: HttpClientTrustRoots,
+
+    /// Client certificate chain (PEM) presented when a peer requests one
+    /// during outbound HTTPS from components.
+    ///
+    /// The other half of `--http-client-ca-path`: that decides which servers
+    /// this host will talk to, this decides who it says it is when one asks.
+    /// Host-wide *and* destination-wide: every workload on this host
+    /// authenticates as this identity, and it is presented to any peer that
+    /// asks for a client certificate, with no per-destination scoping. A
+    /// workload whose `allowed_hosts` reaches an arbitrary endpoint can
+    /// therefore make the host disclose this certificate to it, so pair this
+    /// with an `allowed_hosts` narrow enough to name the services it is for.
+    ///
+    /// Requires `--http-client-key-path`.
+    #[arg(
+        long = "http-client-cert-path",
+        env = "WASH_HTTP_CLIENT_CERT_PATH",
+        requires = "http_client_key_path"
+    )]
+    pub http_client_cert_path: Option<PathBuf>,
+
+    /// Private key (PEM) for `--http-client-cert-path`.
+    #[arg(
+        long = "http-client-key-path",
+        env = "WASH_HTTP_CLIENT_KEY_PATH",
+        requires = "http_client_cert_path"
+    )]
+    pub http_client_key_path: Option<PathBuf>,
+
+    /// Re-read the client identity on this interval, such as `30s` or `5m`.
+    ///
+    /// A failed refresh keeps the current credential. This option also checks
+    /// certificate-chain expiry. Without it, the identity is read once.
+    #[arg(
+        long = "http-client-identity-refresh",
+        env = "WASH_HTTP_CLIENT_IDENTITY_REFRESH",
+        requires = "http_client_cert_path",
+        value_parser = humantime::parse_duration
+    )]
+    pub http_client_identity_refresh: Option<std::time::Duration>,
 
     /// Host-wide cap on live connections across every workload and surface
     /// combined — pooled HTTP, raw sockets, and inbound published ports.
@@ -332,6 +372,34 @@ pub struct HostCommand {
     )]
     pub http_connection_wait: Option<Duration>,
 
+    /// Enable same-host local routing: an outgoing HTTP request matching a
+    /// co-located workload's `localRoute` interface config (`host`, or
+    /// `host/path` for a prefix) is served in-memory by that workload instead
+    /// of egressing to the network.
+    ///
+    /// One of two keys: this flag alone makes nothing locally reachable — each
+    /// workload must also declare its own `localRoute` entries. Hostnames
+    /// published only via `host`/`host-aliases` are never short-circuited, and
+    /// `localRoute` names are never reachable from the network.
+    ///
+    /// SECURITY: a `localRoute` is a claim, not a proof of ownership. Any
+    /// workload on this host may claim any hostname — including a public one it
+    /// has nothing to do with — and will then receive its neighbours' requests
+    /// to that name. Because dispatch is in-memory there is no TLS: an
+    /// `https://` request to a claimed name is handed over in plaintext,
+    /// certificate never checked. The caller's allowed_hosts does not help,
+    /// since the caller legitimately lists the name it means to reach. Enable
+    /// only where every workload on the host is equally trusted.
+    ///
+    /// Locally routed calls also bypass ingress middleware (auth, rate limits,
+    /// mesh mTLS, network policy). allowed_hosts is still enforced first.
+    #[arg(
+        long = "http-local-routing",
+        env = "WASH_HTTP_LOCAL_ROUTING",
+        default_value_t = false
+    )]
+    pub http_local_routing: bool,
+
     /// Enable WASI WebGPU support
     #[cfg(all(
         not(target_os = "windows"),
@@ -343,18 +411,26 @@ pub struct HostCommand {
 
     /// PostgreSQL connection URL for the wasmcloud:postgres plugin
     /// (e.g. postgres://user:pass@bouncer:6432?sslmode=require&pool_size=10)
-    #[arg(long = "postgres-url", env = "WASH_POSTGRES_URL")]
-    pub postgres_url: Option<String>,
+    #[arg(
+        long = "postgres-url",
+        env = "WASH_POSTGRES_URL",
+        hide_env_values = true,
+        value_parser = SecretUrlParser
+    )]
+    pub postgres_url: Option<url::Url>,
 
-    /// Allow insecure OCI Registries
+    /// Allow insecure OCI registries: when a component pull fails over HTTPS,
+    /// retry it over plain HTTP (e.g. an in-cluster registry that serves no
+    /// TLS). Registries that do serve TLS are unaffected — HTTPS is always
+    /// attempted first.
     #[arg(long = "allow-insecure-registries", default_value_t = false)]
     pub allow_insecure_registries: bool,
 
     /// Extra CA certificate bundle files (PEM) trusted when pulling from OCI
-    /// registries: for a registry behind a private or in-cluster CA, which the
-    /// compiled-in public roots do not cover. Applies to every pull this host
-    /// makes: workload components, host component plugins, and washlet
-    /// artifacts alike.
+    /// registries: for a registry behind a private or in-cluster CA that
+    /// neither the OS trust store nor SSL_CERT_FILE / SSL_CERT_DIR covers.
+    /// Applies to every pull this host makes: workload components, host
+    /// component plugins, and washlet artifacts alike.
     ///
     /// Prefer this to `--allow-insecure-registries`, which does not relax
     /// verification but replaces it: that flag switches every registry to
@@ -395,10 +471,12 @@ pub struct HostCommand {
 
     /// How many workloads this host pulls and compiles at once.
     ///
-    /// Each start it admits ends in a single-threaded compile, so this is how
-    /// many cores a burst of starts can take from the ones serving HTTP and
-    /// NATS. Defaults to one fewer than the host can see, at most 4; lower it
-    /// on a host that must stay responsive while it starts things.
+    /// Each start it admits ends in a compile that spreads over every core the
+    /// host can see, so this is a floor on what a burst of starts takes from
+    /// the cores serving HTTP and NATS, not a ceiling. Cap the compiles
+    /// themselves with `RAYON_NUM_THREADS` or `WASMTIME_PARALLEL_COMPILATION=false`.
+    /// Defaults to one fewer than the host can see, at most 4; lower it on a
+    /// host that must stay responsive while it starts things.
     #[arg(long = "max-concurrent-starts", env = "WASH_MAX_CONCURRENT_STARTS")]
     pub max_concurrent_starts: Option<usize>,
 
@@ -461,7 +539,11 @@ pub struct HostCommand {
     /// only — the data plane's certificates say nothing about another NATS —
     /// and it carries no grant either way: a binding that inherits it still
     /// reaches nothing until the host grants it something.
-    #[arg(long = "wasmcloud-nats-url", env = "WASH_WASMCLOUD_NATS_URL")]
+    #[arg(
+        long = "wasmcloud-nats-url",
+        env = "WASH_WASMCLOUD_NATS_URL",
+        hide_env_values = true
+    )]
     pub wasmcloud_nats_url: Option<String>,
 
     /// Removed: the policy is `workloadConfig` on the `host.plugins` entry.
@@ -537,6 +619,32 @@ pub struct HostCommand {
 
 /// clap value parser for `--host-plugin`: parse one spec, flattening the
 /// `anyhow` error chain into the `String` clap wants.
+/// Parses a URL that may carry credentials. clap's default parser error
+/// repeats the raw input, so this one reports only the argument and the reason.
+#[derive(Clone)]
+struct SecretUrlParser;
+
+impl clap::builder::TypedValueParser for SecretUrlParser {
+    type Value = url::Url;
+
+    fn parse_ref(
+        &self,
+        _cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        let arg = arg.map_or_else(|| "...".to_string(), |a| a.to_string());
+        let invalid = |reason: &dyn std::fmt::Display| {
+            clap::Error::raw(
+                clap::error::ErrorKind::ValueValidation,
+                format!("invalid URL for '{arg}': {reason}\n"),
+            )
+        };
+        let value = value.to_str().ok_or_else(|| invalid(&"not valid UTF-8"))?;
+        url::Url::parse(value).map_err(|e| invalid(&e))
+    }
+}
+
 fn parse_host_plugin_spec(s: &str) -> Result<wash_runtime::plugin::ComponentPluginSpec, String> {
     s.parse().map_err(|e: anyhow::Error| format!("{e:#}"))
 }
@@ -559,6 +667,70 @@ fn host_plugin_registry_credentials(
 }
 
 impl HostCommand {
+    /// Build outbound TLS and start identity refresh when configured.
+    fn egress_handler(&self) -> anyhow::Result<wash_runtime::host::http::DefaultOutgoingHandler> {
+        use wash_runtime::host::client_identity::{RotatingClientIdentity, spawn_refresh};
+        use wash_runtime::host::http::DefaultOutgoingHandler;
+
+        let options = self.client_tls_options()?;
+        // Public callers can bypass Clap's required argument checks.
+        if self.http_client_identity_refresh.is_some() && options.client_identity.is_none() {
+            bail!("--http-client-identity-refresh needs --http-client-cert-path");
+        }
+        let (Some(interval), Some(identity)) = (
+            self.http_client_identity_refresh,
+            options.client_identity.clone(),
+        ) else {
+            return DefaultOutgoingHandler::from_tls_options(options)
+                .context("failed to load --http-client-ca-path CA certificates");
+        };
+
+        let rotating = RotatingClientIdentity::load(&identity)
+            .context("failed to load the outbound client identity")?;
+        let config = options
+            .build_with_resolver(Arc::clone(&rotating) as _)
+            .context("failed to load --http-client-ca-path CA certificates")?;
+        spawn_refresh(rotating, identity, interval)
+            .context("invalid --http-client-identity-refresh")?;
+        Ok(DefaultOutgoingHandler::with_tls_config(config))
+    }
+
+    /// Outbound TLS for components: which servers to trust, and which
+    /// identity to present when one asks for a client certificate.
+    fn client_tls_options(
+        &self,
+    ) -> anyhow::Result<wash_runtime::host::http_client::ClientTlsOptions> {
+        let mut options = wash_runtime::host::http_client::ClientTlsOptions::default();
+        options.roots = self.http_client_trust_roots.into();
+        options.extra_ca_paths = self.http_client_ca_paths.clone();
+        // Clap's `requires` pairs these on the command line, but this struct
+        // is public and an embedder can set one alone. Half a credential is
+        // refused rather than dropped: silently serving without an identity
+        // surfaces as the upstream rejecting every request, which is the
+        // failure this whole flag exists to avoid.
+        match (
+            self.http_client_cert_path.clone(),
+            self.http_client_key_path.clone(),
+        ) {
+            (Some(cert_path), Some(key_path)) => {
+                options.client_identity = Some(
+                    wash_runtime::host::http_client::ClientIdentity::CertificatePem {
+                        cert_path,
+                        key_path,
+                    },
+                );
+            }
+            (None, None) => {}
+            (Some(_), None) => {
+                bail!("--http-client-cert-path needs --http-client-key-path")
+            }
+            (None, Some(_)) => {
+                bail!("--http-client-key-path needs --http-client-cert-path")
+            }
+        }
+        Ok(options)
+    }
+
     /// The operator's plugin binding declarations, plus the fallbacks this
     /// host's own flags supply.
     ///
@@ -751,6 +923,10 @@ impl HostCommand {
             },
             quotas: Some(Arc::clone(&quotas)),
             meters: Some(Arc::new(wash_runtime::host::quota::PolicyMeters::default())),
+            // The host's one record of which real ports are spoken for. Every
+            // guest policy is derived from this one, so they all read the same
+            // table and a port reserved here is seen by all of them.
+            host_owned_ports: Some(wash_runtime::host::ports::PortTable::new()),
             ..Default::default()
         });
         engine_builder = engine_builder.with_socket_policy(Arc::clone(&socket_policy));
@@ -911,21 +1087,20 @@ impl HostCommand {
             // Outbound (egress) trust roots: extra CAs for components calling
             // HTTPS hosts behind a private CA. Distinct from the ingress TLS
             // options below, which configure the HTTP *server*.
-            let outgoing_handler =
-                wash_runtime::host::http::DefaultOutgoingHandler::from_tls_options(
-                    wash_runtime::host::http_client::ClientTlsOptions {
-                        roots: self.http_client_trust_roots.into(),
-                        extra_ca_paths: self.http_client_ca_paths.clone(),
-                    },
-                )
-                .context("failed to load --http-client-ca-path CA certificates")?
+            let outgoing_handler = self
+                .egress_handler()?
                 // The same registry the socket policy uses, so a workload's
                 // HTTP pool and its raw sockets share one configured
                 // allowance rather than two.
                 .with_quotas(Arc::clone(&quotas));
 
             let mut ingress_builder = wash_runtime::host::http::Ingress::builder(http_router, addr)
-                .outgoing_handler(outgoing_handler);
+                .outgoing_handler(outgoing_handler)
+                .local_routing(self.http_local_routing)
+                // The same registry the outgoing handler and socket policy draw
+                // on, so a workload's locally routed calls count against the
+                // ceiling its network egress counts against.
+                .quotas(Arc::clone(&quotas));
             if let Some(max) = self.max_http_ingress_connections {
                 ingress_builder = ingress_builder.max_connections(max);
             }
@@ -979,7 +1154,7 @@ impl HostCommand {
                 timeout: Some(self.registry_pull_timeout),
             };
             let native_plugins = cluster_host_builder.native_plugins();
-            let http_handler = cluster_host_builder.http_handler();
+            let host_ref = cluster_host_builder.host_ref();
 
             // Config-file plugins (`host.hostPlugins`) first, so their
             // config/secretFrom/allowedHosts are honored; CLI/env
@@ -1003,7 +1178,7 @@ impl HostCommand {
                     &engine,
                     plugin_oci_config.clone(),
                     &native_plugins,
-                    http_handler.clone(),
+                    Some(host_ref.clone()),
                     Some(Arc::clone(&socket_policy)),
                 )
                 .await

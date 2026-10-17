@@ -523,8 +523,10 @@ impl Engine {
             service,
             volumes,
             host_interfaces,
+            annotations,
             ..
         } = workload;
+        let annotations_arc = Arc::new(annotations);
 
         // Process and validate volumes - create a lookup map from volume name to validated host path
         let mut validated_volumes = std::collections::HashMap::new();
@@ -567,7 +569,7 @@ impl Engine {
             ) {
                 Ok(handle) => {
                     tracing::debug!("successfully initialized service component");
-                    Some(handle)
+                    Some(handle.with_annotations(Arc::clone(&annotations_arc)))
                 }
                 Err(e) => {
                     tracing::error!(err = ?e, "failed to initialize service component");
@@ -591,7 +593,7 @@ impl Engine {
             ) {
                 Ok(handle) => {
                     tracing::debug!("successfully initialized workload component");
-                    workload_components.push(handle);
+                    workload_components.push(handle.with_annotations(Arc::clone(&annotations_arc)));
                 }
                 Err(e) => {
                     tracing::error!(err = ?e, "failed to initialize component");
@@ -984,6 +986,7 @@ pub struct EngineBuilder {
     compilation_cache_ttl: Option<Duration>,
     fuel_consumption: Option<bool>,
     parallel_compilation: Option<bool>,
+    native_unwind_info: Option<bool>,
     socket_policy: Option<Arc<crate::sockets::policy::SocketPolicy>>,
     host_memory: Option<host_memory::HostMemoryBudgets>,
     guest_memory_mode: guest_memory::GuestMemoryMode,
@@ -1094,6 +1097,18 @@ impl EngineBuilder {
     /// makes it single-threaded again.
     pub fn with_parallel_compilation(mut self, enable: bool) -> Self {
         self.parallel_compilation = Some(enable);
+        self
+    }
+
+    /// Whether compiled code registers unwind tables with the system unwinder,
+    /// which only native debuggers and profilers that unwind by DWARF read.
+    ///
+    /// On, as in wasmtime, unless this or `WASMTIME_NATIVE_UNWIND_INFO` turns
+    /// it off. Under LLVM's libunwind (macOS; musl and zig-built Linux
+    /// binaries) every component drop scans a process-wide table of them, so
+    /// a host holding many components wants it off. Windows requires them.
+    pub fn with_native_unwind_info(mut self, enable: bool) -> Self {
+        self.native_unwind_info = Some(enable);
         self
     }
 
@@ -1286,6 +1301,16 @@ impl EngineBuilder {
         // deadline of its own — see [`crate::engine::abandon::arm_epoch_deadline`],
         // which is what decides when one is acted on.
         config.epoch_interruption(true);
+
+        // Unwind tables are wasmtime's own default, so this only carries an
+        // explicit choice through. Windows refuses to drop them, so an "off"
+        // is ignored there instead of failing `build`.
+        if let Some(unwind) = self
+            .native_unwind_info
+            .or_else(|| getenv::<bool>("WASMTIME_NATIVE_UNWIND_INFO"))
+        {
+            config.native_unwind_info(unwind || cfg!(windows));
+        }
 
         for proposal in &self.proposals {
             proposal.apply(&mut config);
@@ -1609,6 +1634,20 @@ mod tests {
         assert!(!engine.inner().get_parallel_compilation());
     }
 
+    // Unwind tables are on unless a host turns them off, and turning them off
+    // reaches the engine everywhere but Windows, which requires them.
+    #[test]
+    fn native_unwind_info_is_on_and_can_be_turned_off() {
+        let engine = Engine::builder().build().expect("default should build");
+        assert_eq!(engine.inner().get_native_unwind_info(), Some(true));
+
+        let engine = Engine::builder()
+            .with_native_unwind_info(false)
+            .build()
+            .expect("turning unwind info off should build");
+        assert_eq!(engine.inner().get_native_unwind_info(), Some(cfg!(windows)));
+    }
+
     // A custom base config can now be combined with the pooling allocator and
     // instance limits, which previously errored out of `build()`.
     #[test]
@@ -1686,6 +1725,30 @@ mod tests {
 
         let engine = Engine::builder().build().expect("engine should build");
         Component::new(&engine.inner, &bytes).expect("map component should compile");
+    }
+
+    /// A component built against a newer WASI patch than the host links still
+    /// resolves, provided it only uses what the host's version defines.
+    #[test]
+    fn a_newer_compatible_wasi_import_links_against_the_host() {
+        let engine = Engine::builder().build().expect("engine should build");
+        let mut linker: Linker<SharedCtx> = Linker::new(&engine.inner);
+        add_wasi_to_linker(&mut linker).expect("WASI should link");
+        let importing = |version: &str| {
+            let wat = format!(
+                r#"(component (import "wasi:random/random@{version}"
+                    (instance (export "get-random-u64" (func (result u64))))))"#
+            );
+            let bytes = wat::parse_str(wat).expect("component should assemble");
+            Component::new(&engine.inner, &bytes).expect("component should compile")
+        };
+
+        for version in ["0.2.0", "0.2.99", "0.3.0", "0.3.3"] {
+            linker
+                .instantiate_pre(&importing(version))
+                .unwrap_or_else(|e| panic!("wasi:random@{version} should link: {e:#}"));
+        }
+        assert!(linker.instantiate_pre(&importing("0.4.0")).is_err());
     }
 
     // A scheduler placing N replicas of one image sends N starts carrying one

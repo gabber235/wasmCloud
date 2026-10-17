@@ -102,6 +102,9 @@ const P2_FIXTURES: &[&str] = &[
     "keyvalue-counter",
     "keyvalue-implements",
     "postgres-implements",
+    "feeds-callee-a",
+    "feeds-callee-b",
+    "feeds-caller",
 ];
 
 const P3_FIXTURES: &[&str] = &[
@@ -111,6 +114,7 @@ const P3_FIXTURES: &[&str] = &[
     "nats-implements-p3",
     "messaging-dual-handler",
     "http-handler-p3",
+    "http-local-caller-p3",
     "http-memory-grow",
     "http-ip-name-lookup-p3",
     "http-blobstore-p3",
