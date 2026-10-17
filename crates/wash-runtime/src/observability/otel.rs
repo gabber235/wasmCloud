@@ -52,12 +52,13 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use opentelemetry::{Key, KeyValue, trace::TracerProvider as _};
+use opentelemetry::{Key, KeyValue, Value, trace::TracerProvider as _};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{WithHttpConfig as _, WithTonicConfig as _};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::resource::{EnvResourceDetector, ResourceDetector as _};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_semantic_conventions::resource;
 use rustls::pki_types::pem::PemObject as _;
@@ -403,35 +404,26 @@ fn signal_or_shared(signal_var: &str, shared_var: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// What `SdkProvidedResourceDetector` emits for `service.name` when nothing
-/// named the service. The Rust SDK uses the bare literal, not the
-/// specification's `unknown_service:<executable>`.
-const UNKNOWN_SERVICE: &str = "unknown_service";
-
-/// This runtime's own `service.name`, or `None` when the environment already
-/// named one.
-///
-/// Presence cannot be the test: `SdkProvidedResourceDetector` *always* emits
-/// `service.name`, falling back to [`UNKNOWN_SERVICE`] when neither
-/// `OTEL_SERVICE_NAME` nor `OTEL_RESOURCE_ATTRIBUTES` supplied a value. That
-/// sentinel is the only thing separating "nobody named it" from a real name.
-fn default_service_name(detected: &Resource) -> Option<KeyValue> {
-    let named = detected
-        .get(&Key::from_static_str(resource::SERVICE_NAME))
-        .is_some_and(|value| value.as_str() != UNKNOWN_SERVICE);
-    (!named).then(|| KeyValue::new(resource::SERVICE_NAME.to_string(), env!("CARGO_PKG_NAME")))
-}
-
 /// The resource every provider this process builds carries.
 ///
-/// `Resource::builder` runs the SDK, telemetry and environment detectors, so
-/// `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` are read before we add
-/// anything. `service.version` and `service.instance.id` are this runtime's to
-/// state; `service.name` is the operator's whenever they set one, because a
-/// fleet that all reports as `wash-runtime` cannot be told apart.
+/// The explicit service name takes precedence over resource attributes. When
+/// neither names the service, use the runtime name instead of the SDK's
+/// generated executable name. Reuse the SDK parser for resource attributes.
+/// Version and instance identity remain owned by this runtime.
 fn resource() -> Resource {
-    let detected = Resource::builder().build();
-    let mut builder = Resource::builder()
+    let service_name = std::env::var("OTEL_SERVICE_NAME")
+        .ok()
+        .filter(|name| !name.is_empty())
+        .map(Value::from)
+        .or_else(|| {
+            EnvResourceDetector::new()
+                .detect()
+                .get(&Key::from_static_str(resource::SERVICE_NAME))
+        })
+        .unwrap_or_else(|| env!("CARGO_PKG_NAME").into());
+
+    Resource::builder()
+        .with_attribute(KeyValue::new(resource::SERVICE_NAME, service_name))
         .with_attribute(KeyValue::new(
             resource::SERVICE_INSTANCE_ID.to_string(),
             uuid::Uuid::new_v4().to_string(),
@@ -439,11 +431,8 @@ fn resource() -> Resource {
         .with_attribute(KeyValue::new(
             resource::SERVICE_VERSION.to_string(),
             env!("CARGO_PKG_VERSION"),
-        ));
-    if let Some(service_name) = default_service_name(&detected) {
-        builder = builder.with_attribute(service_name);
-    }
-    builder.build()
+        ))
+        .build()
 }
 
 /// The OTel providers this process installed, and the `tracing` layers that
@@ -1202,27 +1191,35 @@ mod tests {
         );
     }
 
-    /// `service.name` is the operator's when they set one, and ours only when
-    /// nobody did. Both cases turn on the sentinel: the detector always emits
-    /// the key, so a presence test would never let our default apply.
     #[test]
-    fn the_environment_names_the_service_and_we_only_default_it() {
-        let named = |name: &str| {
-            Resource::builder_empty()
-                .with_attribute(KeyValue::new(
-                    resource::SERVICE_NAME.to_string(),
-                    name.to_string(),
-                ))
-                .build()
-        };
-
-        assert_eq!(
-            default_service_name(&named(UNKNOWN_SERVICE)).map(|kv| kv.value.as_str().to_string()),
-            Some(env!("CARGO_PKG_NAME").to_string()),
-        );
-        assert!(default_service_name(&named("checkout")).is_none());
-        // Nothing detected at all is still nobody naming it.
-        assert!(default_service_name(&Resource::builder_empty().build()).is_some());
+    fn explicit_service_names_are_not_confused_with_sdk_defaults() {
+        for name in ["unknown_service", "unknown_service:checkout"] {
+            crate::env_guard::with_vars(
+                [
+                    ("OTEL_SERVICE_NAME", Some(name)),
+                    ("OTEL_RESOURCE_ATTRIBUTES", Some("service.name=inventory")),
+                ],
+                || {
+                    assert_eq!(
+                        resource().get(&Key::from_static_str(resource::SERVICE_NAME)),
+                        Some(Value::from(name)),
+                    );
+                },
+            );
+            let attributes = format!("service.name={name}");
+            crate::env_guard::with_vars(
+                [
+                    ("OTEL_SERVICE_NAME", Some("")),
+                    ("OTEL_RESOURCE_ATTRIBUTES", Some(attributes.as_str())),
+                ],
+                || {
+                    assert_eq!(
+                        resource().get(&Key::from_static_str(resource::SERVICE_NAME)),
+                        Some(Value::from(name)),
+                    );
+                },
+            );
+        }
     }
 
     /// The detector chain this rests on, end to end: `OTEL_SERVICE_NAME` has to
