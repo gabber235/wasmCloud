@@ -52,6 +52,8 @@ The Wasmtime scheduler executes guest code outside the future awaiting its resul
 
 Typewriter still imports native NATS `0.1.0`. Rebuild and exercise those actual components against the new host to verify compatible interface linking. The retired private messaging ABI remains unsupported.
 
+Rebuild async guests with `wit-bindgen` 0.59 or newer. Earlier bindings cancel their task wakeup stream while it still belongs to a waitable set, which traps under Wasmtime 48. The [upstream binding fix](https://github.com/bytecodealliance/wit-bindgen/pull/1638) removes the stream before cancellation. Typewriter and the SurrealDB SDK use `wit-bindgen` 0.62 with `wasip3` 0.9. Updating the host alone does not repair already compiled guests.
+
 Publish host and component images before changing their GitOps references. Local infrastructure uses its own Git mirror; publishing the Infrastructure default branch can deploy to production and is a separate operation.
 
 ## Fork binaries
