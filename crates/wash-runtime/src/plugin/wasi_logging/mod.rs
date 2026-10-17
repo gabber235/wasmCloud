@@ -232,6 +232,8 @@ impl HostPlugin for TracingLogger {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
 
     fn info(workload_id: &str) -> ComponentInfo {
@@ -261,13 +263,6 @@ mod tests {
         let components = logger.components.read().await;
         assert_eq!(components.keys().collect::<Vec<_>>(), ["b-1"]);
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::{Arc, Mutex};
-
-    use super::{Level, LogRecord, TracingLogger};
 
     #[test]
     fn sink_receives_original_record_without_a_subscriber() {

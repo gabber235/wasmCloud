@@ -923,37 +923,50 @@ mod tests {
 
     #[tokio::test]
     async fn default_plugin_uses_otlp_only_when_traces_are_enabled() {
-        crate::env_guard::with_vars(
-            [
-                ("OTEL_SDK_DISABLED", None::<&str>),
-                ("OTEL_TRACES_EXPORTER", None),
-                ("OTEL_EXPORTER_OTLP_ENDPOINT", None),
-                ("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", None),
-            ],
-            || {
-                let plugin = WasiOtel::default();
-                let resource = opentelemetry_sdk::Resource::builder_empty().build();
-                assert_eq!(plugin.config.service_name, WASI_OTEL_ID);
-                assert!(plugin.create_span_processor(&resource).unwrap().is_none());
-                crate::env_guard::with_vars(
-                    [
-                        (
-                            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-                            Some("http://localhost:4317"),
-                        ),
-                        ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", Some("grpc")),
-                    ],
-                    || {
-                        plugin
-                            .create_span_processor(&resource)
-                            .unwrap()
-                            .unwrap()
-                            .shutdown()
-                            .unwrap();
-                    },
-                );
-            },
-        );
+        const MODE: &str = "WASH_OTEL_PROCESSOR_TEST_MODE";
+        if let Ok(mode) = std::env::var(MODE) {
+            let plugin = WasiOtel::default();
+            let resource = opentelemetry_sdk::Resource::builder_empty().build();
+            assert_eq!(plugin.config.service_name, WASI_OTEL_ID);
+            let processor = plugin.create_span_processor(&resource).unwrap();
+            assert_eq!(processor.is_some(), mode == "enabled");
+            if let Some(processor) = processor {
+                processor.shutdown().unwrap();
+            }
+            return;
+        }
+
+        // Exporter configuration is cached for the process lifetime.
+        // Each case needs a fresh process with its environment set before startup.
+        for mode in ["disabled", "enabled"] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "plugin::wasi_otel::tests::default_plugin_uses_otlp_only_when_traces_are_enabled",
+                    "--nocapture",
+                ])
+                .env(MODE, mode)
+                .env_remove("OTEL_SDK_DISABLED")
+                .env_remove("OTEL_TRACES_EXPORTER")
+                .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .env_remove("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT");
+            if mode == "enabled" {
+                command
+                    .env(
+                        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                        "http://localhost:4317",
+                    )
+                    .env("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "grpc");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{mode} processor case failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
     }
 
     #[test]
