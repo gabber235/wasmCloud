@@ -82,6 +82,37 @@ Host wasmcloud-bench
 - Host key fingerprints are pinned in `~/.ssh/known_hosts` after install.
   When re-staging, refresh them; `installimage` regenerates host keys.
 
+### 2.1 Work that outlives the SSH session
+
+When an SSH session closes, systemd-logind kills every process the session
+started, root's included. `provision.yml --tags logind` sets this with the
+drop-in `/etc/systemd/logind.conf.d/50-bench.conf` (`KillUserProcesses=yes`,
+and an empty `KillExcludeUsers=` because the default exempts root). The same
+tag sets `ClientAliveInterval 30` / `ClientAliveCountMax 4` in
+`/etc/ssh/sshd_config.d/50-bench-keepalive.conf`, so a connection that drops
+without closing (laptop sleep, network loss) ends its session within about two
+minutes instead of the ~2 h TCP keepalive takes.
+
+Without it, a dropped connection leaves its work running. A root `bash -s`
+polling `docker ps` once ran for 43 hours this way. It barely registered in
+the load average, but it kept the socket-activated Docker daemon up, so the
+pre-flight refused every criterion and gungraun bench (§10, pre-flight
+assertions).
+
+The trade-off: `nohup`, `&`, `disown`, `tmux` and `screen` no longer keep work
+alive after you disconnect. Run work meant to outlive the session as its own
+transient unit:
+
+```sh
+systemd-run --unit=<name> --working-directory=/opt/wasmcloud \
+  bash -c '. /root/.cargo/env && cargo bench -p wash-runtime --bench http_invoke'
+journalctl -u <name> -f        # its output
+systemctl stop <name>          # stop it early
+```
+
+Stop the unit when you're done with it; the pre-flight doesn't look at
+`systemd-run` units, only at login sessions.
+
 ## 3. OS install (Hetzner rescue → Ubuntu)
 
 Hetzner ships every dedicated server with a Rescue System (PXE-booted
@@ -293,6 +324,7 @@ cd scripts/bench/ansible
 ansible-playbook provision.yml                  # everything
 ansible-playbook provision.yml --tags toolchain # apt + rustup + gungraun only
 ansible-playbook provision.yml --tags kernel    # just GRUB drop-in
+ansible-playbook provision.yml --tags logind    # kill a closed SSH session's work (§2.1)
 ansible-playbook provision.yml --check          # dry-run; no changes
 ```
 
@@ -316,6 +348,13 @@ The playbook installs (as `root` on the bench host):
   copy (e.g. a Dependabot bump), `run-bench.sh` installs the matching
   runner under `~/.cache/wasmcloud-bench/` and sets `GUNGRAUN_RUNNER`,
   so the bench keeps working until the next Ansible run.
+- **`wasm-component-ld`** in `/usr/local/bin`, pinned by `provision.yml`.
+  `run-bench.sh` selects this binary with
+  `CARGO_TARGET_WASM32_WASIP2_LINKER` and logs its version before building.
+  This also covers existing runners whose Cargo config predates the linker
+  setup. An explicit `CARGO_TARGET_WASM32_WASIP2_LINKER` is preserved. To
+  install or repair the shared binary, run
+  `ansible-playbook provision.yml --tags wasm-component-ld`.
 - **Node.js (current LTS)** from NodeSource's apt repo. The CI
   workflow runs `.github/scripts/*.mjs` via `run: node …`, which
   needs an OS-level `node` on `PATH` (self-hosted runners do not
@@ -349,7 +388,8 @@ cat /etc/wasmcloud-bench-stage     # post-install marker
 ## 6. Self-hosted GitHub Actions runner
 
 The CI pipeline runs on a self-hosted runner registered to
-`wasmCloud/wasmCloud` with the labels `self-hosted, bench, hetzner`.
+`wasmCloud/wasmCloud` with the labels `self-hosted, bench, hetzner`
+(short-lived hosts use another label; see §6.2).
 
 Setup is a one-shot. The 1-hour expiry only governs the window between
 "obtain a registration token" and "`config.sh` consumes it". Once
@@ -383,7 +423,7 @@ with a fresh token). It:
 - Installs **rustup as the `bench` user** so `cargo` is available in
   the workflow's PATH. The actual toolchain is auto-installed on
   first build via `rust-toolchain.toml`.
-- Downloads `actions-runner-linux-x64-2.337.0.tar.gz`, **verifies the
+- Downloads `actions-runner-linux-<x64|arm64>-2.337.0.tar.gz`, **verifies the
   SHA256** (constant in the script — bump version + sha together
   when upgrading), extracts to `/opt/actions-runner`.
 - Registers the runner with labels `self-hosted, bench, hetzner` and
@@ -402,7 +442,7 @@ with a fresh token). It:
 
 **Runner upgrade procedure:**
 
-1. Bump `RUNNER_VERSION` and `RUNNER_SHA256` in
+1. Bump `RUNNER_VERSION`, `RUNNER_SHA256_X64` and `RUNNER_SHA256_ARM64` in
    [`install-runner.sh`](./install-runner.sh) (SHA256 from the runner
    release page).
 2. On the host, stop the service, run `./config.sh remove --token …`
@@ -438,42 +478,161 @@ The token is single-use and short-lived (~1 hour). It flows: gh API →
 local shell variable → SSH env → `config.sh` on the host. It never
 touches the repo, a CI log, or `/proc/<pid>/cmdline` (env-only).
 
+### 6.2 Short-lived bench hosts
+
+A bench host other than the dedicated one is brought up for a run and torn
+down after it. Each one gets a **host label**, its runner label: lowercase
+words joined by `-`, such as `aws-c7i-metal`
+([`bench-host.mjs`](../../.github/scripts/bench-host.mjs)). To add one:
+
+1. Provision it like the dedicated host (§4, §5): `nosmt`, one isolated CPU,
+   the `performance` governor, and `provision.yml`.
+2. Register its runner with the label and, when they differ from the dedicated
+   host's 6 and 5, its online CPU count and isolated CPU:
+
+   ```sh
+   sudo WASMCLOUD_BENCH_RUNNER_TOKEN=<TOKEN> bash scripts/bench/install-runner.sh \
+     --label aws-c7i-metal --nproc 8 --isolated-cpu 7
+   ```
+
+   `--nproc` and `--isolated-cpu` go into the runner's `.env` as
+   `WASMCLOUD_BENCH_EXPECTED_NPROC` and `WASMCLOUD_BENCH_ISOLATED_CPU`.
+3. Set the repo variable the script prints,
+   `WASMCLOUD_BENCH_<LABEL>_HOSTNAME` (`-` becomes `_`), to the host's
+   hostname.
+4. Dispatch `bench`, `k6bench` or `bench-compare` with `host: <label>`.
+   Release runs always use `hetzner`.
+
+Every row records its `host_label`, and `history.json` keeps each label's
+rows apart (§11). Every host's rows are published; arewefastyet charts one
+host at a time (`?host=<label>`), with `hetzner` as the default.
+
+To tear one down, deregister its runner (`./config.sh remove`) before
+deleting the host. The repo variable can stay for the next time.
+
+**EC2 and arm64 hosts.** A cloud VM differs from the dedicated host in a few
+ways the scripts handle with flags rather than edits:
+
+- **No cpufreq driver.** EC2 VMs (Graviton included) expose no
+  `cpufreq/` in sysfs; the hypervisor sets the clock. Register the runner with
+  `--no-cpufreq` so the pre-flight skips the governor check. It still fails if
+  a driver appears later.
+- **No SMT on Graviton.** `nosmt` is a no-op, so `--nproc` is the vCPU count.
+  Isolate the last CPU (`-e isolated_cpu=<n-1>` for `provision.yml`,
+  `--isolated-cpu <n-1>` for `install-runner.sh`).
+- **arm64.** `install-runner.sh` picks the runner tarball for `uname -m`.
+  `provision.yml` skips the k6bench binaries off x86_64 (they're pinned to
+  amd64); run it with `--skip-tags k6bench`.
+- **Login.** EC2 images log in as `ubuntu` with sudo, not `root`. Point
+  Ansible at the host with a local inventory that sets `ansible_user: ubuntu`
+  and `ansible_become: true`, plus a `ProxyJump` in `~/.ssh/config` when the
+  host is reachable only through a jump box.
+
+For a 64-vCPU c9g.16xlarge, for example:
+
+```sh
+WASMCLOUD_BENCH_HOSTNAME=<hostname> ansible-playbook -i <inventory> provision.yml \
+  --skip-tags k6bench -e isolated_cpu=63 -e vm_max_map_count=16777216
+sudo WASMCLOUD_BENCH_RUNNER_TOKEN=<TOKEN> bash scripts/bench/install-runner.sh \
+  --label aws-c9g-16xlarge --nproc 64 --isolated-cpu 63 --no-cpufreq
+```
+
+The c9g also carries `-e vm_max_map_count=16777216` for the `million_warm`
+preset (`bench.yml`), whose 1.6M-memory pool needs about 10M mappings;
+`provision.yml` leaves `vm.max_map_count` alone unless it is given.
+
+### 6.3 Sharing a box with other runners
+
+A box can run another repository's bench runner beside this one. The
+aws-c9g-16xlarge box also runs Cosmonic Control's agent density bench, as
+the `cbench` user. Every measuring step takes `/var/lock/bench-box.lock`
+through
+[`.github/scripts/bench-box-lock.sh`](../../.github/scripts/bench-box-lock.sh),
+and Control's run script takes the same lock, so two benches never share the
+machine. The pre-flight host checks run inside the same lock, since another
+bench's load would fail their load check. A job waits for the lock rather
+than failing, but the wait counts toward the job's `timeout-minutes`. Since
+`/var/lock` is a tmpfs, the script makes the file again after a reboot.
+The workflows run the script from their own commit's tools checkout, like
+the pre-flight, so a benched ref from before the lock existed still takes
+it.
+
 ## 7. Pipeline architecture
 
 ```text
-┌──────────────────────┐               ┌────────────────────────────────────┐
-│  GitHub Actions      │               │   <WASMCLOUD_BENCH_HOSTNAME>       │
-│  workflow_dispatch ──┼──────────────▶│   self-hosted runner (user: bench) │
-│  inputs: bench, ref  │               │   labels: self-hosted,bench,hetzner│
-└──────────────────────┘               │                                    │
-        ▲                              │   1. checkout + preflight checks   │
-        │ artifact + step              │   2. cargo bench                   │
-        │ summary                      │   3. summarize → step summary      │
-        │                              │   4. upload criterion artifact     │
-        ▼                              │   5. push S3 + invalidate CF       │
-┌──────────────────────────────┐       └────────────────────────────────────┘
-│ S3 (private)                 │                                  │
-│   runs/<date>/<sha>/<run>/…  │◀─────────────────────────────────┘
-│   history.json               │ ◄── public via CloudFront ───────────────┐
-└──────────────────────────────┘                                          │
-                                                                          ▼
-                                             ┌──────────────────────────────────┐
-                                             │  arewefastyet                    │
-                                             │ (separate repo, GitHub Pages)    │
-                                             │ fetches history.json             │
-                                             └──────────────────────────────────┘
+workflow_dispatch / release
+           │
+           ▼
+self-hosted bench runner
+  checkout + preflight → run → summary → data artifact
+           │
+           ▼
+GitHub-hosted publisher
+  download artifact → AWS OIDC → S3 upload + history merge → CloudFront invalidation
+                                │
+                                ▼
+                    arewefastyet reads history.json
 ```
 
-**Workflow:** [`.github/workflows/bench.yml`](../../.github/workflows/bench.yml)
+**Workflows:** [`bench.yml`](../../.github/workflows/bench.yml) dispatches
+each matrix entry through [`bench-run.yml`](../../.github/workflows/bench-run.yml).
 
-- Trigger: `workflow_dispatch` only. Inputs: `bench` (choice of
-  `http_invoke` / `wasmtime_baseline` / `wasmtime_serve`) and `ref`
-  (any branch/tag/sha; defaults to the workflow's ref).
-- `runs-on: [self-hosted, bench, hetzner]`
-- `concurrency: bench-host`, `cancel-in-progress: false` — queues
-  rather than cancelling, so an in-flight bench is never interrupted.
-- `permissions:` minimal; the bench job adds `contents: read` and
-  `id-token: write` (OIDC for AWS).
+- Trigger: `workflow_dispatch` and published releases. Inputs:
+  - `bench`: a bench or named variant from the workflow's choices.
+  - `ref`: any branch/tag/sha or `#PR`; defaults to the workflow's ref.
+  - `args`: extra `bench-tools memory-pressure` flags for `memory_pressure`,
+    or a preset that `BENCH_VARIANTS` names for `scale_density` (`max-scale`).
+    Other benches refuse a non-empty value.
+- Published releases run `http_invoke`, `service_http`, `gungraun`, and
+  `max_scale`. These run after publication, not as a pre-release gate.
+- Variants: a `bench` choice may name an entry in `BENCH_VARIANTS` (in
+  `bench.yml`) instead of a bench. It runs that entry's `bench` with either
+  its `args`, the name of a preset the bench defines and versions with its
+  code, or its `env`, variables the bench reads from its environment.
+  Dispatching the bench with a variant's preset as `args` runs that variant.
+  Variants can run manually or in the release subset. Their results remain
+  in the workflow summary and artifact, and stay out of the public benchmark
+  history unless the entry names a `publish_group`. A density variant with
+  one publishes under that group instead of `density`
+  (`bench-tools jsonl --group`, or `WASMCLOUD_BENCH_GROUP`), so its rows form
+  their own series, each flavour with a per-step `ramp` row; the publisher
+  refuses a row in any other group and keeps the run's files under
+  `<bench>/<group>/` in S3. An entry with a `publish_host` publishes only from
+  that host, and an entry never publishes from a ref whose `bench-tools`
+  predates `jsonl --group`; the matrix job warns and runs it unpublished.
+  - `million_warm`: an `env` preset, published as `density-max` from
+    `aws-c9g-16xlarge` only, the record run the density page on arewefastyet
+    draws.
+  - `max_scale`: `scale_density -- max-scale`, which sets
+    `WASH_SCALE_MEMORY_RESERVATION=256MiB`, `WASH_SCALE_MEMORY_GUARD=64KiB`,
+    `WASH_SCALE_GUEST_MEMORY_MODE=growth` and `WASH_SCALE_MEMORY_LIMIT=2GiB`
+    (`crates/wash-runtime/benches/scale_density.rs`). Run it locally with
+    `cargo bench -p wash-runtime --bench scale_density -- max-scale`, or
+    `scripts/bench/run-bench.sh scale_density max-scale`.
+    It produces only `warm-growth-layout256MiB+64KiB` and
+    `scale-to-zero-growth-layout256MiB+64KiB`, with no default-layout runs.
+    The terminal readout and workflow summary show `max-process-memory`
+    for each run; the summary heading also includes that limit in GiB.
+    The reduced layout moves an isolation boundary (`THREAT_MODEL.md`), so
+    it runs only when named and is never part of the default sweep.
+  - `max_scale` results are published as group `density-max-scale`:
+    - Its rows form their own series, apart from the default sweep's
+      `density` rows and `million_warm`'s `density-max`.
+    - It cannot run under a different configuration. The preset refuses
+      its own variables when they are also set in the environment, so every
+      row under its labels measured the same layout, mode and 2 GiB limit.
+      Its variant sets no `env`.
+    - An older ref fails instead of running something else. A bench that
+      predates a preset rejects its name as a flavour filter it cannot
+      match, and `bench-run.yml` refuses to run a ref whose `run-bench.sh`
+      would drop the argument: it asks `run-bench.sh --takes-args <bench>`,
+      which an older script fails.
+- The single `[self-hosted, bench, hetzner]` runner serializes measurements
+  (a dispatch's `host` input picks another; §6.2).
+  Each entry measures the commit resolved before queuing and publishes as soon
+  as its own measurement completes.
+- The bench job has `contents: read`. Only the GitHub-hosted publisher has
+  `id-token: write` for AWS OIDC.
 - `CARGO_TARGET_DIR=/var/lib/bench/target` so the cache survives
   `actions/checkout`'s clean.
 - `persist-credentials: false` on checkout — the runner runs untrusted
@@ -484,7 +643,7 @@ touches the repo, a CI log, or `/proc/<pid>/cmdline` (env-only).
 
 1. **Pre-flight** ([`bench-preflight.mjs`](../../.github/scripts/bench-preflight.mjs)) — see §10.
 2. **Run bench** ([`run-bench.sh`](./run-bench.sh)) — sources cargo,
-   runs `cargo bench -p wash-runtime --bench <name>`,
+   runs `cargo bench -p wash-runtime --bench <name> -- <args>`,
    tees output to a per-run log under `$CARGO_TARGET_DIR`.
 3. **Summary** (`cargo run -p bench-tools -- summary --bench <name>`) —
    emits a markdown table to `$GITHUB_STEP_SUMMARY` with one row per
@@ -495,24 +654,65 @@ touches the repo, a CI log, or `/proc/<pid>/cmdline` (env-only).
    instruction-count table from the gungraun output instead.
 4. **Upload artifact** — the criterion and/or gungraun output dirs as
    `bench-<bench>-<run-id>` with 90-day retention.
-5. **Configure AWS** — `aws-actions/configure-aws-credentials@v6.1.1`
-   assumes the `WASMCLOUD_BENCH_AWS_ROLE_ARN` role via OIDC.
-6. **Push S3 + invalidate CloudFront**
-   ([`bench-push-results.mjs`](../../.github/scripts/bench-push-results.mjs)) —
-   uploads per-run artifacts under `runs/…`, then read-modify-writes
-   `s3://<bucket>/history.json` (the public aggregate), then issues
-   `cloudfront create-invalidation /history.json`.
+5. **Prepare publish artifact** —
+   [`bench-push-results.mjs`](../../.github/scripts/bench-push-results.mjs)
+   archives the data and generates JSONL and metadata without AWS credentials.
+   The host log is removed after the required uploads. Failed runs keep their
+   output in the job log.
+6. **Publish from a GitHub-hosted job** — downloads that data artifact, assumes
+   `WASMCLOUD_BENCH_AWS_ROLE_ARN` through OIDC, uploads under `runs/…`,
+   merges `history.json`, and invalidates CloudFront. The publisher checks
+   every row against the resolved commit, ref, bench, run ID, and attempt.
 
 **Triggers:** `workflow_dispatch` plus `release: published` (the latter
-auto-populates the releases timeline; see §9.3). Both require repo
-write to fire, which keeps untrusted fork code off the self-hosted
-bench host. The `release` matrix is intentionally narrower than the
-dispatch choice list — see §9.3.
+auto-populates the releases timeline; see §9.3). GitHub requires repo write
+access for manual dispatch, but that includes non-maintainers with write
+access. The `release` matrix is intentionally narrower than the dispatch
+choice list — see §9.3.
+
+**Sibling pipeline:** [`k6bench.yml`](../../.github/workflows/k6bench.yml)
+runs the system-level k6 load tests in [`../k6bench/`](../k6bench/README.md)
+on this same runner, with the same triggers, and publishes to the same bucket
+and `history.json` through a separate GitHub-hosted job. It has no workflow
+concurrency group; the single bench runner serializes measurements. Publishers
+use conditional S3 writes so overlapping bench and k6 runs cannot lose rows.
+
+**GPU pipeline:** [`gpubench.yml`](../../.github/workflows/gpubench.yml) runs
+the benched ref's `scripts/gpubench/run.sh` on other self-hosted boxes,
+`[self-hosted, gpubench, <kind>-<class>]` (e.g. `cuda-l4`), never on this host,
+and publishes through the same GitHub-hosted publisher with the box label as
+the rows' `host_label`. Smoke runs are never published. A pull-request ref is
+published only with `publish_pr`, and its rows keep the `pull/N` ref, so they
+stay out of the GPU view's `main` history. The workflow, matrix and publisher
+always come from the dispatch ref, so a PR can be benched and published from
+`main` without its own copy of them.
 
 **Why no `pull_request_target` trigger:** see §9.4. Self-hosted runners
 on a public repo are a foot-gun if exposed to fork PRs (a fork can
 ship a malicious workflow file or build script to your bench host).
 Comparison runs use `workflow_dispatch` only.
+
+### Restrict bench dispatch to maintainers
+
+Apply a repository Actions policy for `bench.yml`, `bench-run.yml`,
+`bench-compare.yml`, `k6bench.yml`, `k6bench-run.yml`, `gpubench.yml`, and
+`gpubench-run.yml` that allows the `@wasmCloud/ci-maintainers` and
+`@wasmCloud/org-maintainers` teams to trigger them. It also allows
+`@automation-wasmcloud`, which publishes releases and triggers the automatic
+release benchmarks. The policy lives in GitHub settings, not in a workflow
+file, so a dispatch from another ref cannot edit it away.
+
+A repository admin with an authenticated `gh` CLI and `jq` applies or updates
+the policy with:
+
+```sh
+./scripts/bench/restrict-dispatch.sh
+```
+
+The script prints the stored policy. Check that `enforcement` is `active`, the
+seven workflow paths are included, and the allowed actors match the two teams
+and release account. Changes to those GitHub teams then take effect without
+editing workflow YAML.
 
 ## 8. AWS bootstrap (S3 + CloudFront + IAM)
 
@@ -566,7 +766,7 @@ GitHub → **Actions** → **bench** → **Run workflow**:
 
 | Input   | Description                                                                                | Default          |
 | ------- | ------------------------------------------------------------------------------------------ | ---------------- |
-| `bench` | which bench to run (`http_invoke`, `service_http`, `gungraun`, `wasmtime_baseline`, `wasmtime_serve`, `gungraun_plugin`) | `http_invoke`    |
+| `bench` | which bench to run (`http_invoke`, `service_http`, `gungraun`, `wasmtime_baseline`, `wasmtime_serve`, `ids`, `gungraun_plugin`) | `http_invoke`    |
 | `ref`   | git ref to bench (branch, tag, sha, or a pull request as `#123` / `pull/123` / `pr/123` — the same spellings bench-compare accepts) | the workflow ref |
 
 A pull-request ref produces a step summary and an uploaded artifact but is
@@ -585,10 +785,11 @@ against its baseline rather than read its absolute numbers, use **bench-compare*
 | `gungraun`          | gungraun      | CPU instruction count (cachegrind) | deterministic regression detection; not subject to shared-runner timing noise. `gungraun` is the renamed/refreshed `iai-callgrind` (rename landed upstream at 0.17.0) |
 | `wasmtime_baseline` | criterion     | wall-clock                         | wasmtime-only baseline for context                                                                                                                             |
 | `wasmtime_serve`    | criterion     | wall-clock                         | wasmtime serve subcommand baseline                                                                                                                             |
+| `ids`               | criterion     | wall-clock (ns / IDs/s)            | runtime UUID minting (`wash_runtime::ids::now_v7`): a tight loop at 1, 2, 4 and all-cores threads, and one ID per millisecond tick, the rate most host threads mint at |
 | `gungraun_plugin`   | gungraun      | CPU instruction count (cachegrind) | host component plugin: the cross-store capability hop, and the plugin's `on-workload-bind` contribution separated from component instantiation. Both are far below what a wall-clock harness can resolve, which is why this is an instruction-count bench rather than a criterion one. Needs `--features host-component-plugins` (added by `run-bench.sh`) plus valgrind — no Apple Silicon support, so it runs on the bench host only |
 
-Anyone with repo-write can dispatch. The job queues on the
-`bench-host` concurrency group, so two dispatched runs serialize.
+The repository Actions policy restricts dispatch to the maintainer teams and
+release account. The single runner serializes dispatched measurements.
 
 ### 9.2 Via SSH (manual / debugging)
 
@@ -601,6 +802,11 @@ ssh -i ~/.ssh/hetzner_bench root@<WASMCLOUD_BENCH_HOST_IP> \
    cargo xtask build-fixtures && \
    cargo bench -p wash-runtime --bench http_invoke'
 ```
+
+This runs inside the SSH session, so the host's logind drop-in kills it if
+the connection drops (§2.1). For a run longer than you'll stay connected,
+including `compare-bench.sh` on the host, start it with `systemd-run` as
+§2.1 shows.
 
 Manual runs do **not** touch S3 or arewefastyet — only the GitHub
 pipeline writes there. The `/opt/wasmcloud` checkout is cloned by the
@@ -647,7 +853,7 @@ workflow; supply:
 
 - `gungraun`: **1×** per ref. Instruction counts via valgrind are
   deterministic, so repeats don't reduce noise.
-- Criterion benches (`http_invoke`, `wasmtime_*`): **3× interleaved**
+- Criterion benches (`http_invoke`, `wasmtime_*`, `ids`): **3× interleaved**
   (a₁ b₁ a₂ b₂ a₃ b₃); the median of the three is what the delta is
   computed from. ~30 min per bench.
 
@@ -672,6 +878,180 @@ particular runner. The bench job has no AWS permissions and no
 `pull-requests: write` permission, so a malicious comparison ref
 cannot exfiltrate the WRITE role or comment on PRs.
 
+### 9.5 Guest memory pressure test
+
+The `memory_pressure` bench compares `enforce` and `growth`
+under real Linux cgroup v2 limits,
+with copy-on-write (CoW) both enabled and disabled.
+It is a pass/fail diagnostic, not a trend benchmark:
+
+- Most admission counts follow from the budgets alone.
+  Per store, `enforce` charges all declared bytes to `G`.
+  `growth` leaves `min(declared, 2 MiB)` per memory uncharged against `I`
+  and charges the rest to `G`, so the bound is the smaller of the two quotients:
+  `I / 2 MiB` for a sparse 2 MiB memory, but `G / 6 MiB` for an 8 MiB one.
+- The bench records that bound with every case;
+  summaries show `admitted / budget`.
+  It checks that the reservations match the stores it admitted,
+  not that admission reached the bound.
+- What only a container shows is where the process guard,
+  CoW, and transparent huge pages (THP) stop admission earlier,
+  whether late writes OOM the container,
+  and the cgroup's peak memory.
+
+On the Linux bench host:
+
+```bash
+CARGO_TARGET_DIR=target scripts/bench/run-bench.sh memory_pressure \
+  --memory-mib 384 768 --repeats 3
+```
+
+For a local Docker run, including on macOS, invoke the same Rust runner directly:
+
+```bash
+cargo run -p bench-tools -- memory-pressure --memory-mib 384 768 --repeats 3
+```
+
+#### What runs
+
+- `bench-tools memory-pressure` builds the locked bench
+  in the repository's pinned Rust toolchain image (an 8 GiB build container),
+  then runs each case sequentially in a fresh container.
+- Each measured container has two CPUs, the requested memory limit (384–2048 MiB),
+  no swap, and no network. The bench runs as PID 1; the runner and build stay outside its cgroup.
+- The runner passes the whole case to the bench as JSON in `WASH_PRESSURE_CASE`.
+- Repeats run outermost, so host drift spreads across every case.
+- Build caches use the named volumes `wash-pressure-target` and `wash-pressure-registry`
+  (`--target-volume`, `--registry-volume`).
+  Do not rebuild into the same target volume while a pressure run is using its binary.
+
+The engine uses the runtime's budget defaults
+(`G = 75%` of the limit, `I = 4 × G`, the process guard at 90%)
+unless `--guest-memory-mib` or `--initial-cap-mib` overrides them.
+Pool settings are not production defaults:
+a 64 MiB heap ceiling per memory and 8192 memories, so `4 × G` of 1 MiB memories fits the pool.
+Each slot still reserves wasmtime's default address space plus guard.
+The bench refuses a case whose budgets would admit more memories than the pool holds.
+Fuel is off, and the build uses `--no-default-features`.
+
+Admission runs without pauses, as a burst of real starts would.
+The process guard refreshes its own reading at most every 50 ms,
+so a guard-limited count includes whatever was admitted between readings.
+Up to four threads then write together, and every store stays alive
+until the `touched` sample.
+
+| Shape | Initial memory | Initial data | Admission writes | Final writes |
+| --- | --- | --- | --- | --- |
+| `sparse` | One 1 MiB memory | 4 KiB | First 64 KiB | Same 64 KiB |
+| `data-heavy` | One 8 MiB memory | 8 MiB | First 64 KiB | Same 64 KiB |
+| `multiple` | Four 1 MiB memories in separate core modules | 4 KiB each | First 64 KiB of each | Same 64 KiB of each |
+| `dirty` | One 1 MiB memory | 4 KiB | First 64 KiB | Every initial page |
+
+`--dirty-mib 2` selects 2 MiB for the last shape.
+Results at 2 MiB depend on the kernel's THP policy:
+
+- With CoW off, each memory is anonymous.
+  Under THP `always`, a 2 MiB-aligned 2 MiB memory faults in a whole huge page
+  on its first write, so the guard stops admission early.
+- With CoW on, each memory maps the image, which `shmem_enabled` governs instead.
+- A 1 MiB memory cannot hold a huge page, so it stays sparse until the final writes.
+
+The bench records both THP settings with every case.
+Compare runs only across hosts with the same policy.
+
+Other selectors:
+
+- `--modes enforce growth` and `--cow on off` select subsets.
+- `--initial-cap-mib` applies only to `growth`.
+
+To focus on late writes, then compare a smaller initial allowance:
+
+```bash
+cargo run -p bench-tools -- memory-pressure \
+  --shapes dirty --memory-mib 384 768 --dirty-mib 2 --repeats 3
+
+cargo run -p bench-tools -- memory-pressure \
+  --shapes dirty --memory-mib 768 --guest-memory-mib 256 \
+  --initial-cap-mib 288 --repeats 3
+```
+
+See the runtime's [sizing guidance](../../crates/wash-runtime/README.md#sizing-guest-memory-in-containers)
+for the budget calculation and its physical-memory assumptions.
+
+#### Results
+
+- `<target>/pressure/memory_pressure.json` holds a list of `bench_tools::pressure::Report`.
+  `--target-dir` selects the target directory; it otherwise follows `CARGO_TARGET_DIR`, then `target/`.
+- A timestamped directory beside it holds the build log,
+  revision and working-tree patch, image ID, and per-case logs, reports, and Docker state.
+- Each report records samples at `baseline`, `ready`, `touched`, and `released`:
+  stores, guest reservations, process footprint, cgroup current and peak memory, and refusal counters.
+  It also records the kernel, architecture, THP policies, CPUs, and actual limits.
+- The bench checks the guest accounting before it writes each later sample:
+  - At `ready`, the reservations must equal the retained memories and stay within their budgets.
+  - At `touched`, they must not have changed during writes.
+  - At `released`, both counters must be back at zero.
+- A peak from an OOM case is unknown unless captured before the kill,
+  so OOM cases report no peak.
+
+#### Outcomes
+
+A case passes as either of these:
+
+- **Completed**: all four samples, exit 0, and evidence that admission stopped
+  on memory pressure (a refusal or the guard over its limit).
+- **Expected late-write OOM**: a `growth` `dirty` case that Docker reports as OOM-killed
+  with exit 137, after the `ready` sample and before `touched`.
+  This is the overcommit risk the test demonstrates.
+  The writes must also be unable to fit:
+  cgroup usage at `ready`, plus the declared bytes that admission had not already written,
+  exceeds the limit.
+  That counts host overhead without accepting an OOM a small initial cap should prevent.
+
+Anything else fails the run:
+
+- exit 137 without Docker's OOM flag
+- an OOM before admission completed, in `enforce`, or in a non-`dirty` shape
+- a late-write OOM whose writes should have fit
+- a timeout, or a failed accounting check
+- a `dirty` case that completed although its full writes exceed the limit
+
+A failed case's report carries the last lines of the bench's stderr,
+including the runtime's own guard and budget warnings.
+A runner error, such as a stalled Docker command, fails that case and the run continues;
+only SIGINT or SIGTERM stops the remaining cases.
+A guard or eager allocation can bound admission early enough that `growth` survives,
+so OOM is not required on every kernel.
+This test demonstrates overcommit behavior;
+it does not certify application sizing or make an expected OOM acceptable in production.
+
+#### Cancellation and CI
+
+- Docker control commands time out after 30 seconds (`--docker-timeout`).
+- SIGINT and SIGTERM interrupt builds, measurements, and control commands.
+- Cleanup is registered by name before container creation and runs even after cancellation.
+  Removal waits at most five seconds, or `--docker-timeout` if shorter;
+  a failed removal prints the container name for manual cleanup.
+- The `bench` workflow lists `memory_pressure` in `DIAGNOSTIC_BENCHES`:
+  dispatch-only, never in the release subset, and never published.
+  It renders the summary and uploads the evidence even when cases fail.
+  Its cleanup stops Docker so the next bench's pre-flight sees the usual idle host.
+- The workflow's `args` input passes runner flags through, for example
+  `gh workflow run bench.yml -f bench=memory_pressure -f args='--memory-mib 384 2048 --repeats 3'`.
+
+The standard reporting commands read pressure results:
+
+```bash
+cargo run -p bench-tools -- summary --bench memory_pressure --target-dir target
+cargo run -p bench-tools -- jsonl --bench memory_pressure --target-dir target
+```
+
+Classifier and schema tests run without containers:
+
+```bash
+cargo test -p bench-tools
+```
+
 ## 10. Pre-flight assertions
 
 [`bench-preflight.mjs`](../../.github/scripts/bench-preflight.mjs) runs first in every CI bench job.
@@ -679,18 +1059,22 @@ It refuses to proceed if the host has drifted from the baseline,
 because measurements on a drifted host are useless and shouldn't end
 up on the dashboard.
 
-The script requires the env var `WASMCLOUD_BENCH_HOSTNAME` (the expected hostname
-of the dedicated bench host). The workflow sources it from the repo
-variable `vars.WASMCLOUD_BENCH_HOSTNAME`; local runs export it from 1Password.
-Keeping the value out of the script avoids broadcasting the box's
-identity in the public repo.
+The workflows run it from their own commit (`github.workflow_sha`), not the
+benched ref, so an old tag gets today's checks.
+
+The expected hostname comes from the repo variable for the host label in
+`WASMCLOUD_BENCH_HOST_LABEL` (default `hetzner`): `WASMCLOUD_BENCH_HOSTNAME`
+for the dedicated host, `WASMCLOUD_BENCH_<LABEL>_HOSTNAME` for others (§6.2).
+The workflow passes the repo variables in as `WASMCLOUD_BENCH_REPO_VARS`;
+local runs export the variable itself from 1Password. Keeping the value out
+of the script avoids broadcasting the box's identity in the public repo.
 
 Hard-checked invariants:
 
 | Check                                | Expected                                               |
 | ------------------------------------ | ------------------------------------------------------ |
-| `hostname`                           | `${WASMCLOUD_BENCH_HOSTNAME}` (env-injected)           |
-| `nproc`                              | `6`  *(SMT off via `nosmt`)*                           |
+| `hostname`                           | the host label's hostname variable                     |
+| `nproc`                              | `6` *(nosmt, or `${WASMCLOUD_BENCH_EXPECTED_NPROC}`)*  |
 | `scaling_governor` on every CPU      | `performance`                                          |
 | `/sys/devices/system/cpu/isolated`   | `5` *(or `${WASMCLOUD_BENCH_ISOLATED_CPU}`; see §4.2)* |
 | `/proc/mdstat` resync                | not in progress                                        |
@@ -698,6 +1082,8 @@ Hard-checked invariants:
 | `$CARGO_TARGET_DIR`                  | exists, writable                                       |
 | Free space on the target dir's mount | ≥ 5 GiB                                                |
 | `cargo` binary                       | `$HOME/.cargo/bin/cargo` exists                        |
+| Closed login sessions                | no processes left in one *(names each PID; §2.1)*      |
+| Docker daemon                        | stopped, except for k6bench and `memory_pressure`      |
 
 If any check fails, the job aborts with a `::error::` annotation
 explaining which invariant is violated. Fix the host (or fix the
@@ -724,15 +1110,15 @@ not reachable):
 ```text
 s3://<bucket>/history.json
   - JSON array of every (group, param, metric) row from every run.
-  - Deduped by (sha, bench, group, param, run_attempt, metric), sorted by timestamp.
+  - Deduped by (sha, bench, group, param, run_attempt, metric, host_label), sorted
+    by timestamp. A row without host_label is a hetzner row.
   - Cache-Control: max-age=60.
   - CloudFront invalidation issued after each push.
   - Capped to last 365 days by HISTORY_MAX_AGE_DAYS.
 ```
 
-`bench-push-results.mjs` does the read-modify-write on `history.json`
-after each run. This is safe without locking because the workflow is
-`concurrency: bench-host` — there's only ever one writer.
+`bench-push-results.mjs` retries the `history.json` merge with S3
+conditional writes if another publisher updates it first.
 
 **Row schema.** Every row carries `metric` (the measurement name) and
 `value` (the measurement). Criterion rows additionally carry the
@@ -751,6 +1137,7 @@ Criterion row (`metric: "mean_ns"`):
   "run_id": "...", "run_attempt": "1",
   "timestamp": "2026-05-08T17:21:20Z",
   "host": "<WASMCLOUD_BENCH_HOSTNAME>",
+  "host_label": "hetzner",
   "kernel": "6.8.0-100-generic",
   "cpus_online": 6,
   "metric": "mean_ns",
@@ -775,10 +1162,67 @@ gungraun row (`metric: "Ir"`):
   "run_id": "...", "run_attempt": "1",
   "timestamp": "2026-05-08T17:21:20Z",
   "host": "<WASMCLOUD_BENCH_HOSTNAME>",
+  "host_label": "hetzner",
   "kernel": "6.8.0-100-generic",
   "cpus_online": 6,
   "metric": "Ir",
   "value": 12345678
+}
+```
+
+Density row (`scale_density`, from `<target>/density/<bench>.json`): no
+`throughput`; like k6 rows, each carries its own `unit` and which way is
+`better`. Metrics are `served_workloads`, `binding_limit`,
+`marginal_bytes_per_workload`, `baseline_footprint_bytes`, `starts_per_sec`,
+`start_p99_ms`, `request_p99_ms`, `spin_down_ms` and `cpu_ms_per_start`, each
+present only when measured:
+
+```json
+{
+  "bench": "scale_density",
+  "group": "density",
+  "param": "warm",
+  "sha": "...", "ref": "main", "...": "...",
+  "metric": "served_workloads",
+  "value": 3250,
+  "unit": "workloads",
+  "better": "higher"
+}
+```
+
+Under a preset's group (`--group`, such as `density-max`), each flavour's
+metric rows are followed by one `ramp` row, when the run took steps: the steps
+thinned to at most 80, evenly spread and always keeping the last clean one, as
+one column per figure. A rate or latency that was not measured is `null`.
+`value` is how many steps the run took before thinning. It has no `better`, so
+it is not a trend; the trends and compare pages leave it out, and the density
+page draws it. The default `density` series has no ramp rows.
+
+```json
+{
+  "bench": "scale_density",
+  "group": "density-max",
+  "param": "warm-growth-layout64MiB+64KiB",
+  "sha": "...", "ref": "main", "...": "...",
+  "metric": "ramp",
+  "value": 142,
+  "unit": "steps",
+  "flavour": "warm",
+  "stop": "max-process-memory (7705 growths refused)",
+  "guest_memory_mode": "growth",
+  "memory_limit_bytes": 107374182400,
+  "baseline_footprint_bytes": 810094592,
+  "marginal_bytes_per_workload": 84440,
+  "peak_starts_per_sec": 45529.0,
+  "steps": {
+    "workloads": [10000, 30000, "..."],
+    "footprint_bytes": [1760358400, 3458715648, "..."],
+    "starts_per_sec": [27759.0, 32442.0, "..."],
+    "requests_per_sec": [152520.0, 158741.0, "..."],
+    "request_p50_ms": [0.612, 0.513, "..."],
+    "request_p99_ms": [1.132, 1.037, "..."],
+    "clean": [true, true, "..."]
+  }
 }
 ```
 
@@ -855,6 +1299,34 @@ Resync runs after every fresh install (~30 min on these disks). Wait
 it out before benching — the I/O contention will skew numbers. The
 preflight script already refuses to run during a resync.
 
+### Pre-flight: processes left by a closed login session
+
+The message names each session, PID and command line, and the command that
+stops each session. Stop by session rather than by PID, since PIDs can be
+reused by the time you act, and `kill` can't clear a zombie:
+
+```sh
+sudo loginctl terminate-session <id>                 # session still "closing"
+sudo systemctl kill --signal=KILL session-<id>.scope # session logind no longer knows
+```
+
+Then re-dispatch. The check re-scans for about 15 s before failing, so a
+session logind is already stopping doesn't fail the job. If the host lets
+such work survive at all, its logind drop-in is missing: apply
+`ansible-playbook provision.yml --tags logind` (§2.1).
+
+If the check fails with `can't check login sessions`, `loginctl` itself
+failed (missing, or D-Bus/logind down). Fix logind
+(`systemctl status systemd-logind`) before re-dispatching.
+
+### Pre-flight: `docker daemon is running`
+
+Docker is socket-activated, so anything still polling the socket starts it
+again after `sudo systemctl stop docker.service`. The usual one is work from
+a dropped SSH session, which the closed-login-session check names. If that
+check passed, look for a client outside a login session (`systemd-cgls`,
+`systemctl list-units --type=service --state=running`).
+
 ### `bench-push-results.mjs` fails with `AccessDenied`
 
 The most common cause is the WRITE role policy missing one of the
@@ -866,7 +1338,7 @@ it's idempotent and will reconcile the inline policy.
 
 Two-minute lag is normal (`Cache-Control: max-age=60` + browser
 cache). For longer staleness:
-1. Verify the bench job's `push to s3 + invalidate CloudFront` step
+1. Verify the publisher job's `push results to s3 + invalidate CloudFront` step
    logged the invalidation ID.
 2. Check the distribution: `aws cloudfront list-invalidations --distribution-id <id>`.
 3. As a last resort, force-refresh: `aws s3 cp s3://<bucket>/history.json /dev/null`
@@ -883,16 +1355,20 @@ cache). For longer staleness:
 | [`stage-hetzner.sh`](./stage-hetzner.sh)                                                                       | Phase 1 from your laptop: rescue → installed OS                                                                                                                                                                           |
 | [`ansible/`](./ansible/)                                                                                       | Phase 2 from your laptop: deps + Rust + valgrind + gungraun-runner + repo + kernel cmdline + perf governor. Idempotent; re-run to apply drift or as the "patch a live box without re-staging" path (`--tags kernel`) |
 | [`install-runner.sh`](./install-runner.sh)                                                                     | Phase 3 on the host: registers the GH Actions runner under the `bench` user and wires it to the shared bench tools in `/usr/local` (installed by `provision.yml`). Kept as bash because runner registration takes a one-shot token whose lifecycle is awkward to model declaratively.             |
-| [`../../.github/scripts/bench-preflight.mjs`](../../.github/scripts/bench-preflight.mjs)                       | CI step: refuses to bench on a drifted host (env: `WASMCLOUD_BENCH_HOSTNAME`). GHA-only — runs via `node` from the workflow.                                                                                              |
+| [`../../.github/scripts/bench-preflight.mjs`](../../.github/scripts/bench-preflight.mjs)                       | CI step: refuses to bench on a drifted host (env: `WASMCLOUD_BENCH_HOST_LABEL` + its hostname variable). GHA-only — runs via `node` from the workflow.                                                                                              |
 | [`run-bench.sh`](./run-bench.sh)                                                                               | CI step + local: invokes `cargo bench`, writes a run log. Stays bash because compare-bench.sh invokes it on the host for local operator runs.                                                                             |
-| [`../../.github/scripts/bench-push-results.mjs`](../../.github/scripts/bench-push-results.mjs)                 | CI step: per-run upload + history.json aggregate + CloudFront invalidate; archives `target/criterion/` and/or `target/gungraun/`. GHA-only.                                                                                    |
+| [`../../.github/scripts/bench-sessions.mjs`](../../.github/scripts/bench-sessions.mjs)                         | Pre-flight helper: finds processes left in a closed login session (§2.1).                                                                                                                                                                        |
+| [`../../.github/scripts/bench-push-results.mjs`](../../.github/scripts/bench-push-results.mjs)                 | Prepares the data artifact on the bench host, then publishes it to S3 from a hosted job.                                                                                    |
 | [`compare-bench.sh`](./compare-bench.sh)                                                                       | Pair-bench script: runs one bench against two refs (interleaved for criterion, 1× for gungraun) and snapshots per-iteration data                                                                                               |
 | [`../../crates/bench-tools/`](../../crates/bench-tools/)                                                       | Rust binary that parses criterion + gungraun output and renders the JSONL trend rows, the step-summary markdown, and comparison deltas — see "Data processing" below                                                     |
 | [`build-history.sh`](./build-history.sh)                                                                       | Maintenance: rebuild `history.json` from scratch by scanning all per-run JSONL in S3                                                                                                                                      |
 | [`aws/setup-aws.sh`](./aws/setup-aws.sh)                                                                       | One-shot: bucket + OAC + CloudFront + WRITE role                                                                                                                                                                          |
 | [`../../.github/workflows/bench.yml`](../../.github/workflows/bench.yml)                                       | Trends pipeline (workflow_dispatch + release auto-trigger)                                                                                                                                                                |
+| [`../../.github/workflows/bench-run.yml`](../../.github/workflows/bench-run.yml)                               | One bench measurement and its separate GitHub-hosted publisher                                                                                                                                                             |
 | [`../../.github/workflows/bench-compare.yml`](../../.github/workflows/bench-compare.yml)                       | Comparison pipeline (workflow_dispatch only — see §9.4 for the rationale against a PR-label trigger)                                                                                                                      |
 | [`../../.github/workflows/bench-host-checks.yml`](../../.github/workflows/bench-host-checks.yml)               | Monthly upstream-version checks (no bench-host involvement; opens / updates / auto-closes a tracking issue per check — see §15)                                                                                           |
+| [`../k6bench/`](../k6bench/README.md) + [`../../.github/workflows/k6bench.yml`](../../.github/workflows/k6bench.yml) | System-level k6 load tests on a kind cluster, same host and S3/history.json pipeline (`bench: "k6"`); own README |
+| [`../../.github/workflows/k6bench-run.yml`](../../.github/workflows/k6bench-run.yml)                           | One k6 measurement and its separate GitHub-hosted publisher                                                                                                                                                                |
 | [`../../.github/scripts/bench-check-runner-version.mjs`](../../.github/scripts/bench-check-runner-version.mjs) | Compares `RUNNER_VERSION` in `install-runner.sh` to the latest actions/runner release; runs from bench-host-checks.yml                                                                                                    |
 
 Sensitive values (the bench host's IP, IPv6, and hostname) are kept in
@@ -940,9 +1416,10 @@ into layers, each with its own cadence.
 | Rust toolchain                         | rolls with `rust-toolchain.toml` (monthly stable) | repo file                                                                                          | No bench-host-specific pin.                                                                                                                                                                                            |
 | `gungraun` crate + runner              | when the bench fails to start, or yearly          | `crates/wash-runtime/Cargo.toml`, resolved in `Cargo.lock`                                          | Bump the dep in `Cargo.toml` and `cargo update -p gungraun`; `provision.yml` installs the matching `gungraun-runner` (derived from the **resolved** `Cargo.lock` version — a caret req resolves up to the latest patch) to the shared `/usr/local`; until it is re-run, `run-bench.sh` installs a per-version copy itself. gungraun enforces crate-vs-runner equality at run time.                       |
 | Node.js                                | quarterly (with the kernel bump)                  | `provision.yml` (`node_lts_major`)                                                                 | Bump to the current active LTS line. Built-ins-only scripts; Node version changes are usually low-risk.                                                                                                                |
-| GitHub Actions runner agent            | monthly check, bump on changelog review           | `install-runner.sh` (`RUNNER_VERSION` + `RUNNER_SHA256`)                                           | Auto-tracked via [`bench-host-checks.yml`](../../.github/workflows/bench-host-checks.yml); see below.                                                                                                                  |
+| GitHub Actions runner agent            | monthly check, bump on changelog review           | `install-runner.sh` (`RUNNER_VERSION` + `RUNNER_SHA256_*`)                                           | Auto-tracked via [`bench-host-checks.yml`](../../.github/workflows/bench-host-checks.yml); see below.                                                                                                                  |
 | Action SHA pins (`actions/checkout@…`) | weekly via Dependabot                             | `.github/workflows/*.yml`                                                                          | Low risk — these execute on hosted runners, not the bench host.                                                                                                                                                        |
 | AWS CLI v2                             | yearly                                            | `install-runner.sh` (curl from official zip)                                                       | Unpinned; we just pull whatever's current at install time.                                                                                                                                                             |
+| Docker, kind, kubectl, helm, k6 (k6bench) | quarterly (with the kernel bump) | `provision.yml` (`k6bench_tools` / `k6bench_archives`, URL + sha256) | kubectl tracks the kind node image pinned in `scripts/k6bench/kind-config.yaml`; bump both together. Docker is Ubuntu's `docker.io` plus `docker-buildx`, socket-activated. |
 
 ### Monthly: the actions/runner version check
 
@@ -958,8 +1435,8 @@ issue auto-closes once `RUNNER_VERSION` catches up to upstream.
 
 To accept a bump:
 
-1. Note the SHA-256 from the release page's assets — `actions-runner-linux-x64-<version>.tar.gz`.
-2. Bump `RUNNER_VERSION` and `RUNNER_SHA256` in `install-runner.sh` together.
+1. Note the SHA-256s from the release page's assets — `actions-runner-linux-x64-<version>.tar.gz` and `actions-runner-linux-arm64-<version>.tar.gz`.
+2. Bump `RUNNER_VERSION`, `RUNNER_SHA256_X64` and `RUNNER_SHA256_ARM64` in `install-runner.sh` together.
 3. On the bench host: stop the service, deregister with a fresh removal token, `rm -rf /opt/actions-runner`, re-run `install-runner.sh`. See §6 for the full re-registration flow.
 
 ### Quarterly: bench-host maintenance window
@@ -984,9 +1461,6 @@ dashboard shows one annotated step instead of N small ones:
 Deliberately not built; document the "why not yet" so the next person
 doesn't reinvent or reattempt without context.
 
-- **Auto-trigger on `release: published`** — would let new tags
-  populate the `releases` view automatically. Easy add when we want
-  it; out for v1 because we're still tuning what to bench per release.
 - **Comment-driven dispatch** (e.g. `@rust-timer queue` style) —
   needs a fine-grained PAT or GH App. Worth doing once we want PR
   authors to dispatch their own benches.
@@ -995,8 +1469,7 @@ doesn't reinvent or reattempt without context.
   storage cost ever shows up on the bill (currently ≪ $0.01/mo).
 - **Multi-host fan-out** — bench numbers across architectures
   (aarch64, Apple silicon) or multiple x86_64 baselines. Requires
-  rethinking the `concurrency: bench-host` group and the per-row
-  schema.
+  new runner labels and a host dimension in the per-row schema.
 - **Auto-regression alerting** — Slack/issue post when a bench
   regresses by N % with non-overlapping CI vs. baseline. The data
   is in S3 already; the consumer is missing.

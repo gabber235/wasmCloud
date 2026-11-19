@@ -120,6 +120,7 @@ pub const KNOWN_PLUGIN_IDS: &[&str] = &[
 ];
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod roster_tests {
     /// Every native plugin's id, from the constant the plugin itself uses. A
     /// plugin added without its roster entry gets a refusal instead of a
@@ -190,8 +191,17 @@ mod roster_tests {
 /// decides whether a workload may write over it.
 pub mod bindings;
 pub use bindings::{
-    BindingSchema, KeyOwnership, PluginBindingSet, PluginBindings, WorkloadConfigPolicy, binding_of,
+    BindingSchema, KeyOwnership, PluginBindingSet, PluginBindings, PluginSecretRef,
+    WorkloadConfigPolicy, binding_of,
 };
+
+/// Plugin-backed `secrets:` entries, resolved through another plugin at bind.
+mod secret_source;
+pub use secret_source::{
+    BindingName, CatalogName, HostSecretSource, PluginId, RequestingWorkload, SecretConsumer,
+    SecretKey, SecretRequest, SecretSourceError, SecretValue, WorkloadGrant, WorkloadSelector,
+};
+pub(crate) use secret_source::{resolve_plugin_secrets, validate_plugin_config_sources};
 
 /// Shared `(implements ..)` multiplexing core
 #[cfg(feature = "wasm_component_model_implements")]
@@ -398,6 +408,44 @@ pub trait HostPlugin: std::any::Any + Send + Sync + 'static {
         true
     }
 
+    /// The host-linked WASI interfaces this plugin redefines, wholly or in
+    /// part, on the linker of every item it binds. Default: none.
+    ///
+    /// Only interfaces from the seven host-linked packages are supported:
+    /// `wasi:io`, `wasi:filesystem`, `wasi:clocks`, `wasi:random`, `wasi:cli`,
+    /// `wasi:sockets`, and `wasi:http`, at compatible host-linked versions.
+    /// Plugin-served `wasi:*` packages (such as `wasi:otel`, `wasi:blobstore`,
+    /// `wasi:keyvalue`, `wasi:config`, and `wasi:logging`) are out of scope:
+    /// replace them with another plugin serving the interface through plugin
+    /// precedence, not linker shadowing. Unsupported declarations are rejected
+    /// at registration and again before a workload binds.
+    ///
+    /// The host links these packages into every component itself, so a plugin that
+    /// changes what components see through it — a filesystem view, an
+    /// environment, a clock — cannot be matched by what it serves: nothing
+    /// imports these WASI interfaces *from a plugin*. Declaring the interfaces it
+    /// overrides lets the host do three things it otherwise could not:
+    ///
+    /// - bind the plugin to every item of an opted-in workload that imports
+    ///   one of them (the workload opts in through a `hostInterfaces` entry
+    ///   naming an interface the plugin serves, as for any plugin);
+    /// - refuse two plugins that override the same interface, loudly and
+    ///   before anything runs, since nothing composes their definitions;
+    /// - allow name shadowing on the item's linker only while this plugin's
+    ///   [`HostPlugin::on_workload_item_bind`] runs, and bind such plugins
+    ///   after the others, so a redefinition is deliberate and final.
+    ///
+    /// Name whole interfaces (`0.2.0` and `0.3.0` stand for compatible
+    /// revisions). In the item bind, use
+    /// [`WorkloadMetadata::wasi_override_instance`] to reopen the host's exact
+    /// linker instance before redefining functions. Raw `Linker::instance`
+    /// names are exact: a different compatible revision creates a separate,
+    /// incomplete instance. Through the helper, the plugin may redefine only
+    /// some functions of an interface; the rest stay the host's.
+    fn wasi_overrides(&self) -> WitWorld {
+        WitWorld::default()
+    }
+
     /// The config keys this plugin considers the host operator's rather than a
     /// workload's — where a binding connects, as whom, and what it may reach.
     ///
@@ -432,12 +480,17 @@ pub trait HostPlugin: std::any::Any + Send + Sync + 'static {
 
     /// Check the operator's declaration for this plugin at host startup.
     ///
-    /// Called once by [`crate::host::HostBuilder::build`] with whatever
+    /// Called by [`crate::host::HostBuilder::build`] with whatever
     /// `host.plugins` declared for this id. A plugin parses each of
     /// [`PluginBindingSet::host_layers`] with its own reader here, so a
     /// declaration it cannot use fails the host rather than the first workload
     /// that needs it — and so an operator cannot write a value the manifest
     /// parser would have rejected.
+    ///
+    /// A key a plugin secret supplies has no value at startup: `host_layers`
+    /// lists it as pending beside its layer, and the reader must count it as
+    /// set without reading it. Each bind that fills such keys calls this again
+    /// with the values in place.
     ///
     /// The default accepts everything, which is what a plugin with no
     /// [`HostPlugin::binding_schema`] wants.
@@ -517,6 +570,18 @@ pub trait HostPlugin: std::any::Any + Send + Sync + 'static {
     /// component plugin evicting a workload whose lifecycle bind crash-loops).
     fn set_workload_failure_sink(&self, _sink: WorkloadFailureSink) {}
 
+    /// What resolves the plugin-backed `secrets:` entries naming this plugin:
+    /// its `wasmcloud:host/secret-source` export, for a component plugin. The
+    /// default serves none.
+    /// Whether this plugin can consume resolved plugin secrets.
+    fn takes_plugin_secrets(&self) -> bool {
+        true
+    }
+
+    fn secret_source(&self) -> Option<Arc<dyn HostSecretSource>> {
+        None
+    }
+
     /// Called when the plugin is started during host initialization.
     ///
     /// This method allows plugins to perform any necessary setup before
@@ -592,6 +657,9 @@ pub trait HostPlugin: std::any::Any + Send + Sync + 'static {
     /// the ingress the service will serve calls on. See
     /// [`crate::engine::dispatch`].
     ///
+    /// The workload's linkers are sealed; mutable access returns an error.
+    /// Bind in [`Self::on_workload_item_bind`] instead.
+    ///
     /// # Arguments
     /// * `workload` - The fully resolved workload
     /// * `component_id` - The ID of the specific component within the workload
@@ -657,6 +725,57 @@ pub trait HostPlugin: std::any::Any + Send + Sync + 'static {
     }
 }
 
+/// Refuses overrides ([`HostPlugin::wasi_overrides`]) of interfaces the host
+/// does not link itself, or two plugins overriding the same WASI interface.
+///
+/// Two redefinitions of one interface cannot both take effect: whichever
+/// bound last would silently win. Until the host can compose such plugins,
+/// the conflict is an error, raised when plugins are registered and again
+/// before a workload binds, so it is never discovered by a guest.
+pub fn check_wasi_overrides(
+    plugins: &HashMap<&'static str, Arc<dyn HostPlugin>>,
+) -> anyhow::Result<()> {
+    let mut declared: Vec<(&'static str, WitInterface)> = Vec::new();
+    let mut ids: Vec<&&'static str> = plugins.keys().collect();
+    ids.sort();
+    for id in ids {
+        let Some(plugin) = plugins.get(id) else {
+            continue;
+        };
+        for interface in plugin.wasi_overrides().imports {
+            anyhow::ensure!(
+                interface.is_host_builtin(),
+                "plugin '{id}' declares WASI override '{interface}', which is not a \
+                 host-linked WASI interface at a supported version; plugin-served \
+                 interfaces must be replaced by another plugin serving them through \
+                 plugin precedence, not wasi_overrides()"
+            );
+            if let Some((other, theirs)) = declared
+                .iter()
+                .find(|(other, theirs)| *other != *id && overrides_overlap(theirs, &interface))
+            {
+                anyhow::bail!(
+                    "plugins '{other}' and '{id}' both override the WASI interface \
+                     {theirs} / {interface}; a host cannot serve two definitions of one \
+                     interface, so register only one of them"
+                );
+            }
+            declared.push((id, interface));
+        }
+    }
+    Ok(())
+}
+
+/// Whether two override declarations name a common interface: the same
+/// package at compatible versions, and a shared interface name (an entry
+/// naming no interface stands for the whole package).
+fn overrides_overlap(a: &WitInterface, b: &WitInterface) -> bool {
+    a.same_package(b)
+        && (a.interfaces.is_empty()
+            || b.interfaces.is_empty()
+            || a.interfaces.iter().any(|i| b.interfaces.contains(i)))
+}
+
 /// A tracker for workloads and their components, allowing storage of associated
 /// data.
 /// The tracker maintains a mapping of workload IDs to their data and
@@ -701,6 +820,18 @@ impl<T, Y> WorkloadTracker<T, Y> {
                 self.components.remove(component_id);
             }
         }
+    }
+
+    /// Remove a workload and hand back what was tracked for it, for a caller
+    /// that cleans up after releasing the lock it holds the tracker under:
+    /// cleanup run under a plugin-wide write lock stalls every other bind and
+    /// unbind on the plugin for as long as it takes.
+    pub fn take_workload(&mut self, workload_id: &str) -> Option<WorkloadTrackerItem<T, Y>> {
+        let item = self.workloads.remove(workload_id)?;
+        for component_id in item.components.keys() {
+            self.components.remove(component_id);
+        }
+        Some(item)
     }
 
     pub async fn remove_workload_with_cleanup<
@@ -785,21 +916,23 @@ pub(crate) fn lock_root(root: impl AsRef<Path>, untrusted: &str) -> Result<PathB
 /// The multiplexed plugin set a host registers to serve `(implements ..)`
 /// named imports.
 ///
-/// Every single-backend plugin leaves [`HostPlugin::supports_named_instances`]
-/// at its default of `false`, so a workload declaring two entries of one
-/// namespace:package under distinct names fails to bind unless a multiplexed
-/// plugin is registered alongside. That makes this list load-bearing rather
-/// than optional, and it was previously written out by hand in every embedder:
-/// `wash host`, `wash dev`, and downstream hosts each kept their own copy.
-/// The copies drift — a downstream host lost `(implements ..)` support
-/// entirely for three weeks after a refactor rebuilt its registration list and
-/// omitted the block, with nothing at compile time to notice. One list here
-/// means adding a multiplexed plugin reaches every embedder at once.
+/// Register these alongside single-backend plugins to resolve named imports.
+/// NATS discovery stays enabled unless an egress policy restricts it. Use
+/// [`multiplexed_plugins_ignoring_discovered_nats_servers`] to disable it.
 ///
 /// Postgres is deliberately absent: whether it registers at all, and whether
 /// as `multiplex_only`, depends on the host's own configuration.
 #[cfg(feature = "wasm_component_model_implements")]
 pub fn multiplexed_plugins() -> Vec<std::sync::Arc<dyn HostPlugin>> {
+    multiplexed_plugins_ignoring_discovered_nats_servers(false)
+}
+
+/// Register multiplexed plugins with a shared NATS discovery policy.
+/// Egress policies always restrict NATS connections to their configured URLs.
+#[cfg(feature = "wasm_component_model_implements")]
+pub fn multiplexed_plugins_ignoring_discovered_nats_servers(
+    ignore_discovered_servers: bool,
+) -> Vec<std::sync::Arc<dyn HostPlugin>> {
     #[allow(unused_mut)]
     let mut plugins: Vec<std::sync::Arc<dyn HostPlugin>> = Vec::new();
     #[allow(unused_imports)]
@@ -807,47 +940,61 @@ pub fn multiplexed_plugins() -> Vec<std::sync::Arc<dyn HostPlugin>> {
 
     #[cfg(feature = "wasi-keyvalue")]
     {
+        let nats = Arc::new(
+            wasi_keyvalue::NatsProvider::default()
+                .with_ignore_discovered_servers(ignore_discovered_servers),
+        );
         plugins.push(Arc::new(
             wasi_keyvalue::MultiplexedKeyValue::new()
                 .with_provider(Arc::new(wasi_keyvalue::InMemoryProvider))
                 .with_provider(Arc::new(wasi_keyvalue::RedisProvider))
-                .with_provider(Arc::new(wasi_keyvalue::NatsProvider))
+                .with_provider(nats.clone())
                 .with_provider(Arc::new(wasi_keyvalue::FilesystemProvider)),
         ));
         plugins.push(Arc::new(
             wasi_keyvalue::MultiplexedAsyncKeyValue::new()
                 .with_provider(Arc::new(wasi_keyvalue::InMemoryProvider))
                 .with_provider(Arc::new(wasi_keyvalue::RedisProvider))
-                .with_provider(Arc::new(wasi_keyvalue::NatsProvider))
+                .with_provider(nats)
                 .with_provider(Arc::new(wasi_keyvalue::FilesystemProvider)),
         ));
     }
 
     #[cfg(feature = "wasi-blobstore")]
     {
+        let nats = Arc::new(
+            wasi_blobstore::NatsBlobProvider::default()
+                .with_ignore_discovered_servers(ignore_discovered_servers),
+        );
         plugins.push(Arc::new(
             wasi_blobstore::MultiplexedBlobstore::new()
                 .with_provider(Arc::new(wasi_blobstore::InMemoryProvider))
                 .with_provider(Arc::new(wasi_blobstore::FilesystemProvider))
-                .with_provider(Arc::new(wasi_blobstore::NatsBlobProvider)),
+                .with_provider(nats.clone())
+                .with_provider(Arc::new(wasi_blobstore::S3BlobProvider)),
         ));
         plugins.push(Arc::new(
             wasi_blobstore::MultiplexedAsyncBlobstore::new()
                 .with_provider(Arc::new(wasi_blobstore::InMemoryProvider))
                 .with_provider(Arc::new(wasi_blobstore::FilesystemProvider))
-                .with_provider(Arc::new(wasi_blobstore::NatsBlobProvider)),
+                .with_provider(nats)
+                .with_provider(Arc::new(wasi_blobstore::S3BlobProvider)),
         ));
     }
 
+    let nats = Arc::new(
+        wasmcloud_messaging::NatsMsgProvider::default()
+            .with_ignore_discovered_servers(ignore_discovered_servers),
+    );
     plugins.push(Arc::new(
         wasmcloud_messaging::MultiplexedMessaging::new()
             .with_provider(Arc::new(wasmcloud_messaging::InMemoryMsgProvider))
-            .with_provider(Arc::new(wasmcloud_messaging::NatsMsgProvider)),
+            .with_provider(nats.clone()),
     ));
     plugins.push(Arc::new(
         wasmcloud_messaging::MultiplexedAsyncMessaging::new()
             .with_provider(Arc::new(wasmcloud_messaging::InMemoryMsgProvider))
-            .with_provider(Arc::new(wasmcloud_messaging::NatsMsgProvider)),
+            .with_provider(nats),
     ));
 
     plugins

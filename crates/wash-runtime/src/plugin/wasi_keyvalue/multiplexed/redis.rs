@@ -1,11 +1,12 @@
 //! Redis-backed [`KvBackend`] for the multiplexed keyvalue plugin.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use redis::AsyncCommands;
+use anyhow::Context as _;
 
+use crate::plugin::PluginEgressPolicy;
 use crate::plugin::multiplex::BackendProvider;
+use crate::plugin::wasi_keyvalue::redis::{Connection, ConnectionSettings};
 
 use super::{KeyResponse, KvBackend, KvId, LIST_KEYS_BATCH_SIZE, StoreError};
 
@@ -17,10 +18,11 @@ use super::{KeyResponse, KvBackend, KvId, LIST_KEYS_BATCH_SIZE, StoreError};
 /// label selects the redis URL (and DB, via the url) — or an optional,
 /// operator-set [`prefix`](Self::prefix). The `open(identifier)` bucket name does
 /// NOT namespace keys, so a guest can open an externally-created keyspace simply
-/// by pointing its label at the right redis. Holds a shared multiplexed
-/// connection (pooled per url+prefix by the provider).
+/// by pointing its label at the right redis. Holds a shared, self-healing
+/// connection (pooled per url, prefix and connection settings by the provider):
+/// see `wasi_keyvalue::redis::Connection`.
 pub struct RedisBackend {
-    conn: redis::aio::MultiplexedConnection,
+    conn: Connection,
     /// Optional operator-configured key prefix, default none.
     /// Lets a deployment namespace within a shared DB or match an external key
     /// convention. It is operator-set, not guest-controlled, so a guest cannot
@@ -63,27 +65,29 @@ impl KvBackend for RedisBackend {
     }
 
     async fn get(&self, _bucket: &str, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
-        let mut conn = self.conn.clone();
-        conn.get::<_, Option<Vec<u8>>>(self.key(key))
+        self.conn
+            .query_read(redis::cmd("GET").arg(self.key(key)))
             .await
             .map_err(Self::err)
     }
 
     async fn set(&self, _bucket: &str, key: &str, value: Vec<u8>) -> Result<(), StoreError> {
-        let mut conn = self.conn.clone();
-        conn.set::<_, _, ()>(self.key(key), value)
+        self.conn
+            .query(redis::cmd("SET").arg(self.key(key)).arg(value))
             .await
             .map_err(Self::err)
     }
 
     async fn delete(&self, _bucket: &str, key: &str) -> Result<(), StoreError> {
-        let mut conn = self.conn.clone();
-        conn.del::<_, ()>(self.key(key)).await.map_err(Self::err)
+        self.conn
+            .query(redis::cmd("DEL").arg(self.key(key)))
+            .await
+            .map_err(Self::err)
     }
 
     async fn exists(&self, _bucket: &str, key: &str) -> Result<bool, StoreError> {
-        let mut conn = self.conn.clone();
-        conn.exists::<_, bool>(self.key(key))
+        self.conn
+            .query_read(redis::cmd("EXISTS").arg(self.key(key)))
             .await
             .map_err(Self::err)
     }
@@ -93,20 +97,18 @@ impl KvBackend for RedisBackend {
         _bucket: &str,
         cursor: Option<u64>,
     ) -> Result<KeyResponse, StoreError> {
-        let mut conn = self.conn.clone();
         // SCAN the connection's keyspace under the (escaped) operator prefix.
         // With no prefix the pattern is `*`. The whole DB follows
         // flat-keyspace semantics; the guest's `list-keys` prefix is applied
         // host-side, so it never reaches this pattern.
         let prefix = self.prefix.as_deref().unwrap_or("");
         let pattern = format!("{}*", Self::glob_escape(prefix));
-        let (next, raw): (u64, Vec<Vec<u8>>) = redis::cmd("SCAN")
-            .arg(cursor.unwrap_or(0))
-            .arg("MATCH")
-            .arg(&pattern)
-            .arg("COUNT")
-            .arg(LIST_KEYS_BATCH_SIZE)
-            .query_async(&mut conn)
+        // The cursor the guest sees carries the redis cursor and the
+        // generation of the connection that issued it, and is refused after
+        // a reconnect (see `Connection::scan_page`).
+        let (next, raw): (u64, Vec<Vec<u8>>) = self
+            .conn
+            .scan_page::<Vec<u8>>(cursor.unwrap_or(0), &pattern, LIST_KEYS_BATCH_SIZE)
             .await
             .map_err(Self::err)?;
         let strip = prefix.as_bytes();
@@ -125,9 +127,13 @@ impl KvBackend for RedisBackend {
 
     async fn increment(&self, _bucket: &str, key: &str, delta: i64) -> Result<i64, StoreError> {
         // INCRBY is a native, signed, atomic increment (negative delta
-        // decrements); it errors on overflow, which we propagate.
-        let mut conn = self.conn.clone();
-        conn.incr(self.key(key), delta).await.map_err(Self::err)
+        // decrements); it errors on overflow, which we propagate. It is sent
+        // once: if the connection drops under it, it may already have run, so
+        // a retry could add twice. The error surfaces instead.
+        self.conn
+            .query(redis::cmd("INCRBY").arg(self.key(key)).arg(delta))
+            .await
+            .map_err(Self::err)
     }
 
     async fn get_many(
@@ -138,14 +144,13 @@ impl KvBackend for RedisBackend {
         if keys.is_empty() {
             return Ok(vec![]);
         }
-        let mut conn = self.conn.clone();
         let redis_keys: Vec<String> = keys.iter().map(|k| self.key(k)).collect();
         // Explicit MGET: the `mget` helper downgrades to `GET` for a single key,
         // and an absent single key then returns `nil`, which decodes to an
         // *empty* vec. MGET always returns one slot per key (nil → `None`).
-        let values: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
-            .arg(redis_keys.as_slice())
-            .query_async(&mut conn)
+        let values: Vec<Option<Vec<u8>>> = self
+            .conn
+            .query_read(redis::cmd("MGET").arg(redis_keys.as_slice()))
             .await
             .map_err(Self::err)?;
         Ok(keys
@@ -163,12 +168,12 @@ impl KvBackend for RedisBackend {
         if key_values.is_empty() {
             return Ok(());
         }
-        let mut conn = self.conn.clone();
         let pairs: Vec<(String, Vec<u8>)> = key_values
             .into_iter()
             .map(|(k, v)| (self.key(&k), v))
             .collect();
-        conn.mset::<_, _, ()>(pairs.as_slice())
+        self.conn
+            .query(redis::cmd("MSET").arg(pairs.as_slice()))
             .await
             .map_err(Self::err)
     }
@@ -177,9 +182,9 @@ impl KvBackend for RedisBackend {
         if keys.is_empty() {
             return Ok(());
         }
-        let mut conn = self.conn.clone();
         let redis_keys: Vec<String> = keys.iter().map(|k| self.key(k)).collect();
-        conn.del::<_, ()>(redis_keys.as_slice())
+        self.conn
+            .query(redis::cmd("DEL").arg(redis_keys.as_slice()))
             .await
             .map_err(Self::err)
     }
@@ -190,9 +195,11 @@ impl KvBackend for RedisBackend {
         key: &str,
         value: Vec<u8>,
     ) -> Result<bool, StoreError> {
-        // SETNX is an atomic insert-if-absent.
-        let mut conn = self.conn.clone();
-        conn.set_nx::<_, _, bool>(self.key(key), value)
+        // SETNX is an atomic insert-if-absent. Sent once, like INCRBY: if the
+        // first attempt ran before the connection dropped, a retry would
+        // report the key as already present.
+        self.conn
+            .query(redis::cmd("SETNX").arg(self.key(key)).arg(value))
             .await
             .map_err(Self::err)
     }
@@ -201,29 +208,259 @@ impl KvBackend for RedisBackend {
 /// Provider for [`RedisBackend`], selected by `config.backend = "redis"`.
 /// Requires `config.url` (e.g. `redis://127.0.0.1:6379`); optional `config.prefix`
 /// namespaces keys within the connection's keyspace (default none → flat).
+/// The optional `backend-reconnect-num-retries`, `backend-reconnect-max-delay-ms`,
+/// `backend-connection-timeout-ms` and `backend-response-timeout-ms` tune the
+/// connection (see `ConnectionSettings`). All of these are operator-owned.
 #[derive(Default)]
 pub struct RedisProvider;
 
 #[async_trait::async_trait]
 impl BackendProvider<KvId> for RedisProvider {
-    fn pool_key(&self, config: &HashMap<String, String>) -> Option<String> {
+    fn pool_key(&self, config: &crate::wit::Config) -> Option<String> {
         // Pool by url AND prefix: two interfaces with the same url but different
         // prefixes are different logical stores and must not share an instance.
-        let url = config.get("url")?;
-        let prefix = config.get("prefix").map(String::as_str).unwrap_or("");
-        Some(format!("{url}\u{0}{prefix}"))
+        // The connection settings are part of the key too, so a binding with a
+        // tighter timeout never inherits another's connection. They go in
+        // parsed, so two spellings of the same settings share one. A config
+        // whose settings do not parse is not pooled; `instantiate` reports why.
+        // The key never leaves this process, so the `Debug` rendering will do.
+        let url = config.expose("url")?;
+        let prefix = config.expose("prefix").unwrap_or("");
+        let settings = ConnectionSettings::from_config(config).ok()?;
+        Some(format!("{url}\u{0}{prefix}\u{0}{settings:?}"))
     }
     fn backend_type(&self) -> &'static str {
         "redis"
     }
 
-    async fn instantiate(&self, config: &HashMap<String, String>) -> anyhow::Result<KvId> {
+    async fn instantiate(
+        &self,
+        config: &crate::wit::Config,
+        _egress: Option<&PluginEgressPolicy>,
+    ) -> anyhow::Result<KvId> {
         let url = config
-            .get("url")
+            .value("url")
             .ok_or_else(|| anyhow::anyhow!("redis keyvalue backend requires a 'url' config"))?;
-        let client = redis::Client::open(url.as_str())?;
-        let conn = client.get_multiplexed_async_connection().await?;
-        let prefix = config.get("prefix").filter(|p| !p.is_empty()).cloned();
+        let settings = ConnectionSettings::from_config(config)?;
+        let client = url.guard("url", redis::Client::open(url.expose()))?;
+        let conn = Connection::connect(client, settings).await?;
+        let prefix = config
+            .expose("prefix")
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
         Ok(Arc::new(RedisBackend { conn, prefix }))
+    }
+
+    fn check_egress(
+        &self,
+        config: &crate::wit::Config,
+        policy: &PluginEgressPolicy,
+    ) -> anyhow::Result<()> {
+        let Some(url) = config.value("url") else {
+            return Ok(());
+        };
+        url.guard("url", check_url_egress(url.expose(), policy))
+    }
+
+    async fn check_resolved_egress(
+        &self,
+        config: &crate::wit::Config,
+        policy: &PluginEgressPolicy,
+    ) -> anyhow::Result<()> {
+        let Some(url) = config.value("url") else {
+            return Ok(());
+        };
+        url.guard("url", check_resolved_url_egress(url.expose(), policy).await)
+    }
+}
+
+/// Checks the address `redis` itself parses out of the url. A unix socket has
+/// no host for `allowedHosts` to name, so it is refused.
+fn check_url_egress(url: &str, policy: &PluginEgressPolicy) -> anyhow::Result<()> {
+    let info =
+        redis::IntoConnectionInfo::into_connection_info(url).context("redis url is invalid")?;
+    match info.addr {
+        redis::ConnectionAddr::Tcp(host, port) => policy.check_host_port("redis", &host, port),
+        redis::ConnectionAddr::TcpTls { host, port, .. } => {
+            policy.check_host_port("rediss", &host, port)
+        }
+        redis::ConnectionAddr::Unix(path) => anyhow::bail!(
+            "redis endpoint {path:?} is a unix socket, which allowedHosts cannot permit"
+        ),
+    }
+}
+
+/// What the address [`check_url_egress`] accepted resolves to now.
+async fn check_resolved_url_egress(url: &str, policy: &PluginEgressPolicy) -> anyhow::Result<()> {
+    let info =
+        redis::IntoConnectionInfo::into_connection_info(url).context("redis url is invalid")?;
+    match info.addr {
+        redis::ConnectionAddr::Tcp(host, port)
+        | redis::ConnectionAddr::TcpTls { host, port, .. } => {
+            policy
+                .check_resolved(&host, port, crate::host::declared_port::Protocol::Tcp)
+                .await
+        }
+        redis::ConnectionAddr::Unix(_) => Ok(()),
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    fn check(url: &str, policy: &PluginEgressPolicy) -> anyhow::Result<()> {
+        RedisProvider.check_egress(&[("url", url)].into_iter().collect(), policy)
+    }
+
+    #[test]
+    fn egress_is_checked_at_the_address_redis_dials() {
+        let policy =
+            PluginEgressPolicy::allowing(&["redis://cache.internal:6379", "[fd00::5]:6379"]);
+        check("redis://cache.internal", &policy).expect("the default port is 6379");
+        check("redis://:secret@cache.internal:6379/2", &policy).unwrap();
+        check("redis://[fd00::5]:6379", &policy).unwrap();
+
+        let err = check("redis://evil.example:6379", &policy).unwrap_err();
+        assert!(format!("{err:#}").contains("evil.example"), "{err:#}");
+        assert!(check("redis://cache.internal:6380", &policy).is_err());
+        assert!(check("redis+unix:///var/run/redis.sock", &policy).is_err());
+    }
+
+    fn cfg(entries: &[(&str, &str)]) -> crate::wit::Config {
+        entries.iter().copied().collect()
+    }
+
+    #[test]
+    fn bindings_with_different_connection_settings_do_not_share_a_connection() {
+        let base = [("url", "redis://h:6379"), ("prefix", "p")];
+        let plain = RedisProvider.pool_key(&cfg(&base)).unwrap();
+        let tight = RedisProvider
+            .pool_key(&cfg(&[
+                base[0],
+                base[1],
+                ("backend-response-timeout-ms", "50"),
+            ]))
+            .unwrap();
+        let tight_v1 = RedisProvider
+            .pool_key(&cfg(&[
+                base[0],
+                base[1],
+                ("BACKEND_RESPONSE_TIMEOUT_MS", "50"),
+            ]))
+            .unwrap();
+        assert_ne!(plain, tight);
+        assert_eq!(tight, tight_v1, "a spelling is not a different setting");
+
+        // Settings that do not parse are never pooled; instantiate says why.
+        let bad = cfg(&[base[0], ("backend-connection-timeout-ms", "soon")]);
+        assert_eq!(RedisProvider.pool_key(&bad), None);
+    }
+
+    #[tokio::test]
+    async fn invalid_connection_settings_fail_instantiate_before_connecting() {
+        // Nothing listens on the url; the refusal must come from the config.
+        let err = RedisProvider
+            .instantiate(
+                &cfg(&[
+                    ("url", "redis://127.0.0.1:1"),
+                    ("backend-reconnect-num-retries", "lots"),
+                ]),
+                None,
+            )
+            .await
+            .err()
+            .expect("an invalid setting is refused")
+            .to_string();
+        assert!(err.contains("backend-reconnect-num-retries"), "{err}");
+    }
+
+    /// A workload under `workloadConfig: deny` cannot set a connection setting,
+    /// even when the operator lists no `hostOwnedKeys`: the plugin claims them.
+    #[test]
+    fn deny_refuses_a_workload_that_sets_a_connection_setting() {
+        use crate::plugin::{HostPlugin, PluginBindingSet, WorkloadConfigPolicy};
+
+        let plugins: [Box<dyn HostPlugin>; 2] = [
+            Box::new(crate::plugin::wasi_keyvalue::MultiplexedKeyValue::new()),
+            Box::new(crate::plugin::wasi_keyvalue::MultiplexedAsyncKeyValue::new()),
+        ];
+        for plugin in plugins {
+            let set = PluginBindingSet::new(plugin.id())
+                .with_binding("cache", cfg(&[("url", "redis://cache.internal:6379")]))
+                .with_workload_config(WorkloadConfigPolicy::Deny);
+            let schema = plugin.binding_schema();
+            for key in [
+                "backend-reconnect-num-retries",
+                "BACKEND_RECONNECT_MAX_DELAY_MS",
+                "backend_connection_timeout_ms",
+                "backend-response-timeout-ms",
+            ] {
+                let err = set
+                    .resolve(
+                        "cache",
+                        &cfg(&[("backend", "redis"), (key, "1")]),
+                        &schema,
+                        crate::plugin::bindings::never_narrows(),
+                    )
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains(key), "{}: {err}", plugin.id());
+                assert!(
+                    err.contains("belong to the operator"),
+                    "{}: {err}",
+                    plugin.id()
+                );
+            }
+
+            // The operator may still set them for the binding.
+            let operator = PluginBindingSet::new(plugin.id())
+                .with_binding(
+                    "cache",
+                    cfg(&[
+                        ("url", "redis://cache.internal:6379"),
+                        ("backend-response-timeout-ms", "250"),
+                    ]),
+                )
+                .with_workload_config(WorkloadConfigPolicy::Deny);
+            let resolved = operator
+                .resolve(
+                    "cache",
+                    &cfg(&[("backend", "redis")]),
+                    &schema,
+                    crate::plugin::bindings::never_narrows(),
+                )
+                .unwrap();
+            assert_eq!(resolved.get("backend-response-timeout-ms").unwrap(), "250");
+        }
+    }
+
+    #[test]
+    fn a_refused_url_is_quoted_unless_it_is_a_secret() {
+        let policy = PluginEgressPolicy::allowing(&["cache.internal:6379"]);
+        let refused = "redis://hunter2.example:6379";
+
+        let err = format!("{:#}", check(refused, &policy).unwrap_err());
+        assert!(err.contains("hunter2"), "{err}");
+
+        let mut secret = crate::wit::Config::new();
+        secret.insert("url", crate::plugin::SecretValue::new(refused));
+        let err = format!(
+            "{:#}",
+            RedisProvider.check_egress(&secret, &policy).unwrap_err()
+        );
+        assert!(!err.contains("hunter2"), "{err}");
+    }
+
+    /// A permitted name is judged by what it resolves to.
+    #[tokio::test]
+    async fn a_name_resolving_to_loopback_is_refused() {
+        let policy = PluginEgressPolicy::allowing(&["redis://localhost:6379"]);
+        let config: crate::wit::Config = [("url", "redis://localhost:6379")].into_iter().collect();
+        RedisProvider
+            .check_resolved_egress(&config, &policy)
+            .await
+            .unwrap_err();
     }
 }

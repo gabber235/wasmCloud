@@ -10,10 +10,9 @@
 //!
 //! Pools are keyed per workload ([`WorkloadClients`]): components never reuse
 //! each other's TCP connections, so connection-scoped server state (auth,
-//! rate-limit attribution) cannot leak between them — and each client keeps
-//! its own TLS session-resumption store, so session tickets never resume
-//! across workloads either. Port exhaustion is still prevented because it is
-//! caused by a single busy workload, which keeps reusing its own pool.
+//! rate-limit attribution) cannot leak between them. TLS session resumption
+//! is disabled so new connections consult the current client identity. A busy
+//! workload reuses its pool, which prevents port exhaustion.
 //!
 //! Live connections are bounded by the workload's
 //! [`GuestConnectionQuota`](crate::host::quota::GuestConnectionQuota): its
@@ -51,7 +50,6 @@ use hyper_util::client::legacy::connect::{
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tokio::net::TcpStream;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 use tracing::{debug, warn};
 use wasmtime_wasi::runtime::AbortOnDropJoinHandle;
@@ -134,17 +132,16 @@ fn idle_per_authority(call_concurrency: usize, max_http: usize) -> usize {
 /// a client whose connections have all idled out anyway is just memory, so
 /// there is nothing worth keeping past that window.
 ///
-/// This TTI also backstops an isolation property: eviction plus lazy
-/// re-creation gives a *fresh* TLS session-resumption store, so a workload ID
-/// reused after the idle window cannot resume the previous holder's TLS
-/// sessions. Raising the TTI widens the window in which a reused ID inherits
-/// the prior client (workload stop already invalidates eagerly via
-/// [`WorkloadClients::invalidate`], so this only matters for callers that
-/// never signal unbind).
+/// Eviction also prevents a reused workload ID from inheriting idle connections.
+/// Workload stop invalidates eagerly via [`WorkloadClients::invalidate`].
 const WORKLOAD_CLIENT_IDLE: Duration = Duration::from_secs(60);
 
 /// Shortest gap between two [`warn_permits_exhausted`] lines for one workload.
 const PERMIT_WARN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Most bytes [`drain_unsent`] discards from a body hyper will never send
+/// before closing it under the guest, as hyper itself would have.
+const UNSENT_BODY_DRAIN_LIMIT: usize = 64 * 1024;
 
 /// Built-in roots to start from before layering on
 /// [`ClientTlsOptions::extra_ca_paths`].
@@ -459,11 +456,14 @@ fn is_resolver_error(err: &std::io::Error) -> bool {
 }
 
 /// Open an HTTP TCP connection and return guest-visible connection errors.
+///
+/// The stream has `TCP_NODELAY` set, matching the pooled client's connector,
+/// so a request head and its first body frame are not held back by Nagle.
 pub(crate) async fn connect_http_tcp(
     authority: &str,
     connect_timeout: Duration,
 ) -> Result<TcpStream, HttpError> {
-    timeout(connect_timeout, TcpStream::connect(authority))
+    let stream = timeout(connect_timeout, TcpStream::connect(authority))
         .await
         .map_err(|_| HttpError::ConnectionTimeout)?
         .map_err(|e| {
@@ -472,20 +472,21 @@ pub(crate) async fn connect_http_tcp(
             } else {
                 HttpError::ConnectionRefused
             }
-        })
+        })?;
+    if let Err(e) = stream.set_nodelay(true) {
+        warn!(err = ?e, authority = %authority, "failed to set TCP_NODELAY on outbound connection");
+    }
+    Ok(stream)
 }
 
-/// Clone a TLS client configuration with a fresh, private session-resumption
-/// store.
+/// Clone a TLS configuration without resumable session state.
 ///
-/// `ClientConfig::clone` shares the resumption store behind an `Arc`, and
-/// rustls resumes sessions across clones — so every client (or connection)
-/// built from a shared base configuration would otherwise share one TLS
-/// session-ticket cache, letting an upstream server correlate two workloads
-/// via a resumed session, against this module's isolation promise.
-pub(crate) fn isolated_resumption(tls: &rustls::ClientConfig) -> rustls::ClientConfig {
+/// Resumed sessions retain the original client identity and skip its resolver.
+/// A resolver can gain, rotate, or lose a credential after this clone, so even
+/// `has_certs() == false` cannot safely enable resumption.
+pub(crate) fn without_resumption(tls: &rustls::ClientConfig) -> rustls::ClientConfig {
     let mut config = tls.clone();
-    config.resumption = rustls::client::Resumption::in_memory_sessions(256);
+    config.resumption = rustls::client::Resumption::disabled();
     config
 }
 
@@ -693,35 +694,29 @@ impl PooledClient {
         Self::bounded(
             tls,
             None,
-            quota.outbound_http_permits(),
-            unbounded_permits(),
-            crate::host::quota::QuotaRegistry::new(Default::default(), None).http_wait(),
+            quota,
+            crate::host::quota::DEFAULT_HTTP_WAIT,
             MIN_IDLE_PER_AUTHORITY,
         )
     }
 
-    /// Create a client whose new connections each hold one permit from
-    /// `workload_permits` (the HTTP surface of the quota belonging to the
-    /// workload named by `workload`, if any) and one from `global_permits`
-    /// (shared host-wide) for the connection's lifetime.
+    /// Charge both the workload's HTTP quota and the host-wide quota for
+    /// each new connection's lifetime.
     fn bounded(
         tls: Arc<rustls::ClientConfig>,
         workload: Option<Arc<str>>,
-        workload_permits: Arc<Semaphore>,
-        global_permits: Arc<Semaphore>,
+        quota: crate::host::quota::GuestConnectionQuota,
         permit_wait: Duration,
         idle_per_authority: usize,
     ) -> Self {
         crate::init_crypto();
-        // One session store, and one exhaustion-warning throttle, shared by
-        // both protocols: they belong to the workload, not to a pool.
-        let tls_config = isolated_resumption(&tls);
+        // Both protocols use the current identity on every new connection.
+        let tls_config = without_resumption(&tls);
         let last_permit_warning = Arc::new(std::sync::Mutex::new(None));
         let connector = |alpn: Alpn| BoundedConnector {
             inner: https_connector(&tls_config, alpn),
             workload: workload.clone(),
-            workload_permits: workload_permits.clone(),
-            global_permits: global_permits.clone(),
+            quota: quota.clone(),
             permit_wait,
             last_permit_warning: last_permit_warning.clone(),
         };
@@ -762,7 +757,20 @@ impl PooledClient {
         request: hyper::Request<WasiBody>,
         options: Option<RequestOptions>,
     ) -> SendResult {
-        self.send(&self.client, request, options).await
+        let (parts, body) = request.into_parts();
+        let (body, upload_rx) = UploadProbe::new(body);
+        let body = if http1_sends_no_body(&parts, &body) {
+            // hyper would drop the body unwritten, closing it under a guest
+            // that has yet to finish it.
+            drain_unsent(body);
+            http_body_util::Empty::new()
+                .map_err(|never| match never {})
+                .boxed_unsync()
+        } else {
+            client_body(body)
+        };
+        let request = hyper::Request::from_parts(parts, body);
+        self.send(&self.client, request, upload_rx, options).await
     }
 
     /// Send a gRPC request through the HTTP/2 pool.
@@ -771,13 +779,17 @@ impl PooledClient {
         request: hyper::Request<WasiBody>,
         options: Option<RequestOptions>,
     ) -> SendResult {
-        self.send(&self.grpc, request, options).await
+        let (parts, body) = request.into_parts();
+        let (body, upload_rx) = UploadProbe::new(body);
+        let request = hyper::Request::from_parts(parts, client_body(body));
+        self.send(&self.grpc, request, upload_rx, options).await
     }
 
     async fn send(
         &self,
         pool: &PoolClient,
-        request: hyper::Request<WasiBody>,
+        request: hyper::Request<ClientBody>,
+        mut upload_rx: UploadOutcome,
         options: Option<RequestOptions>,
     ) -> SendResult {
         let connect_timeout = options
@@ -789,11 +801,6 @@ impl PooledClient {
         let between_bytes_timeout = options
             .and_then(|o| o.between_bytes_timeout)
             .unwrap_or(Duration::from_secs(600));
-
-        let (parts, body) = request.into_parts();
-        let (body, mut upload_rx) = UploadProbe::new(body);
-        let body = body.map_err(|e| Box::new(e) as BoxError).boxed_unsync();
-        let request = hyper::Request::from_parts(parts, body);
 
         let resp = send_head(pool, request, connect_timeout, first_byte_timeout)
             .await
@@ -898,6 +905,45 @@ pub struct WorkloadClients {
     /// before any request builds a client, and is dropped when it unbinds.
     call_concurrency: Arc<std::sync::RwLock<BTreeMap<String, usize>>>,
     clients: moka::sync::Cache<String, PooledClient>,
+    /// Unbinds whose invalidated clients have not been dropped yet. Non-zero
+    /// while a task is dropping them, so a burst of unbinds runs one task
+    /// rather than one each.
+    release_pending: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Owns maintenance before it is queued, including if the runtime cancels it
+/// before the blocking closure starts. Cancellation still drains the pending
+/// invalidations, so their clients do not wait for another cache access.
+struct ReleaseOwner {
+    clients: moka::sync::Cache<String, PooledClient>,
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+    armed: bool,
+}
+
+impl ReleaseOwner {
+    fn release(&mut self) {
+        use std::sync::atomic::Ordering;
+        while self.armed {
+            let seen = self.pending.load(Ordering::Acquire);
+            self.clients.run_pending_tasks();
+            // An unbind during this pass left its invalidation to us. Keep
+            // ownership until a complete pass has caught up with every one.
+            if self
+                .pending
+                .compare_exchange(seen, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // A new owner can start immediately after the exchange.
+                self.armed = false;
+            }
+        }
+    }
+}
+
+impl Drop for ReleaseOwner {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 impl WorkloadClients {
@@ -943,6 +989,7 @@ impl WorkloadClients {
             tls,
             quotas,
             call_concurrency: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+            release_pending: Arc::default(),
             clients: moka::sync::Cache::builder()
                 .time_to_idle(WORKLOAD_CLIENT_IDLE)
                 .build(),
@@ -978,17 +1025,10 @@ impl WorkloadClients {
     /// `workload_id` is a trust boundary: it must be the host-assigned,
     /// unique identifier of the workload instance — never empty, never
     /// derived from guest-controllable data. Two callers presenting the same
-    /// ID collapse into one pool and inherit each other's keep-alive
-    /// connections and TLS session tickets (see
-    /// [`crate::host::http::OutgoingHandler`]).
+    /// ID share keep-alive connections (see [`crate::host::http::OutgoingHandler`]).
     pub fn client(&self, workload_id: &str) -> PooledClient {
-        // Looked up on every call, not just on a client-cache miss, so the
-        // quota's idle window is refreshed alongside the client's and a
-        // workload's allowance cannot expire out from under a client that is
-        // still serving it. The quota's window is the longer of the two, so it
-        // outlives the client either way.
-        let quota = self.quotas.for_guest(workload_id);
         self.clients.get_with_by_ref(workload_id, || {
+            let quota = self.quotas.for_guest(workload_id);
             let calls = self
                 .call_concurrency
                 .read()
@@ -999,11 +1039,7 @@ impl WorkloadClients {
             PooledClient::bounded(
                 self.tls.config_for(workload_id),
                 Some(Arc::from(workload_id)),
-                quota.outbound_http_permits(),
-                // An unset host-wide ceiling is spelled as an effectively
-                // unbounded semaphore rather than an `Option`, so the connector
-                // has one acquire path instead of two.
-                quota.global_permits().unwrap_or_else(unbounded_permits),
+                quota,
                 self.quotas.http_wait(),
                 idle_per_authority(calls, self.quotas.limits().outbound_http),
             )
@@ -1017,21 +1053,47 @@ impl WorkloadClients {
     /// of the client and complete unaffected; their connections close, and
     /// release their permits, when those requests finish). A subsequent
     /// [`Self::client`] call for the same ID builds a fresh client with a
-    /// fresh TLS session-resumption store.
+    /// fresh connection pool.
     ///
-    /// The workload's quota deliberately survives, so that the
-    /// draining connections stay charged to it; it ages out on its own idle
-    /// window ([`WORKLOAD_CLIENT_IDLE`]) once nothing refers to the workload.
+    /// Draining connections keep the workload's quota alive until they close.
     pub fn invalidate(&self, workload_id: &str) {
         self.clients.invalidate(workload_id);
-        // moka may defer dropping the evicted value to a maintenance pass;
-        // force it so the pool (and the permits its idle connections pin) is
-        // released now, not on the next cache access.
-        self.clients.run_pending_tasks();
         self.call_concurrency
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(workload_id);
+        drop(self.release_invalidated());
+    }
+
+    /// Drop invalidated clients now rather than on the next cache access.
+    ///
+    /// moka may defer dropping an evicted value to a maintenance pass, and
+    /// until then its pool keeps its idle connections, and the permits they
+    /// pin. Running that pass inline put the whole cache's pending work on
+    /// every unbind, so it runs off the caller's thread, on one task at a time
+    /// that keeps passing until no unbind arrived during its last pass.
+    fn release_invalidated(&self) -> Option<tokio::task::JoinHandle<()>> {
+        use std::sync::atomic::Ordering;
+        // Only the unbind that finds nothing pending starts a task: a burst
+        // otherwise spawned one blocking task per unbind, each queueing on
+        // moka's maintenance lock behind the last.
+        if self.release_pending.fetch_add(1, Ordering::AcqRel) != 0 {
+            return None;
+        }
+        let mut owner = ReleaseOwner {
+            clients: self.clients.clone(),
+            pending: Arc::clone(&self.release_pending),
+            armed: true,
+        };
+        let release = move || owner.release();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => Some(runtime.spawn_blocking(release)),
+            Err(_) => {
+                let mut release = release;
+                release();
+                None
+            }
+        }
     }
 
     /// The TLS configuration for egress belonging to no single workload.
@@ -1067,8 +1129,7 @@ struct BoundedConnector {
     /// The workload this connector belongs to, named in the exhaustion
     /// warning. `None` for a standalone [`PooledClient::new`] client.
     workload: Option<Arc<str>>,
-    workload_permits: Arc<Semaphore>,
-    global_permits: Arc<Semaphore>,
+    quota: crate::host::quota::GuestConnectionQuota,
     permit_wait: Duration,
     /// When this workload last logged permit exhaustion; see
     /// [`warn_permits_exhausted`].
@@ -1093,47 +1154,24 @@ impl tower_service::Service<hyper::Uri> for BoundedConnector {
         let mut inner = self.inner.clone();
         std::mem::swap(&mut self.inner, &mut inner);
         let workload = self.workload.clone();
-        let workload_permits = self.workload_permits.clone();
-        let global_permits = self.global_permits.clone();
+        let quota = self.quota.clone();
         let permit_wait = self.permit_wait;
         let last_permit_warning = self.last_permit_warning.clone();
         Box::pin(async move {
-            // Acquire order (workload, then global) is fixed everywhere, and
-            // waiters hold no resource another waiter needs, so waiting on
-            // both cannot deadlock. `acquire_owned` only errors when the
-            // semaphore is closed, which never happens.
-            let acquire =
-                {
-                    let workload_permits = workload_permits.clone();
-                    let global_permits = global_permits.clone();
-                    async move {
-                        let workload = workload_permits.acquire_owned().await.map_err(|_| {
-                            std::io::Error::other("outbound connection limiter closed")
-                        })?;
-                        let global = global_permits.acquire_owned().await.map_err(|_| {
-                            std::io::Error::other("outbound connection limiter closed")
-                        })?;
-                        Ok::<_, std::io::Error>((workload, global))
-                    }
-                };
-            let permits = tokio::time::timeout(permit_wait, acquire)
+            let slot = quota
+                .acquire_outbound_http(permit_wait)
                 .await
-                .map_err(|_| {
-                    warn_permits_exhausted(
-                        &last_permit_warning,
-                        workload.as_deref(),
-                        &workload_permits,
-                        &global_permits,
-                    );
+                .ok_or_else(|| {
+                    warn_permits_exhausted(&last_permit_warning, workload.as_deref(), &quota);
                     std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "outbound connection limit reached (per-workload or host-wide)",
                     )
-                })??;
+                })?;
             let stream = tower_service::Service::call(&mut inner, uri).await?;
             Ok(PermittedStream {
                 inner: stream,
-                _permits: permits,
+                _slot: slot,
             })
         })
     }
@@ -1154,8 +1192,7 @@ impl tower_service::Service<hyper::Uri> for BoundedConnector {
 fn warn_permits_exhausted(
     last_warning: &std::sync::Mutex<Option<std::time::Instant>>,
     workload: Option<&str>,
-    workload_permits: &Semaphore,
-    global_permits: &Semaphore,
+    quota: &crate::host::quota::GuestConnectionQuota,
 ) {
     let mut last = last_warning.lock().unwrap_or_else(|e| e.into_inner());
     if last.is_none_or(|at| at.elapsed() >= PERMIT_WARN_INTERVAL) {
@@ -1163,8 +1200,14 @@ fn warn_permits_exhausted(
         drop(last);
         warn!(
             workload_id = workload.unwrap_or("<none>"),
-            workload_permits_available = workload_permits.available_permits(),
-            global_permits_available = global_permits.available_permits(),
+            workload_permits_available = quota.outbound_http_available(),
+            // An unset host-wide ceiling reads as unbounded, keeping the
+            // field numeric for log pipelines that alert on it.
+            global_permits_available = quota
+                .global_permits()
+                .map_or(tokio::sync::Semaphore::MAX_PERMITS, |permits| {
+                    permits.available_permits()
+                }),
             "outbound connect timed out waiting for a connection permit; \
              a connection quota is exhausted (logged at most once per \
              {PERMIT_WARN_INTERVAL:?} per workload)"
@@ -1172,17 +1215,11 @@ fn warn_permits_exhausted(
     }
 }
 
-/// An effectively unbounded semaphore, for a host that configured no
-/// host-wide ceiling.
-fn unbounded_permits() -> Arc<Semaphore> {
-    Arc::new(Semaphore::new(Semaphore::MAX_PERMITS))
-}
-
 /// A connection stream carrying its quota slots; dropping
 /// the stream (connection close) releases them.
 struct PermittedStream {
     inner: hyper_rustls::MaybeHttpsStream<TokioIo<TcpStream>>,
-    _permits: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+    _slot: crate::host::quota::ConnectionSlot,
 }
 
 impl hyper::rt::Read for PermittedStream {
@@ -1318,6 +1355,56 @@ impl hyper::body::Body for UploadProbe {
     }
 }
 
+/// Whether hyper's HTTP/1.1 client would frame `parts` with no body, though
+/// the body it is handed is still open: a zero `content-length`, or a GET,
+/// HEAD or CONNECT of unknown length (hyper's `Client::set_length`). When
+/// upgrading hyper, `unsent_body_predicate_matches_hyper` pins the two.
+fn http1_sends_no_body(parts: &http::request::Parts, body: &impl hyper::body::Body) -> bool {
+    if body.is_end_stream() || parts.headers.contains_key(hyper::header::TRANSFER_ENCODING) {
+        return false;
+    }
+    let mut declared = parts
+        .headers
+        .get_all(hyper::header::CONTENT_LENGTH)
+        .iter()
+        .peekable();
+    if declared.peek().is_some() {
+        return declared.all(|value| {
+            value
+                .to_str()
+                .is_ok_and(|v| v.split(',').all(|len| len.trim().parse::<u64>() == Ok(0)))
+        });
+    }
+    match body.size_hint().exact() {
+        Some(len) => len == 0,
+        None => matches!(
+            parts.method,
+            hyper::Method::GET | hyper::Method::HEAD | hyper::Method::CONNECT
+        ),
+    }
+}
+
+/// Read a body hyper will never send to its end, so a guest still writing it
+/// is not closed out mid-write. Past [`UNSENT_BODY_DRAIN_LIMIT`] the body is
+/// dropped, closing it under the guest. Detached: aborting it early would
+/// close the body too, and the guest's store dropping its writer ends it.
+fn drain_unsent(mut body: UploadProbe) {
+    tokio::spawn(async move {
+        let mut discarded = 0;
+        while let Some(Ok(frame)) = body.frame().await {
+            discarded += frame.data_ref().map_or(0, Bytes::len);
+            if discarded > UNSENT_BODY_DRAIN_LIMIT {
+                return;
+            }
+        }
+    });
+}
+
+/// The form hyper's pools take a guest body in.
+fn client_body(body: UploadProbe) -> ClientBody {
+    body.map_err(|e| Box::new(e) as BoxError).boxed_unsync()
+}
+
 /// What the nested layers of an `io::Error` say about a failed connect.
 struct IoErrorFacts {
     /// The most specific error kind found, ignoring `Other` placeholders.
@@ -1425,8 +1512,84 @@ fn classify_client_error(err: &hyper_util::client::legacy::Error) -> HttpError {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_release_drains_clients_and_allows_another_runtime() {
+        use std::sync::atomic::Ordering;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (started, ready) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let busy = runtime.spawn_blocking(move || {
+            started.send(()).unwrap();
+            let _ = blocked.recv();
+        });
+        ready.recv().unwrap();
+
+        let clients = WorkloadClients::new(default_client_tls_config());
+        clients.clients.insert(
+            "workload".into(),
+            PooledClient::new(default_client_tls_config()),
+        );
+        clients.clients.insert(
+            "another-workload".into(),
+            PooledClient::new(default_client_tls_config()),
+        );
+        clients.clients.run_pending_tasks();
+        assert_eq!(clients.clients.entry_count(), 2);
+        clients.clients.invalidate("workload");
+        let queued = {
+            let _entered = runtime.enter();
+            let queued = clients.release_invalidated().unwrap();
+            // Coalesced unbinds must also be drained on cancellation.
+            clients.invalidate("another-workload");
+            queued
+        };
+        assert_eq!(clients.release_pending.load(Ordering::Acquire), 2);
+
+        // Rebinding the ID must survive the old task's cleanup.
+        let new_tls = Arc::new((*default_client_tls_config()).clone());
+        clients
+            .clients
+            .insert("workload".into(), PooledClient::new(Arc::clone(&new_tls)));
+        queued.abort();
+        release.send(()).unwrap();
+        runtime.block_on(async {
+            busy.await.unwrap();
+            assert!(queued.await.unwrap_err().is_cancelled());
+        });
+        assert_eq!(clients.release_pending.load(Ordering::Acquire), 0);
+        assert_eq!(
+            clients.clients.entry_count(),
+            1,
+            "cancelled maintenance must drain"
+        );
+        assert!(
+            Arc::ptr_eq(&clients.clients.get("workload").unwrap().tls, &new_tls,),
+            "the rebound client must survive"
+        );
+        drop(runtime);
+
+        let next_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let next = {
+            let _entered = next_runtime.enter();
+            clients.clients.invalidate("workload");
+            clients.release_invalidated().unwrap()
+        };
+        next_runtime.block_on(next).unwrap();
+        assert_eq!(clients.release_pending.load(Ordering::Acquire), 0);
+        assert_eq!(clients.clients.entry_count(), 0);
+    }
 
     /// Shorter than the production [`PERMIT_WAIT`]: the connection-bound tests
     /// deliberately wait out abandoned connect attempts parked on the
@@ -1840,6 +2003,22 @@ mod tests {
             .unwrap()
     }
 
+    /// Unpooled egress (the gRPC HTTP/2 path) connects through
+    /// `connect_http_tcp`, so it must hand back a stream with Nagle disabled.
+    #[tokio::test]
+    async fn connect_http_tcp_disables_nagle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = connect_http_tcp(&addr.to_string(), Duration::from_secs(5))
+            .await
+            .expect("connect should succeed");
+        let _accepted = listener.accept().await.unwrap();
+        assert!(
+            stream.nodelay().unwrap(),
+            "connect_http_tcp must set TCP_NODELAY on outbound connections"
+        );
+    }
+
     /// Sequential requests to the same authority must reuse one pooled
     /// connection instead of opening one per request (the per-request
     /// connections are what exhaust ephemeral ports under load and surface as
@@ -2008,8 +2187,7 @@ mod tests {
     }
 
     /// Stopping a workload must drop its pooled client: the next client for
-    /// the same ID gets a fresh pool (and a fresh TLS session-resumption
-    /// store) instead of inheriting the previous holder's connections.
+    /// the same ID gets a fresh pool without the previous holder's connections.
     #[tokio::test]
     async fn invalidate_drops_pooled_connections() {
         let (addr, conns) = spawn_counting_server().await;
@@ -2304,6 +2482,177 @@ mod tests {
         assert!(Box::into_pin(upload_io(outcome)).await.is_ok());
     }
 
+    /// The shape of wasmtime's p2 outgoing body: a channel the guest writes,
+    /// of unknown length until the guest drops its end.
+    struct ChannelBody(tokio::sync::mpsc::Receiver<Bytes>);
+
+    impl hyper::body::Body for ChannelBody {
+        type Data = Bytes;
+        type Error = HttpError;
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, HttpError>>> {
+            self.0
+                .poll_recv(cx)
+                .map(|chunk| chunk.map(|b| Ok(hyper::body::Frame::data(b))))
+        }
+    }
+
+    /// A GET whose body the guest has yet to write, sent through `client`.
+    async fn send_unwritten_get(
+        client: &PooledClient,
+        addr: std::net::SocketAddr,
+    ) -> (tokio::sync::mpsc::Sender<Bytes>, RequestIoFuture) {
+        let (guest, body) = tokio::sync::mpsc::channel(1);
+        let request = hyper::Request::get(format!("http://{addr}/"))
+            .body(ChannelBody(body).boxed_unsync())
+            .unwrap();
+        let (response, io) = timeout(Duration::from_secs(5), client.send_request(request, None))
+            .await
+            .expect("response head timed out")
+            .expect("request failed");
+        assert_eq!(response.status(), 200);
+        (guest, io)
+    }
+
+    /// A guest writes its request body after `handle` returns. hyper sends no
+    /// body for a GET of unknown length and drops the one it was handed, so
+    /// the body has to stay writable past the response; otherwise the guest's
+    /// write fails as a closed stream, which wstd reports as "connection reset".
+    #[tokio::test]
+    async fn an_unsent_body_stays_writable_for_the_guest() {
+        let (addr, _) = spawn_counting_server().await;
+        let client = PooledClient::new(default_client_tls_config());
+        let (guest, io) = send_unwritten_get(&client, addr).await;
+
+        guest
+            .send(Bytes::new())
+            .await
+            .expect("the guest's body was closed under it");
+        drop(guest);
+        assert!(Box::into_pin(io).await.is_ok());
+    }
+
+    /// Draining a body hyper never sends is bounded: a guest that keeps
+    /// writing past the limit has the body closed under it.
+    #[tokio::test]
+    async fn an_unsent_body_is_closed_past_the_drain_limit() {
+        let (addr, _) = spawn_counting_server().await;
+        let client = PooledClient::new(default_client_tls_config());
+        let (guest, _io) = send_unwritten_get(&client, addr).await;
+
+        let chunk = Bytes::from(vec![0u8; 1024]);
+        let chunks = 2 * UNSENT_BODY_DRAIN_LIMIT / chunk.len();
+        let mut sent = 0;
+        while sent < chunks && guest.send(chunk.clone()).await.is_ok() {
+            sent += 1;
+        }
+        assert!(
+            sent < chunks,
+            "the drain read {sent} KiB of a body that is never sent"
+        );
+    }
+
+    /// [`http1_sends_no_body`] mirrors hyper's own framing rule. hyper drops
+    /// a body it will not send before writing the head, so whether the
+    /// guest's end is closed once the response arrives is what hyper decided.
+    #[tokio::test]
+    async fn unsent_body_predicate_matches_hyper() {
+        use hyper::Method;
+        let (addr, _) = spawn_counting_server().await;
+        let cases: &[(Method, &[(&str, &str)])] = &[
+            (Method::GET, &[]),
+            (Method::HEAD, &[]),
+            (Method::POST, &[]),
+            (Method::PUT, &[]),
+            (Method::GET, &[("content-length", "0")]),
+            (Method::POST, &[("content-length", "0")]),
+            (Method::POST, &[("content-length", "00")]),
+            (Method::POST, &[("content-length", "5")]),
+            (Method::GET, &[("transfer-encoding", "chunked")]),
+        ];
+        for (method, headers) in cases {
+            // A bare hyper pool: no `PooledClient`, so nothing replaces the body.
+            let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
+                .build::<_, ChannelBody>(HttpConnector::new());
+            let (guest, body) = tokio::sync::mpsc::channel(1);
+            let mut request = hyper::Request::builder()
+                .method(method.clone())
+                .uri(format!("http://{addr}/"));
+            for (name, value) in *headers {
+                request = request.header(*name, *value);
+            }
+            let (parts, body) = request.body(ChannelBody(body)).unwrap().into_parts();
+            let predicted = http1_sends_no_body(&parts, &body);
+
+            let response = timeout(
+                Duration::from_secs(5),
+                client.request(hyper::Request::from_parts(parts, body)),
+            )
+            .await
+            .expect("response head timed out")
+            .expect("request failed");
+            assert_eq!(response.status(), 200);
+            assert_eq!(
+                guest.is_closed(),
+                predicted,
+                "{method} with {headers:?}: hyper and `http1_sends_no_body` disagree \
+                 on whether the body is sent"
+            );
+        }
+    }
+
+    /// A POST of unknown length is not caught by the GET rule: its body still
+    /// reaches the server, chunked, though the guest writes it late.
+    #[tokio::test]
+    async fn an_unknown_length_post_still_uploads_its_body() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (received_tx, received) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !buf.ends_with(b"\r\n0\r\n\r\n") {
+                match sock.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .await;
+            let _ = received_tx.send(buf);
+        });
+
+        let client = PooledClient::new(default_client_tls_config());
+        let (guest, body) = tokio::sync::mpsc::channel(1);
+        let request = hyper::Request::post(format!("http://{addr}/"))
+            .body(ChannelBody(body).boxed_unsync())
+            .unwrap();
+        let send = tokio::spawn(async move { client.send_request(request, None).await });
+        guest.send(Bytes::from_static(b"hello")).await.unwrap();
+        drop(guest);
+
+        let (response, _io) = timeout(Duration::from_secs(5), send)
+            .await
+            .expect("response head timed out")
+            .unwrap()
+            .expect("request failed");
+        assert_eq!(response.status(), 200);
+        let received = String::from_utf8(received.await.unwrap()).unwrap();
+        assert!(
+            received
+                .to_ascii_lowercase()
+                .contains("transfer-encoding: chunked")
+                && received.contains("hello"),
+            "the POST body never reached the server: {received:?}"
+        );
+    }
+
     /// A server that hangs up mid-body must surface as an error on the
     /// response body, not as a silently truncated success. On the pooled path
     /// this guarantee is enforced by hyper's content-length check surfacing
@@ -2502,6 +2851,132 @@ mod tests {
             }
         });
         (port, ca_pem)
+    }
+
+    #[derive(Debug, Default)]
+    struct SwappableIdentity(std::sync::RwLock<Option<Arc<rustls::sign::CertifiedKey>>>);
+
+    impl rustls::client::ResolvesClientCert for SwappableIdentity {
+        fn resolve(
+            &self,
+            _roots: &[&[u8]],
+            _schemes: &[rustls::SignatureScheme],
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            self.0.read().unwrap().clone()
+        }
+
+        fn has_certs(&self) -> bool {
+            self.0.read().unwrap().is_some()
+        }
+    }
+
+    /// Every new pooled connection must run a full handshake and present the
+    /// identity the resolver holds now, across TLS 1.2 and 1.3 and whether or
+    /// not a certificate exists when the pool is built.
+    #[tokio::test]
+    async fn pooled_tls_connections_refresh_client_identity() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        crate::init_crypto();
+        let dir = tempfile::tempdir().unwrap();
+        let load = |stem| {
+            let (certs, key) = write_identity(dir.path(), stem).load().unwrap();
+            Arc::new(
+                rustls::sign::CertifiedKey::from_der(
+                    certs,
+                    key,
+                    rustls::crypto::CryptoProvider::get_default().unwrap(),
+                )
+                .unwrap(),
+            )
+        };
+        let first = load("first");
+        let second = load("second");
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(first.cert[0].clone()).unwrap();
+        roots.add(second.cert[0].clone()).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .allow_unauthenticated()
+            .build()
+            .unwrap();
+        let server = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let ca_path = dir.path().join("server.pem");
+        std::fs::write(&ca_path, server.cert.pem()).unwrap();
+
+        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            for initially_available in [false, true] {
+                let key =
+                    rustls::pki_types::PrivateKeyDer::try_from(server.signing_key.serialize_der())
+                        .unwrap();
+                let mut config = rustls::ServerConfig::builder_with_protocol_versions(&[version])
+                    .with_client_cert_verifier(Arc::clone(&verifier))
+                    .with_single_cert(vec![server.cert.der().clone()], key)
+                    .unwrap();
+                config.ticketer = rustls::crypto::aws_lc_rs::Ticketer::new().unwrap();
+                let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let (observed, mut observations) = tokio::sync::mpsc::channel(4);
+                let worker = tokio::spawn(async move {
+                    for _ in 0..4 {
+                        let (tcp, _) = listener.accept().await.unwrap();
+                        let mut tls = acceptor.accept(tcp).await.unwrap();
+                        let kind = tls.get_ref().1.handshake_kind();
+                        let peer = tls
+                            .get_ref()
+                            .1
+                            .peer_certificates()
+                            .and_then(|certs| certs.first())
+                            .cloned();
+                        let mut request = Vec::new();
+                        while !request.ends_with(b"\r\n\r\n") {
+                            request.push(tls.read_u8().await.unwrap());
+                        }
+                        tls.write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .await
+                        .unwrap();
+                        tls.shutdown().await.unwrap();
+                        observed.send((kind, peer)).await.unwrap();
+                    }
+                });
+                let resolver = Arc::new(SwappableIdentity::default());
+                if initially_available {
+                    *resolver.0.write().unwrap() = Some(Arc::clone(&first));
+                }
+                let tls = ClientTlsOptions {
+                    roots: TrustRoots::ExtraOnly,
+                    extra_ca_paths: vec![ca_path.clone()],
+                    ..Default::default()
+                }
+                .build_with_resolver(Arc::clone(&resolver) as _)
+                .unwrap();
+                let client = PooledClient::new(tls);
+                let initial = initially_available.then(|| Arc::clone(&first));
+                for identity in [
+                    initial,
+                    Some(Arc::clone(&first)),
+                    Some(Arc::clone(&second)),
+                    None,
+                ] {
+                    *resolver.0.write().unwrap() = identity.clone();
+                    timeout(Duration::from_secs(5), async {
+                        let (response, _io) = client
+                            .send_request(request(&format!("https://{addr}/")), test_options())
+                            .await
+                            .unwrap();
+                        response.into_body().collect().await.unwrap();
+                        let (kind, peer) = observations.recv().await.unwrap();
+                        assert_eq!(kind, Some(rustls::HandshakeKind::Full));
+                        assert_eq!(peer, identity.map(|key| key.cert[0].clone()));
+                    })
+                    .await
+                    .expect("TLS identity request timed out");
+                }
+                worker.await.unwrap();
+            }
+        }
     }
 
     /// HTTPS to a server behind a private CA must work once that CA is added

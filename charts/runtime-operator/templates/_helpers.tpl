@@ -201,9 +201,14 @@ Shared by deployment.yaml (which needs both partitions, to render
 host-plugin-config.yaml (which needs only `fileBacked`, to render the
 `wash host` config file).
 
+A `secretFrom` name the host group declares under `pluginSecrets` is served by
+a host plugin at bind, not by a Kubernetes Secret: it goes to
+`pluginSecrets` (rendered into the `secrets:` catalog as is) instead of
+`secretFromNames`, so it gets no volume and no Reloader annotation.
+
 Takes the host group dict directly (e.g. `.` inside
 `range .Values.runtime.hostGroups`). Returns a JSON object
-`{fileBacked, cli, configFromNames, secretFromNames, needsConfigFile}`
+`{fileBacked, cli, configFromNames, secretFromNames, pluginSecrets, needsConfigFile}`
 and parses the result with `fromJson`.
 */}}
 {{- define "runtime-operator.hostPluginPartition" -}}
@@ -220,6 +225,9 @@ and parses the result with `fromJson`.
 {{- $fileBacked := list }}
 {{- $cli := list }}
 {{- range concat (default list .plugins) (default list .hostPlugins) }}
+{{- if or .volumes .volumeMounts }}
+{{- fail (printf "host plugin %s: `volumes` and `volumeMounts` are not yet supported by the chart; the plugin would start with no filesystem" .id) }}
+{{- end }}
 {{- if or .config .configFrom .secretFrom .allowedHosts .allowedIpNameLookups .allowedHostLoopbackPorts .ports .workloadConfig .hostOwnedKeys .bindings (not (or .image .file)) }}
 {{- $fileBacked = append $fileBacked . }}
 {{- else }}
@@ -244,7 +252,17 @@ and parses the result with `fromJson`.
 {{- end }}
 {{- end }}
 {{- end }}
-{{- dict "fileBacked" $fileBacked "cli" $cli "configFromNames" ($configFromNames | uniq) "secretFromNames" ($secretFromNames | uniq) "needsConfigFile" (gt (len $fileBacked) 0) | toJson }}
+{{- $declared := default dict .pluginSecrets }}
+{{- $pluginSecrets := dict }}
+{{- $mountedSecretNames := list }}
+{{- range ($secretFromNames | uniq) }}
+{{- if hasKey $declared . }}
+{{- $_ := set $pluginSecrets . (index $declared .) }}
+{{- else }}
+{{- $mountedSecretNames = append $mountedSecretNames . }}
+{{- end }}
+{{- end }}
+{{- dict "fileBacked" $fileBacked "cli" $cli "configFromNames" ($configFromNames | uniq) "secretFromNames" $mountedSecretNames "pluginSecrets" $pluginSecrets "needsConfigFile" (gt (len $fileBacked) 0) | toJson }}
 {{- end }}
 
 {{/*
@@ -276,6 +294,7 @@ e.g. `wasmcloud:secrets`'s `get`.
 {{- $partition := . }}
 {{- $configNames := $partition.configFromNames }}
 {{- $secretNames := $partition.secretFromNames }}
+{{- $pluginSecrets := $partition.pluginSecrets }}
 {{- if $configNames }}
 configs:
   {{- range $configNames }}
@@ -283,11 +302,19 @@ configs:
     dir: /etc/wasmcloud/host-plugin-config/{{ . }}
   {{- end }}
 {{- end }}
-{{- if $secretNames }}
+{{- if or $secretNames $pluginSecrets }}
 secrets:
   {{- range $secretNames }}
   {{ . }}:
     dir: /etc/wasmcloud/host-plugin-secrets/{{ . }}
+  {{- end }}
+  {{- range $name, $source := $pluginSecrets }}
+  {{ $name }}:
+    plugin: {{ required (printf "pluginSecrets.%s needs a `plugin`" $name) $source.plugin }}
+    keys:
+      {{- required (printf "pluginSecrets.%s needs `keys`" $name) $source.keys | toYaml | nindent 6 }}
+    workloads:
+      {{- required (printf "pluginSecrets.%s needs `workloads`: the namespaces (and optionally workload names) that may use it, or `all`" $name) $source.workloads | toYaml | nindent 6 }}
   {{- end }}
 {{- end }}
 host:
@@ -414,4 +441,13 @@ imagePullSecrets:
   - name: {{ .name }}
 {{- end }}
 {{- end }}
+{{- end }}
+
+{{/*
+A host env value from a chart value that may be a bare number. A YAML number
+arrives as a float64 and would print as `2.68435456e+08`, which the host
+cannot parse, so numbers render as integers and anything else as is.
+*/}}
+{{- define "runtime-operator.envNumber" -}}
+{{- if or (kindIs "int64" .) (kindIs "float64" .) }}{{ int64 . }}{{ else }}{{ . }}{{ end }}
 {{- end }}

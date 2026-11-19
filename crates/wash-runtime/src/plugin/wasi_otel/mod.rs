@@ -18,7 +18,8 @@ use opentelemetry_sdk::logs::{BatchLogProcessor, SdkLoggerProvider};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SpanData;
 use opentelemetry_sdk::trace::{BatchSpanProcessor, SpanProcessor};
-use std::collections::HashSet;
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
@@ -201,6 +202,99 @@ fn component_resource(
         .build()
 }
 
+/// One running total a guest instance reports.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CumulativeSeries {
+    scope: String,
+    name: String,
+    attributes: Vec<(String, String)>,
+}
+
+/// How many series one guest instance can have the host remember. The guest
+/// picks the names and attributes, so a guest could otherwise grow this forever.
+const MAX_CUMULATIVE_SERIES: usize = 4_096;
+
+/// How many bytes of series names and attributes one guest instance can have
+/// the host remember. The series limit alone leaves each key's size unbounded.
+const MAX_CUMULATIVE_BYTES: usize = 1 << 20;
+
+impl CumulativeSeries {
+    fn bytes(&self) -> usize {
+        self.scope.len()
+            + self.name.len()
+            + self
+                .attributes
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .sum::<usize>()
+    }
+}
+
+/// The last total each series reported, kept per guest instance on its store,
+/// so the totals last exactly as long as the instance reporting them.
+#[derive(Debug, Default)]
+pub(crate) struct CumulativeTotals {
+    series: BTreeMap<CumulativeSeries, ((u64, u32), f64)>,
+    bytes: usize,
+    warned_full: bool,
+}
+
+impl CumulativeTotals {
+    /// What to add to the host's instrument for `counter`, whose SDK treats
+    /// every `add` as an increment: a delta as it is, a total as its growth.
+    /// An up-down total always adds its change, so a restarted series replaces
+    /// its old level instead of stacking on it.
+    /// `None` for a non-finite value, or a new series past the limits: it has
+    /// no remembered total, so adding its total on every export would count it
+    /// repeatedly.
+    fn increment(&mut self, counter: &convert::CounterValue) -> Option<f64> {
+        if !counter.value.is_finite() {
+            return None;
+        }
+        let Some(start) = counter.series_start else {
+            return Some(counter.value);
+        };
+        let mut attributes = counter.attributes.clone();
+        attributes.sort();
+        let series = CumulativeSeries {
+            scope: counter.scope.clone(),
+            name: counter.name.clone(),
+            attributes,
+        };
+        let bytes = series.bytes();
+        let fits = self.series.len() < MAX_CUMULATIVE_SERIES
+            && self.bytes.saturating_add(bytes) <= MAX_CUMULATIVE_BYTES;
+        match self.series.entry(series) {
+            Entry::Occupied(mut last) => {
+                let (last_start, last_total) = last.insert((start, counter.value));
+                let growth = counter.value - last_total;
+                if counter.is_monotonic && (last_start != start || growth < 0.0) {
+                    Some(counter.value)
+                } else {
+                    Some(growth)
+                }
+            }
+            Entry::Vacant(slot) if fits => {
+                slot.insert((start, counter.value));
+                self.bytes += bytes;
+                Some(counter.value)
+            }
+            Entry::Vacant(slot) => {
+                if !self.warned_full {
+                    self.warned_full = true;
+                    tracing::warn!(
+                        metric = %slot.key().name.chars().take(128).collect::<String>(),
+                        series_limit = MAX_CUMULATIVE_SERIES,
+                        bytes_limit = MAX_CUMULATIVE_BYTES,
+                        "a guest instance reported too many cumulative metric series; dropping new ones"
+                    );
+                }
+                None
+            }
+        }
+    }
+}
+
 fn current_outer_span_context() -> SpanContext {
     tracing::Span::current()
         .context()
@@ -339,19 +433,19 @@ impl HostPlugin for WasiOtel {
     ) -> anyhow::Result<()> {
         // Add all wasi:otel interfaces to linker
         bindings::wasi::otel::types::add_to_linker::<_, SharedCtx>(
-            component_handle.linker(),
+            component_handle.linker()?,
             extract_active_ctx,
         )?;
         bindings::wasi::otel::tracing::add_to_linker::<_, SharedCtx>(
-            component_handle.linker(),
+            component_handle.linker()?,
             extract_active_ctx,
         )?;
         bindings::wasi::otel::metrics::add_to_linker::<_, SharedCtx>(
-            component_handle.linker(),
+            component_handle.linker()?,
             extract_active_ctx,
         )?;
         bindings::wasi::otel::logs::add_to_linker::<_, SharedCtx>(
-            component_handle.linker(),
+            component_handle.linker()?,
             extract_active_ctx,
         )?;
 
@@ -381,7 +475,7 @@ impl HostPlugin for WasiOtel {
             .await
             .add_component(component_handle, context);
 
-        tracing::info!(
+        tracing::debug!(
             component_id = component_handle.id(),
             "WASI OTel interfaces bound to component"
         );
@@ -404,7 +498,7 @@ impl HostPlugin for WasiOtel {
                 },
             )
             .await;
-        tracing::info!(workload_id, "WASI OTel unbound from workload");
+        tracing::debug!(workload_id, "WASI OTel unbound from workload");
         Ok(())
     }
 
@@ -445,7 +539,14 @@ impl<'a> bindings::wasi::otel::logs::Host for ActiveCtx<'a> {
         &mut self,
         data: bindings::wasi::otel::logs::LogRecord,
     ) -> wasmtime::Result<()> {
-        tracing::info!(?data, "emitting log record");
+        // Guest warnings and errors stay visible in the host log even with no
+        // OTel logs exporter; lower severities are per-request noise. The
+        // ranges match the severity mapping in `convert_wasi_log_record`.
+        match data.severity_number {
+            Some(17..=24) => tracing::error!(?data, "emitting log record"),
+            Some(13..=16) => tracing::warn!(?data, "emitting log record"),
+            _ => tracing::debug!(?data, "emitting log record"),
+        }
         if let Ok(plugin) = self.ctx.try_get_plugin::<WasiOtel>(WASI_OTEL_ID) {
             let service_name = plugin.config.service_name.clone();
             let provider = plugin.logger_provider.read().await;
@@ -468,14 +569,17 @@ impl<'a> bindings::wasi::otel::metrics::Host for ActiveCtx<'a> {
         resource_metrics: bindings::wasi::otel::metrics::ResourceMetrics,
     ) -> wasmtime::Result<Result<(), bindings::wasi::otel::metrics::Error>> {
         if let Ok(plugin) = self.ctx.try_get_plugin::<WasiOtel>(WASI_OTEL_ID) {
-            // Summarize incoming metrics for logging
-            let summary = summarize_resource_metrics(&resource_metrics);
-            tracing::info!(
-                total_scopes = summary.total_scopes,
-                total_metrics = summary.total_metrics,
-                metric_names = ?summary.metric_names,
-                "Processing WASI resource metrics"
-            );
+            // The summary formats a string per metric, so it is built only when
+            // something will print it; this runs on every guest export.
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let summary = summarize_resource_metrics(&resource_metrics);
+                tracing::debug!(
+                    total_scopes = summary.total_scopes,
+                    total_metrics = summary.total_metrics,
+                    metric_names = ?summary.metric_names,
+                    "Processing WASI resource metrics"
+                );
+            }
 
             // Get the meter provider to record values
             let provider_guard = plugin.meter_provider.read().await;
@@ -494,18 +598,21 @@ impl<'a> bindings::wasi::otel::metrics::Host for ActiveCtx<'a> {
                 }
 
                 // Record counter values
-                for (name, value, is_monotonic, attrs) in extract_counter_values(&resource_metrics)
-                {
-                    let kv_attrs: Vec<KeyValue> = attrs
+                for counter in extract_counter_values(&resource_metrics) {
+                    let Some(increment) = self.ctx.cumulative_totals.increment(&counter) else {
+                        continue;
+                    };
+                    let kv_attrs: Vec<KeyValue> = counter
+                        .attributes
                         .into_iter()
                         .map(|(k, v)| KeyValue::new(k, v))
                         .collect();
-                    if is_monotonic {
-                        let counter = meter.f64_counter(name).build();
-                        counter.add(value, &kv_attrs);
+                    if counter.is_monotonic {
+                        let instrument = meter.f64_counter(counter.name).build();
+                        instrument.add(increment, &kv_attrs);
                     } else {
-                        let up_down = meter.f64_up_down_counter(name).build();
-                        up_down.add(value, &kv_attrs);
+                        let instrument = meter.f64_up_down_counter(counter.name).build();
+                        instrument.add(increment, &kv_attrs);
                     }
                 }
 
@@ -515,8 +622,12 @@ impl<'a> bindings::wasi::otel::metrics::Host for ActiveCtx<'a> {
                     return Ok(Err(format!("Failed to flush metrics: {e}")));
                 }
 
-                tracing::info!(
-                    total_metrics = summary.total_metrics,
+                tracing::debug!(
+                    total_metrics = resource_metrics
+                        .scope_metrics
+                        .iter()
+                        .map(|scope| scope.metrics.len())
+                        .sum::<usize>(),
                     "Successfully processed WASI metrics"
                 );
             } else {
@@ -536,7 +647,7 @@ impl<'a> bindings::wasi::otel::tracing::Host for ActiveCtx<'a> {
         span_context: bindings::wasi::otel::tracing::SpanContext,
     ) -> wasmtime::Result<()> {
         // Log the span start - the actual span is managed by the guest
-        tracing::info!(
+        tracing::debug!(
             trace_id = %span_context.trace_id,
             span_id = %span_context.span_id,
             is_remote = span_context.is_remote,
@@ -556,19 +667,23 @@ impl<'a> bindings::wasi::otel::tracing::Host for ActiveCtx<'a> {
             {
                 return Ok(());
             }
-            let summary = summarize_span_data(&span_data);
-            tracing::info!(
-                name = %summary.name,
-                trace_id = %summary.trace_id,
-                span_id = %summary.span_id,
-                parent_span_id = %summary.parent_span_id,
-                kind = %summary.kind,
-                status = %summary.status,
-                attribute_count = summary.attribute_count,
-                event_count = summary.event_count,
-                link_count = summary.link_count,
-                "Processing WASI span end"
-            );
+            // The summary clones the span's names and IDs, so it is built only
+            // when something will print it; this runs on every guest span.
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let summary = summarize_span_data(&span_data);
+                tracing::debug!(
+                    name = %summary.name,
+                    trace_id = %summary.trace_id,
+                    span_id = %summary.span_id,
+                    parent_span_id = %summary.parent_span_id,
+                    kind = %summary.kind,
+                    status = %summary.status,
+                    attribute_count = summary.attribute_count,
+                    event_count = summary.event_count,
+                    link_count = summary.link_count,
+                    "Processing WASI span end"
+                );
+            }
 
             let tracker = plugin.tracker.read().await;
             if let Some(component) = tracker.get_component_data(self.component_id.as_ref()) {
@@ -605,6 +720,7 @@ impl<T: Send> bindings::wasi::otel::tracing::HostWithStore<T> for SharedCtx {
 impl<'a> bindings::wasi::otel::types::Host for ActiveCtx<'a> {}
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use std::borrow::Cow;
     use std::sync::Mutex;
@@ -1087,3 +1203,7 @@ mod tests {
         context.shutdown();
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod contract_tests;

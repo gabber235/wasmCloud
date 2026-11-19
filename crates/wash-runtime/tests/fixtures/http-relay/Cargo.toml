@@ -1,0 +1,12 @@
+[package]
+name = "http-relay"
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+futures = { workspace = true, features = ["alloc"] }
+wstd = { workspace = true }

@@ -1,0 +1,305 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://raw.githubusercontent.com/wasmCloud/wasmCloud/main/vex/wasmcloud.openvex.json",
+  "author": "https://github.com/wasmCloud/wasmCloud/blob/main/SECURITY.md#security-team-membership",
+  "role": "Document Creator",
+  "timestamp": "2026-11-05T17:15:37Z",
+  "version": 4,
+  "statements": [
+    {
+      "vulnerability": {
+        "@id": "https://rustsec.org/advisories/RUSTSEC-2026-0391.html",
+        "name": "RUSTSEC-2026-0391"
+      },
+      "products": [
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-x86_64-unknown-linux-gnu",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd@0.13.4"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-aarch64-unknown-linux-gnu",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd@0.13.4"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-s390x-unknown-linux-gnu",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd@0.13.4"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-x86_64-unknown-linux-musl",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd@0.13.4"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-aarch64-unknown-linux-musl",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd@0.13.4"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-x86_64-apple-darwin",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd@0.13.4"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-aarch64-apple-darwin",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd@0.13.4"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-x86_64-pc-windows-msvc",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd@0.13.4"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-x86_64-pc-windows-msvc.zip",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd@0.13.4"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:oci/wash@2.12.2?repository_url=ghcr.io%2Fwasmcloud%2Fwash",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd@0.13.4"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:oci/wash@2.12.2-all-features?repository_url=ghcr.io%2Fwasmcloud%2Fwash",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd@0.13.4"
+            }
+          ]
+        }
+      ],
+      "status": "fixed",
+      "status_notes": "Fixed in v2.12.2 by a dependency update; the v2.12.2 Cargo.lock has zstd@0.13.4. The v2.12.1 release assets keep the earlier assessment."
+    },
+    {
+      "vulnerability": {
+        "@id": "https://rustsec.org/advisories/RUSTSEC-2026-0398.html",
+        "name": "RUSTSEC-2026-0398"
+      },
+      "products": [
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-x86_64-unknown-linux-gnu",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-aarch64-unknown-linux-gnu",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-s390x-unknown-linux-gnu",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-x86_64-unknown-linux-musl",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-aarch64-unknown-linux-musl",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-x86_64-apple-darwin",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-aarch64-apple-darwin",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-x86_64-pc-windows-msvc",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-x86_64-pc-windows-msvc.zip",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:oci/wash@2.12.2?repository_url=ghcr.io%2Fwasmcloud%2Fwash",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:oci/wash@2.12.2-all-features?repository_url=ghcr.io%2Fwasmcloud%2Fwash",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        }
+      ],
+      "status": "fixed",
+      "status_notes": "Fixed in v2.12.2 by a dependency update; the v2.12.2 Cargo.lock has zstd-safe@7.4.0. The v2.12.1 release assets keep the earlier assessment."
+    },
+    {
+      "vulnerability": {
+        "@id": "https://rustsec.org/advisories/RUSTSEC-2026-0403.html",
+        "name": "RUSTSEC-2026-0403"
+      },
+      "products": [
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-x86_64-unknown-linux-gnu",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-aarch64-unknown-linux-gnu",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-s390x-unknown-linux-gnu",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-x86_64-unknown-linux-musl",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-aarch64-unknown-linux-musl",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-x86_64-apple-darwin",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-aarch64-apple-darwin",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-x86_64-pc-windows-msvc",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:github/wasmcloud/wasmcloud@v2.12.2?file_name=wash-x86_64-pc-windows-msvc.zip",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:oci/wash@2.12.2?repository_url=ghcr.io%2Fwasmcloud%2Fwash",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        },
+        {
+          "@id": "pkg:oci/wash@2.12.2-all-features?repository_url=ghcr.io%2Fwasmcloud%2Fwash",
+          "subcomponents": [
+            {
+              "@id": "pkg:cargo/zstd-safe@7.4.0"
+            }
+          ]
+        }
+      ],
+      "status": "fixed",
+      "status_notes": "Fixed in v2.12.2 by a dependency update; the v2.12.2 Cargo.lock has zstd-safe@7.4.0. The v2.12.1 release assets keep the earlier assessment."
+    }
+  ],
+  "last_updated": "2026-11-17T16:04:47Z"
+}

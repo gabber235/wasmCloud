@@ -142,6 +142,21 @@ impl HostPlugin for MultiplexedMessaging {
         MULTIPLEXED_MESSAGING_ID
     }
 
+    /// Retains the declared ceiling; each bind checks its backend's url
+    /// against it before a connection is opened or reused.
+    fn configure_egress_policy(
+        &self,
+        policy: Arc<crate::plugin::PluginEgressPolicy>,
+    ) -> anyhow::Result<()> {
+        self.mux.configure_egress_policy(policy)
+    }
+
+    fn binding_schema(&self) -> crate::plugin::BindingSchema {
+        crate::plugin::multiplex::backend_binding_schema(
+            crate::plugin::multiplex::MESSAGING_HOST_OWNED_KEYS,
+        )
+    }
+
     fn world(&self) -> WitWorld {
         WitWorld {
             imports: HashSet::from([WitInterface::from(
@@ -166,7 +181,7 @@ impl HostPlugin for MultiplexedMessaging {
 
         let registry = self.build_registry(interfaces.iter()).await?;
         let component = item.component().clone();
-        let linker = item.linker();
+        let linker = item.linker()?;
 
         // `types` carries only record definitions; bind it via the regular
         // path (no per-import routing needed).
@@ -185,11 +200,12 @@ impl HostPlugin for MultiplexedMessaging {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
     fn msg_iface(name: Option<&str>, backend: Option<&str>) -> WitInterface {
-        let mut config = HashMap::new();
+        let mut config = crate::wit::Config::new();
         if let Some(b) = backend {
             config.insert("backend".to_string(), b.to_string());
         }

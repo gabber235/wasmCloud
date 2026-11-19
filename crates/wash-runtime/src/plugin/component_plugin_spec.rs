@@ -60,6 +60,12 @@ pub struct ComponentPluginSpec {
     /// grants concrete addresses the plugin may bind itself. `publish` is
     /// rejected until host-component port splicing is implemented.
     pub ports: Arc<[crate::host::declared_port::DeclaredPort]>,
+    /// Named volumes the plugin's `volume_mounts` can use, as a workload
+    /// declares them. Only host-path volumes are supported for now.
+    pub volumes: Arc<[crate::types::Volume]>,
+    /// Where the plugin sees each volume. Empty (the default) gives the plugin
+    /// no filesystem.
+    pub volume_mounts: Arc<[crate::types::VolumeMount]>,
 }
 
 impl ComponentPluginSpec {
@@ -76,8 +82,75 @@ impl ComponentPluginSpec {
             allowed_ip_name_lookups: Arc::from([]),
             allowed_host_loopback_ports: Arc::from([]),
             ports: Arc::from([]),
+            volumes: Arc::from([]),
+            volume_mounts: Arc::from([]),
         }
     }
+}
+
+/// The directory a plugin volume names. Host component plugins take only
+/// `hostPath` volumes.
+pub(crate) fn plugin_host_path<'a>(
+    volume: &'a crate::types::Volume,
+    owner: &str,
+) -> anyhow::Result<&'a str> {
+    match &volume.volume_type {
+        crate::types::VolumeType::HostPath(host_path) => Ok(&host_path.local_path),
+        crate::types::VolumeType::EmptyDir(_) => bail!(
+            "{owner}: volume '{}' is an emptyDir, which host component plugins do not support yet",
+            volume.name
+        ),
+    }
+}
+
+/// Check a plugin's volumes and volume mounts without touching the host
+/// filesystem: every volume has a unique, non-empty name and is a `hostPath`,
+/// every mount names a declared volume at an absolute path with no `.` or `..`
+/// segment, and no two mounts share a path. `owner` starts each error, so it
+/// can name the config entry the plugin came from.
+///
+/// The loader checks the same rules before it opens any directory, so a
+/// config validated here fails the same way at load.
+///
+/// # Errors
+///
+/// The first problem found.
+pub fn validate_plugin_volumes(
+    volumes: &[crate::types::Volume],
+    volume_mounts: &[crate::types::VolumeMount],
+    owner: &str,
+) -> anyhow::Result<()> {
+    let mut names = std::collections::HashSet::with_capacity(volumes.len());
+    for volume in volumes {
+        let name = volume.name.as_str();
+        ensure!(!name.is_empty(), "{owner}: a volume has an empty name");
+        ensure!(
+            names.insert(name),
+            "{owner}: two volumes are named '{name}'"
+        );
+        plugin_host_path(volume, owner)?;
+    }
+
+    let mut mount_paths = std::collections::HashSet::with_capacity(volume_mounts.len());
+    for mount in volume_mounts {
+        ensure!(
+            names.contains(mount.name.as_str()),
+            "{owner}: a volumeMount names volume '{}', which the plugin does not declare",
+            mount.name
+        );
+        let mount_path =
+            crate::engine::volumes::normalize_mount_path(&mount.mount_path).map_err(|why| {
+                anyhow!(
+                    "{owner}: volumeMount mountPath {:?} {why}",
+                    mount.mount_path
+                )
+            })?;
+        ensure!(
+            mount_paths.insert(mount_path.clone()),
+            "{owner}: two volumeMounts mount at {mount_path:?}"
+        );
+    }
+    Ok(())
 }
 
 /// Parse a `wash host --host-plugin` value: a comma-separated list of
@@ -130,7 +203,13 @@ impl FromStr for ComponentPluginSpec {
                 // does go rather than reporting it as an unknown field.
                 "port" | "ports" => bail!(
                     "host plugin ports cannot be declared on --host-plugin; put them under \
-                     `host.hostPlugins[].ports` in the `wash host` config file"
+                     `host.plugins[].ports` in the `wash host` config file"
+                ),
+                // Same reason as ports: a volume is a record, and the comma is
+                // already taken.
+                "volume" | "volumes" | "volume-mount" | "volumeMounts" => bail!(
+                    "host plugin volumes cannot be declared on --host-plugin; put them under \
+                     `host.plugins[].volumes` and `volumeMounts` in the `wash host` config file"
                 ),
                 other => bail!(
                     "unknown host plugin field {other:?}; expected id|image|file|pull|max-restarts|digest"
@@ -152,11 +231,14 @@ impl FromStr for ComponentPluginSpec {
             allowed_ip_name_lookups: Arc::from([]),
             allowed_host_loopback_ports: Arc::from([]),
             ports: Arc::from([]),
+            volumes: Arc::from([]),
+            volume_mounts: Arc::from([]),
         })
     }
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::oci::OciPullPolicy;
@@ -196,7 +278,16 @@ mod tests {
             .parse::<ComponentPluginSpec>()
             .unwrap_err()
             .to_string();
-        assert!(err.contains("host.hostPlugins[].ports"), "got: {err}");
+        assert!(err.contains("host.plugins[].ports"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_volumes_on_the_flag_and_says_where_they_go() {
+        let err = "id=kv,file=./kv.wasm,volume=./models"
+            .parse::<ComponentPluginSpec>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("host.plugins[].volumes"), "got: {err}");
     }
 
     #[test]

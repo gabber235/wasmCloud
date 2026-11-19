@@ -39,6 +39,9 @@ jobs:
               - 'buf.gen.yaml'
               - 'runtime-operator/buf.yaml'
               - 'runtime-operator/buf.gen.yaml'
+              # buf generate cleans this tree, so a hand-written file
+              # here is deleted on regeneration and fails check-generated.
+              - 'runtime-operator/pkg/rpc/**'
               - '.github/workflows/proto.yml'
               # The Rust bindings under crates/wash-runtime are committed
               # output of `cargo xtask generate-protos`, so anything that
@@ -65,7 +68,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1.5.0
+      - uses: bufbuild/buf-action@37ac33d8960807670a6e9719080e885197b09cc6 # v1.7.0
         with:
           setup_only: false
 
@@ -80,14 +83,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1.5.0
+      - uses: bufbuild/buf-action@37ac33d8960807670a6e9719080e885197b09cc6 # v1.7.0
         with:
           setup_only: true
       - name: Generate protobuf definitions
         run: |
           buf generate
       - name: "Verify no protobuf changes"
-        uses: ./.github/actions/no-diff
+        uses: $/.github/actions/no-diff
         with:
           fixup-command: "buf generate"
 
@@ -112,13 +115,13 @@ jobs:
         with:
           persist-credentials: false
       - name: Setup protoc
-        uses: ./.github/actions/setup-protoc
+        uses: $/.github/actions/setup-protoc
       - name: Setup Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
       - name: Regenerate protobuf bindings
         run: cargo xtask generate-protos
       - name: "Verify no protobuf changes"
-        uses: ./.github/actions/no-diff
+        uses: $/.github/actions/no-diff
         with:
           fixup-command: "cargo xtask generate-protos"
 

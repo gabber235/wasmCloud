@@ -3,14 +3,18 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"go.wasmcloud.dev/runtime-operator/v2/api/condition"
 	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/v2/api/runtime/v1alpha1"
@@ -47,6 +51,7 @@ func readyDeployment(prevSetName string) *runtimev1alpha1.WorkloadDeployment {
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: testNamespace,
 			Name:      testDeploymentName,
+			UID:       "wd-uid",
 		},
 		Spec: runtimev1alpha1.WorkloadDeploymentSpec{
 			WorkloadReplicaSetSpec: runtimev1alpha1.WorkloadReplicaSetSpec{
@@ -115,8 +120,8 @@ func availableReplicaSet(name string) *runtimev1alpha1.WorkloadReplicaSet {
 // unavailableReplicaSet returns an RS that has been reconciled at least once
 // but whose workloads are not yet running (Status.Replicas reports
 // Unavailable, Ready condition is absent).
-func unavailableReplicaSet(name string) *runtimev1alpha1.WorkloadReplicaSet {
-	rs := baseReplicaSet(name)
+func unavailableReplicaSet() *runtimev1alpha1.WorkloadReplicaSet {
+	rs := baseReplicaSet(testReplicaSetName)
 	rs.Status.Replicas = &runtimev1alpha1.ReplicaSetStatus{
 		Expected:    testReplicas,
 		Current:     testReplicas,
@@ -138,6 +143,13 @@ func ptrTrue() *bool { b := true; return &b }
 
 func newScaleReconciler(t *testing.T, objs ...client.Object) *WorkloadDeploymentReconciler {
 	t.Helper()
+	return newScaleReconcilerWith(t, interceptor.Funcs{}, objs...)
+}
+
+// newScaleReconcilerWith is newScaleReconciler with funcs intercepting its
+// client's calls.
+func newScaleReconcilerWith(t *testing.T, funcs interceptor.Funcs, objs ...client.Object) *WorkloadDeploymentReconciler {
+	t.Helper()
 	s := newScaleTestScheme(t)
 
 	// Mirror SetupWithManager's index, reconcileScale's List() call uses
@@ -150,16 +162,81 @@ func newScaleReconciler(t *testing.T, objs ...client.Object) *WorkloadDeployment
 	c := fake.NewClientBuilder().
 		WithScheme(s).
 		WithObjects(objs...).
-		WithIndex(&runtimev1alpha1.WorkloadReplicaSet{}, workloadDeploymentNameIndex,
+		WithIndex(&runtimev1alpha1.WorkloadReplicaSet{}, workloadDeploymentOwnerIndex,
 			func(obj client.Object) []string {
-				if name, ok := isOwnedByController(obj, deploymentGvk); ok {
-					return []string{name}
+				if ownerUID, ok := controllerUID(obj, deploymentGvk); ok {
+					return []string{ownerUID}
 				}
 				return nil
 			}).
+		WithInterceptorFuncs(funcs).
 		Build()
 
 	return &WorkloadDeploymentReconciler{Client: c, Scheme: s}
+}
+
+// Deleting and re-applying a Deployment reuses its name. The old ReplicaSets
+// are the garbage collector's to remove, and their replicas aren't this one's.
+func TestReconcileScale_PredecessorReplicaSetIsNotCounted(t *testing.T) {
+	wd := readyDeployment("")
+	old := availableReplicaSet("predecessor-rs")
+	old.OwnerReferences[0].UID = "deleted-wd-uid"
+	r := newScaleReconciler(t, wd, availableReplicaSet(testReplicaSetName), old)
+
+	if err := r.reconcileScale(context.Background(), wd); err != nil {
+		t.Fatalf("reconcileScale: %v", err)
+	}
+	if wd.Status.Replicas.Current != testReplicas {
+		t.Fatalf("expected only this Deployment's replicas counted, got %d", wd.Status.Replicas.Current)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(old), &runtimev1alpha1.WorkloadReplicaSet{}); err != nil {
+		t.Fatalf("expected the old ReplicaSet left for the garbage collector: %v", err)
+	}
+}
+
+// A Deployment being deleted starts and removes nothing: its ReplicaSets are the
+// garbage collector's, and --cascade=orphan means to keep them. Its status still
+// follows what is left, and it stops being Ready as the delete starts.
+func TestDeployment_DeleteChangesNothing(t *testing.T) {
+	wd := readyDeployment("")
+	now := metav1.Now()
+	wd.DeletionTimestamp = &now
+	wd.Finalizers = []string{metav1.FinalizerDeleteDependents}
+	// Sync is not True once the current ReplicaSet is gone, which is what makes
+	// reconcileDeploy want a new one.
+	wd.Status.SetConditions(condition.UnknownCondition(runtimev1alpha1.WorkloadDeploymentConditionSync, "Reconcile", "current ReplicaSet not found"))
+	wd.Status.SetConditions(condition.ReadyCondition(runtimev1alpha1.WorkloadDeploymentConditionArtifact))
+	other := availableReplicaSet("older-rs")
+	r := newScaleReconciler(t, wd, other)
+	ctx := context.Background()
+
+	if err := r.reconcileDeploy(ctx, wd); !errors.Is(err, condition.ErrNoop()) {
+		t.Fatalf("reconcileDeploy: expected a no-op, got %v", err)
+	}
+	if err := r.reconcileScale(ctx, wd); !errors.Is(err, condition.ErrNoop()) {
+		t.Fatalf("reconcileScale: expected a no-op, got %v", err)
+	}
+
+	replicaSets := &runtimev1alpha1.WorkloadReplicaSetList{}
+	if err := r.List(ctx, replicaSets); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(replicaSets.Items) != 1 || replicaSets.Items[0].Name != other.Name {
+		t.Fatalf("expected the ReplicaSets unchanged, got %d", len(replicaSets.Items))
+	}
+	if wd.Status.Replicas == nil || wd.Status.Replicas.Current != testReplicas {
+		t.Fatalf("expected the status to follow what is left, got %+v", wd.Status.Replicas)
+	}
+
+	// Everything else may still read as fine at the start of a delete.
+	wd.Status.SetConditions(
+		condition.ReadyCondition(runtimev1alpha1.WorkloadDeploymentConditionSync),
+		condition.ReadyCondition(runtimev1alpha1.WorkloadDeploymentConditionDeploy),
+		condition.ReadyCondition(runtimev1alpha1.WorkloadDeploymentConditionScale),
+	)
+	if err := r.reconcileReady(ctx, wd); !condition.IsStatusUnknown(err) {
+		t.Fatalf("reconcileReady: expected Unknown, got %v", err)
+	}
 }
 
 // Regression coverage for reconcileScale used to return nil on a fresh
@@ -173,7 +250,7 @@ func TestReconcileScale_FreshDeploy_RSNotAvailable_ReturnsUnknown(t *testing.T) 
 	// the underlying Workload was still unplaced. Lock in that an RS
 	// with Unavailable=1 keeps reconcileScale in the Unknown path.
 	wd := readyDeployment("" /* no previous RS */)
-	rs := unavailableReplicaSet(testReplicaSetName)
+	rs := unavailableReplicaSet()
 	r := newScaleReconciler(t, wd, rs)
 
 	err := r.reconcileScale(context.Background(), wd)
@@ -251,7 +328,7 @@ func TestReconcileScale_RollingUpdate_CurrentNotAvailable_ReturnsUnknown(t *test
 	// running, causing the downtime that RollingUpdate is supposed to
 	// prevent.
 	wd := readyDeployment(testPrevSetName)
-	current := unavailableReplicaSet(testReplicaSetName)
+	current := unavailableReplicaSet()
 	prev := availableReplicaSet(testPrevSetName)
 	r := newScaleReconciler(t, wd, current, prev)
 
@@ -297,5 +374,278 @@ func TestReconcileScale_RollingUpdate_CurrentAvailable_DeletesPrev(t *testing.T)
 		client.ObjectKey{Namespace: testNamespace, Name: testPrevSetName}, got)
 	if !apierrors.IsNotFound(getErr) {
 		t.Fatalf("expected previous ReplicaSet to be deleted (NotFound), got err=%v obj=%+v", getErr, got)
+	}
+}
+
+// A current ReplicaSet that cannot scale up never becomes available, so its
+// reason lands on the deployment's Scale and Ready conditions.
+func TestDeploymentConditionsCarryReplicaSetFailure(t *testing.T) {
+	wd := readyDeployment("")
+	rs := unavailableReplicaSet()
+	rs.Status.SetConditions(condition.ErrorCondition(runtimev1alpha1.WorkloadReplicaSetConditionScaleUp,
+		"Reconcile", errors.New("creating Workload: denied by policy require-team-label")))
+	r := newScaleReconciler(t, wd, rs)
+
+	err := r.reconcileScale(context.Background(), wd)
+	if err == nil || condition.IsStatusUnknown(err) || !strings.Contains(err.Error(), "require-team-label") {
+		t.Fatalf("scale = %v, want a failure carrying the ReplicaSet's ScaleUp message", err)
+	}
+
+	wd.Status.SetConditions(
+		condition.ReadyCondition(runtimev1alpha1.WorkloadDeploymentConditionArtifact),
+		condition.ErrorCondition(runtimev1alpha1.WorkloadDeploymentConditionScale, "Reconcile", err),
+	)
+	// Ready stays Unknown, since a failing Sync is a normal rollout step, but
+	// says which condition is holding it and why.
+	ready := r.reconcileReady(context.Background(), wd)
+	if !condition.IsStatusUnknown(ready) || !strings.Contains(ready.Error(), "require-team-label") {
+		t.Fatalf("ready = %v, want Unknown carrying the Scale message", ready)
+	}
+}
+
+// A refused WorkloadReplicaSet create is recorded on the deployment.
+func TestDeployRecordsRefusedReplicaSetCreate(t *testing.T) {
+	wd := readyDeployment("")
+	wd.Status.CurrentReplicaSet = nil
+	wd.Status.SetConditions(
+		condition.ReadyCondition(runtimev1alpha1.WorkloadDeploymentConditionArtifact),
+		condition.UnknownCondition(runtimev1alpha1.WorkloadDeploymentConditionSync, "Reconcile", "no Active Replicas"),
+	)
+	s := newScaleTestScheme(t)
+	recorder := events.NewFakeRecorder(4)
+	r := &WorkloadDeploymentReconciler{
+		Client:   fake.NewClientBuilder().WithScheme(s).WithObjects(wd).WithInterceptorFuncs(refuseCreates).Build(),
+		Scheme:   s,
+		Recorder: recorder,
+	}
+
+	if err := r.reconcileDeploy(context.Background(), wd); err == nil || !strings.Contains(err.Error(), "require-team-label") {
+		t.Fatalf("deploy = %v, want the refusal", err)
+	}
+	got := drainEvents(recorder)
+	if len(got) != 1 || !strings.HasPrefix(got[0], "Warning FailedCreate") || !strings.Contains(got[0], "require-team-label") {
+		t.Fatalf("events = %q, want one FailedCreate carrying the refusal", got)
+	}
+}
+
+// A ReplicaSet's conditions count only when computed for its current spec: a
+// failure left by an older one, such as a replica count that a quota refused
+// before it was lowered, is not reported, nor is an older Ready trusted. Until
+// the ReplicaSet catches up, Scale keeps what it said, so it does not flicker.
+func TestDeploymentReadsOnlyCurrentReplicaSetConditions(t *testing.T) {
+	at := func(c condition.Condition, generation int64) condition.Condition {
+		c.ObservedGeneration = generation
+		return c
+	}
+	scaleUp := func(generation int64) condition.Condition {
+		return at(condition.ReadyCondition(runtimev1alpha1.WorkloadReplicaSetConditionScaleUp), generation)
+	}
+	scaleDown := func(generation int64) condition.Condition {
+		return at(condition.ReadyCondition(runtimev1alpha1.WorkloadReplicaSetConditionScaleDown), generation)
+	}
+	ready := func(generation int64) condition.Condition {
+		return at(condition.ReadyCondition(condition.TypeReady), generation)
+	}
+	for _, tc := range []struct {
+		name       string
+		conditions []condition.Condition
+		wantNoop   bool
+		wantFailed string
+	}{
+		{
+			name: "stale ScaleUp failure",
+			conditions: []condition.Condition{at(condition.ErrorCondition(runtimev1alpha1.WorkloadReplicaSetConditionScaleUp,
+				"Reconcile", errors.New("creating Workload: exceeded quota")), 1), scaleDown(1), ready(1)},
+			wantNoop: true,
+		},
+		{
+			name:       "stale Ready",
+			conditions: []condition.Condition{scaleUp(1), scaleDown(1), ready(1)},
+			wantNoop:   true,
+		},
+		{
+			// A failing ScaleUp ends each ReplicaSet pass, so the conditions
+			// after it can stay a generation behind for as long as it fails.
+			name: "current ScaleUp failure, stale Ready",
+			conditions: []condition.Condition{at(condition.ErrorCondition(runtimev1alpha1.WorkloadReplicaSetConditionScaleUp,
+				"Reconcile", errors.New("creating Workload: exceeded quota")), 2), scaleDown(1), ready(1)},
+			wantFailed: "exceeded quota",
+		},
+		{
+			name: "current ScaleDown failure",
+			conditions: []condition.Condition{scaleUp(2), at(condition.ErrorCondition(runtimev1alpha1.WorkloadReplicaSetConditionScaleDown,
+				"Reconcile", errors.New("deleting Workload: denied by policy")), 2), at(condition.UnknownCondition(condition.TypeReady, "Reconcile", "scaling"), 2)},
+			wantFailed: "denied by policy",
+		},
+	} {
+		wd := readyDeployment("")
+		rs := baseReplicaSet(testReplicaSetName)
+		rs.Generation = 2
+		rs.Status.SetConditions(tc.conditions...)
+		r := newScaleReconciler(t, wd, rs)
+
+		err := r.reconcileScale(context.Background(), wd)
+		switch {
+		case tc.wantNoop:
+			if !errors.Is(err, condition.ErrNoop()) {
+				t.Errorf("%s: scale = %v, want it left as it was", tc.name, err)
+			}
+		default:
+			if err == nil || condition.IsStatusUnknown(err) || !strings.Contains(err.Error(), tc.wantFailed) {
+				t.Errorf("%s: scale = %v, want a failure carrying %q", tc.name, err, tc.wantFailed)
+			}
+		}
+	}
+}
+
+// The current ReplicaSet is written only when the replica count differs, so a
+// refusing policy is not asked again, and recorded again, every reconcile.
+func TestScaleUpdatesReplicaSetOnlyOnChange(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		replicas   int32
+		wantUpdate bool
+	}{
+		{name: "unchanged", replicas: testReplicas},
+		{name: "changed", replicas: testReplicas + 1, wantUpdate: true},
+	} {
+		wd := readyDeployment("")
+		wd.Spec.Replicas = &tc.replicas
+		updates := 0
+		r := newScaleReconcilerWith(t, interceptor.Funcs{
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				updates++
+				return c.Update(ctx, obj, opts...)
+			},
+		}, wd, availableReplicaSet(testReplicaSetName))
+
+		_ = r.reconcileScale(context.Background(), wd)
+		if got := updates > 0; got != tc.wantUpdate {
+			t.Errorf("%s: updated = %v, want %v", tc.name, got, tc.wantUpdate)
+		}
+	}
+}
+
+func TestSyncConfirmsCacheMissWithAPIReader(t *testing.T) {
+	scheme := newScaleTestScheme(t)
+	for _, present := range []bool{false, true} {
+		t.Run(fmt.Sprintf("exists=%v", present), func(t *testing.T) {
+			wd := readyDeployment("")
+			wd.Status.SetConditions(condition.ReadyCondition(runtimev1alpha1.WorkloadDeploymentConditionArtifact))
+			cached := fake.NewClientBuilder().WithScheme(scheme).Build()
+			builder := fake.NewClientBuilder().WithScheme(scheme)
+			if present {
+				builder = builder.WithObjects(baseReplicaSet(testReplicaSetName))
+			}
+			r := &WorkloadDeploymentReconciler{Client: cached, APIReader: builder.Build(), Scheme: scheme}
+			err := r.reconcileSync(t.Context(), wd)
+			if present && err != nil {
+				t.Fatalf("existing ReplicaSet lost to cache lag: %v", err)
+			}
+			if !present && (err == nil || !condition.IsStatusUnknown(err)) {
+				t.Fatalf("missing ReplicaSet should still trigger recovery, got %v", err)
+			}
+		})
+	}
+}
+
+func TestDeploymentCreateIsIdempotentAcrossStatusWriteRetry(t *testing.T) {
+	original := readyDeployment("")
+	original.Status.CurrentReplicaSet = nil
+	original.Status.SetConditions(
+		condition.ReadyCondition(runtimev1alpha1.WorkloadDeploymentConditionArtifact),
+		condition.UnknownCondition(runtimev1alpha1.WorkloadDeploymentConditionSync, "Pending", "not deployed"),
+	)
+	r := newScaleReconciler(t)
+	for range 3 {
+		stale := original.DeepCopy()
+		if err := r.reconcileDeploy(t.Context(), stale); !errors.Is(err, condition.ErrSkipReconciliation()) {
+			t.Fatalf("retry rollout = %v", err)
+		}
+	}
+	sets := &runtimev1alpha1.WorkloadReplicaSetList{}
+	if err := r.List(t.Context(), sets); err != nil {
+		t.Fatal(err)
+	}
+	if len(sets.Items) != 1 {
+		t.Fatalf("created %d ReplicaSets for one rollout, want one", len(sets.Items))
+	}
+	set := &sets.Items[0]
+	set.OwnerReferences = nil
+	if err := r.Update(t.Context(), set); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.reconcileDeploy(t.Context(), original.DeepCopy()); err == nil ||
+		!strings.Contains(err.Error(), "different ownership or spec") {
+		t.Fatalf("unowned ReplicaSet adopted, got %v", err)
+	}
+}
+
+func TestDeploymentRecreatesCurrentReplicaSetWithoutRetiringIt(t *testing.T) {
+	wd := readyDeployment("")
+	wd.Status.SetConditions(
+		condition.ReadyCondition(runtimev1alpha1.WorkloadDeploymentConditionArtifact),
+		condition.UnknownCondition(runtimev1alpha1.WorkloadDeploymentConditionSync, "Pending", "not deployed"),
+	)
+	r := newScaleReconciler(t)
+	if err := r.reconcileDeploy(t.Context(), wd); !errors.Is(err, condition.ErrSkipReconciliation()) {
+		t.Fatalf("initial rollout = %v", err)
+	}
+	wd.Status.PreviousReplicaSet = nil
+	name := wd.Status.CurrentReplicaSet.Name
+	key := client.ObjectKey{Namespace: wd.Namespace, Name: name}
+	set := &runtimev1alpha1.WorkloadReplicaSet{}
+	if err := r.Get(t.Context(), key, set); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete(t.Context(), set); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.reconcileDeploy(t.Context(), wd); !errors.Is(err, condition.ErrSkipReconciliation()) {
+		t.Fatalf("recreate current set = %v", err)
+	}
+	if wd.Status.CurrentReplicaSet.Name != name || wd.Status.PreviousReplicaSet != nil {
+		t.Fatalf("recreated set should only be current: %+v", wd.Status)
+	}
+}
+
+func TestDeploymentRetirementPreservesCurrentAndUnownedSets(t *testing.T) {
+	for _, previousName := range []string{testReplicaSetName, testPrevSetName} {
+		t.Run(previousName, func(t *testing.T) {
+			wd := readyDeployment(previousName)
+			current := availableReplicaSet(testReplicaSetName)
+			unowned := availableReplicaSet(testPrevSetName)
+			unowned.OwnerReferences = nil
+			r := newScaleReconciler(t, wd, current, unowned)
+			if err := r.reconcileScale(t.Context(), wd); !errors.Is(err, condition.ErrSkipReconciliation()) {
+				t.Fatalf("scale = %v", err)
+			}
+			if wd.Status.PreviousReplicaSet != nil {
+				t.Fatal("obsolete status reference was kept")
+			}
+			for _, set := range []*runtimev1alpha1.WorkloadReplicaSet{current, unowned} {
+				if err := r.Get(t.Context(), client.ObjectKeyFromObject(set), &runtimev1alpha1.WorkloadReplicaSet{}); err != nil {
+					t.Fatalf("protected set %s: %v", set.Name, err)
+				}
+			}
+		})
+	}
+}
+
+func TestStaleDeploymentCannotRetireNewCurrentReplicaSet(t *testing.T) {
+	old := readyDeployment("")
+	old.ResourceVersion = "10"
+	fresh := old.DeepCopy()
+	fresh.ResourceVersion = "11"
+	fresh.Status.CurrentReplicaSet.Name = testPrevSetName
+	current := availableReplicaSet(testReplicaSetName)
+	newSet := availableReplicaSet(testPrevSetName)
+	r := newScaleReconciler(t, fresh, current, newSet)
+	r.APIReader = r.Client
+	if err := r.reconcileScale(t.Context(), old); !errors.Is(err, condition.ErrNoop()) {
+		t.Fatalf("stale scale = %v, want a retry", err)
+	}
+	if err := r.Get(t.Context(), client.ObjectKeyFromObject(newSet), &runtimev1alpha1.WorkloadReplicaSet{}); err != nil {
+		t.Fatalf("current set was retired: %v", err)
 	}
 }

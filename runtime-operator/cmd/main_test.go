@@ -1,75 +1,45 @@
 package main
 
 import (
-	"fmt"
-	"net"
+	"reflect"
 	"testing"
-	"time"
-
-	"github.com/nats-io/nats-server/v2/server"
-
-	"go.wasmcloud.dev/runtime-operator/v2/pkg/wasmbus"
 )
 
-// startNatsOnFreePort starts an embedded NATS server on an ephemeral port to
-// avoid contention with the fixed-port servers used by the pkg/wasmbus tests,
-// which may run in parallel.
-func startNatsOnFreePort(t *testing.T) (url string, stop func()) {
-	t.Helper()
-
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-
-	s, err := server.NewServer(&server.Options{
-		Host:   "127.0.0.1",
-		Port:   port,
-		NoLog:  true,
-		NoSigs: true,
-	})
-	if err != nil {
-		t.Fatalf("new nats server: %v", err)
-	}
-	s.Start()
-	if !s.ReadyForConnections(10 * time.Second) {
-		s.Shutdown()
-		t.Fatal("nats server did not become ready")
-	}
-
-	return fmt.Sprintf("nats://127.0.0.1:%d", port), func() {
-		s.Shutdown()
-		s.WaitForShutdown()
-	}
-}
-
-// TestNatsLivenessCheck verifies the operator's liveness reflects NATS
-// connectivity: healthy while connected, and unhealthy once the connection is
-// permanently closed so the kubelet restarts the pod.
-func TestNatsLivenessCheck(t *testing.T) {
-	url, stop := startNatsOnFreePort(t)
-	defer stop()
-
-	nc, err := wasmbus.NatsConnect(url)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer nc.Close()
-
-	check := natsLivenessCheck(nc)
-
-	if err := check(nil); err != nil {
-		t.Fatalf("expected healthy while connected, got: %v", err)
-	}
-
-	nc.Close()
-	deadline := time.Now().Add(5 * time.Second)
-	for !nc.IsClosed() && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if err := check(nil); err == nil {
-		t.Fatal("expected liveness to fail on a permanently closed nats connection")
+func TestNamespaceAndListFlags(t *testing.T) {
+	const (
+		firstNamespace  = "team-a"
+		secondNamespace = "team-b"
+	)
+	for _, tt := range []struct {
+		name, raw  string
+		list       []string
+		namespaces []string
+	}{
+		{name: "unset"},
+		{name: "empty entries", raw: " , \t,\n"},
+		{
+			name: "single namespace", raw: " team-a ",
+			list: []string{firstNamespace}, namespaces: []string{firstNamespace},
+		},
+		{
+			name: "trim and deduplicate", raw: " team-a,,team-b,team-a, ",
+			list:       []string{firstNamespace, secondNamespace, firstNamespace},
+			namespaces: []string{firstNamespace, secondNamespace},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := splitCSVList(tt.raw); !reflect.DeepEqual(got, tt.list) {
+				t.Fatalf("splitCSVList(%q) = %v, want %v", tt.raw, got, tt.list)
+			}
+			got := parseNamespaceSet(tt.raw)
+			if len(got) != len(tt.namespaces) || (got == nil) != (tt.namespaces == nil) {
+				t.Fatalf("parseNamespaceSet(%q) = %v, want %v", tt.raw, got, tt.namespaces)
+			}
+			for _, namespace := range tt.namespaces {
+				if _, ok := got[namespace]; !ok {
+					t.Errorf("namespace %q missing from %v", namespace, got)
+				}
+			}
+		})
 	}
 }

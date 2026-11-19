@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::str::FromStr;
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 use bigdecimal::num_traits::Float;
 use bit_vec::BitVec;
 use bytes::{BufMut, BytesMut};
@@ -28,7 +28,7 @@ use chrono::{
 use cidr::IpCidr;
 use geo_types::{LineString, Point, Rect, coord};
 use pg_bigdecimal::PgNumeric;
-use postgres_types::{FromSql, IsNull, PgLsn, ToSql, Type as PgType};
+use postgres_types::{FromSql, IsNull, Kind, PgLsn, ToSql, Type as PgType, WrongType};
 use tokio_postgres::Row;
 use uuid::Uuid;
 
@@ -60,28 +60,204 @@ fn rect_to_hashable_f64s(r: Rect<f64>) -> ((HashableF64, HashableF64), (Hashable
     )
 }
 
-/// Convert a [`LineString`] (expected to have exactly two points) into a tuple of `HashableF64` pairs
-fn linestring_to_hashable_f64s_tuple(
-    l: LineString<f64>,
-) -> anyhow::Result<((HashableF64, HashableF64), (HashableF64, HashableF64))> {
-    match linestring_to_hashable_f64s(l)[..] {
-        [start, end] => Ok((start, end)),
-        _ => bail!("unexpected number of points in line string"),
-    }
-}
-
-/// Convert a [`LineString`] into a vector of point pairs
-fn linestring_to_hashable_f64s(l: LineString<f64>) -> Vec<(HashableF64, HashableF64)> {
-    l.into_points()
-        .into_iter()
-        .map(point_to_hashable_f64s)
-        .collect::<Vec<_>>()
-}
-
 /// Convert a [`Point`] into two `HashableF64`s
 fn point_to_hashable_f64s(p: Point<f64>) -> (HashableF64, HashableF64) {
     let (x, y) = p.x_y();
     (x.integer_decode(), y.integer_decode())
+}
+
+/// A guest's open `path`, which Postgres refuses without a point.
+fn line_string(
+    points: &[(HashableF64, HashableF64)],
+) -> Result<LineString<f64>, Box<dyn Error + Sync + Send>> {
+    if points.is_empty() {
+        return Err("invalid path, no points specified".into());
+    }
+    Ok(points
+        .iter()
+        .map(|(x, y)| coord! { x: f64_from_tuple(x), y: f64_from_tuple(y) })
+        .collect())
+}
+
+/// A guest's `polygon`, which Postgres refuses without a point.
+fn polygon(
+    points: &[(HashableF64, HashableF64)],
+) -> Result<PgPolygon, Box<dyn Error + Sync + Send>> {
+    if points.is_empty() {
+        return Err("invalid polygon, no points specified".into());
+    }
+    Ok(PgPolygon(
+        points
+            .iter()
+            .map(|(x, y)| Point::<f64>::new(f64_from_tuple(x), f64_from_tuple(y)))
+            .collect(),
+    ))
+}
+
+/// Most digits a guest's `numeric` may carry: the largest precision a declared
+/// `numeric(p)` column holds. pg_bigdecimal's encoder is quadratic in digits,
+/// about 0.1 ms here but 2 s at an unconstrained column's 131072. A larger
+/// value can be bound as text and cast with `$1::text::numeric`.
+const MAX_NUMERIC_DIGITS: i64 = 1000;
+
+/// Longest `numeric` text parsed: the digits plus a sign, point and exponent.
+const MAX_NUMERIC_TEXT_LEN: usize = 1024;
+
+/// Parse a guest's `numeric` text for the encoder.
+///
+/// The encoder raises ten to the scale as a `u32`, so a negative scale (from
+/// text like `1e9`) would wrap to a power the host cannot compute. Such a value
+/// is rescaled to zero first.
+fn parse_numeric(s: &str) -> Result<PgNumeric, Box<dyn Error + Sync + Send>> {
+    if s.len() > MAX_NUMERIC_TEXT_LEN {
+        return Err(format!("numeric text is longer than {MAX_NUMERIC_TEXT_LEN} bytes").into());
+    }
+    let value = pg_bigdecimal::BigDecimal::parse_bytes(s.as_bytes(), 10)
+        .ok_or_else(|| format!("failed to parse numeric [{s}]"))?;
+    let (_, scale) = value.as_bigint_and_exponent();
+    let value = match scale {
+        0.. => value,
+        _ if scale < -MAX_NUMERIC_DIGITS => {
+            return Err(format!("numeric [{s}] has more than {MAX_NUMERIC_DIGITS} digits").into());
+        }
+        _ => value.with_scale(0),
+    };
+    Ok(PgNumeric::new(Some(value)))
+}
+
+/// A `polygon`: its point count, then each point. geo-types' `Polygon` is not
+/// encoded by postgres-types, and a `Vec<Point>` encodes as `point[]`.
+#[derive(Debug)]
+struct PgPolygon(Vec<Point<f64>>);
+
+impl ToSql for PgPolygon {
+    fn to_sql(
+        &self,
+        _: &PgType,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_i32(i32::try_from(self.0.len())?);
+        for point in &self.0 {
+            out.put_f64(point.x());
+            out.put_f64(point.y());
+        }
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &PgType) -> bool {
+        *ty == PgType::POLYGON
+    }
+
+    tokio_postgres::types::to_sql_checked!();
+}
+
+/// The points of a `polygon`, or of a `path` past its closed flag:
+/// a point count, then each point's `x` and `y`.
+///
+/// The count is checked against the bytes that follow before any room is made,
+/// so a value that overstates it is an error and not an allocation.
+fn counted_points(
+    ty: &PgType,
+    raw: &[u8],
+) -> Result<Vec<Point<f64>>, Box<dyn Error + Sync + Send>> {
+    let (count, points) = raw
+        .split_first_chunk::<4>()
+        .ok_or_else(|| format!("invalid {ty}, no point count"))?;
+    // A negative count matches no length.
+    let count = usize::try_from(i32::from_be_bytes(*count)).ok();
+    let (floats, rest) = points.as_chunks::<8>();
+    if !rest.is_empty() || count.and_then(|count| count.checked_mul(2)) != Some(floats.len()) {
+        return Err(format!("invalid {ty}, point count does not match its length").into());
+    }
+    Ok(floats
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[x, y]| Point::new(f64::from_be_bytes(*x), f64::from_be_bytes(*y)))
+        .collect())
+}
+
+impl FromSql<'_> for PgPolygon {
+    fn from_sql(ty: &PgType, raw: &[u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        counted_points(ty, raw).map(PgPolygon)
+    }
+
+    fn accepts(ty: &PgType) -> bool {
+        *ty == PgType::POLYGON
+    }
+}
+
+/// A `path` column: whether it is closed, which `pg-value` has no place for,
+/// then its points.
+///
+/// Not postgres-types' `LineString`, which makes room for as many points as
+/// the value says it holds before reading any:
+/// a negative count panics, and a large one aborts the host.
+struct PgPath(Vec<Point<f64>>);
+
+impl FromSql<'_> for PgPath {
+    fn from_sql(ty: &PgType, raw: &[u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        let (_closed, points) = raw
+            .split_first()
+            .ok_or_else(|| format!("invalid {ty}, no closed flag"))?;
+        counted_points(ty, points).map(PgPath)
+    }
+
+    fn accepts(ty: &PgType) -> bool {
+        *ty == PgType::PATH
+    }
+}
+
+/// The two end points of an `lseg`, as `pg-value` holds them.
+type PointPair = ((HashableF64, HashableF64), (HashableF64, HashableF64));
+
+/// An `lseg` parameter: its two end points' four `float8`s.
+/// postgres-types has no encoder for one, and a `LineString` encodes as a
+/// `path`, which Postgres refuses for an `lseg`.
+#[derive(Debug)]
+struct PgLseg<'a>(&'a PointPair);
+
+impl ToSql for PgLseg<'_> {
+    fn to_sql(
+        &self,
+        _: &PgType,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        let ((start_x, start_y), (end_x, end_y)) = self.0;
+        for coordinate in [start_x, start_y, end_x, end_y] {
+            out.put_f64(f64_from_tuple(coordinate));
+        }
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &PgType) -> bool {
+        *ty == PgType::LSEG
+    }
+
+    tokio_postgres::types::to_sql_checked!();
+}
+
+/// An `lseg` column: exactly four `float8`s, the first point's `x` and `y`
+/// and then the second's.
+///
+/// Not postgres-types' `LineString`, which reads an `lseg` as a `path` and so
+/// takes the first coordinate's bytes for a point count: a negative one panics,
+/// and a large one aborts the host while room is made for it.
+struct PgLsegValue(PointPair);
+
+impl FromSql<'_> for PgLsegValue {
+    fn from_sql(ty: &PgType, raw: &[u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        let (&[start_x, start_y, end_x, end_y], []) = raw.as_chunks::<8>() else {
+            return Err(format!("invalid {ty}, expected 32 bytes but got {}", raw.len()).into());
+        };
+        let [start_x, start_y, end_x, end_y] =
+            [start_x, start_y, end_x, end_y].map(|f| f64::from_be_bytes(f).integer_decode());
+        Ok(PgLsegValue(((start_x, start_y), (end_x, end_y))))
+    }
+
+    fn accepts(ty: &PgType) -> bool {
+        *ty == PgType::LSEG
+    }
 }
 
 // ── MAC address helpers ─────────────────────────────────────────────────────
@@ -280,6 +456,242 @@ impl FromSql<'_> for MacAddressEui64 {
     }
 }
 
+/// Postgres types whose binary form is a fixed-width value (or a structured
+/// one, like `uuid` or `numeric`), so the bytes of a `text` value are never a
+/// valid encoding of them.
+const NON_TEXT_TYPES: [PgType; 15] = [
+    PgType::BOOL,
+    PgType::INT2,
+    PgType::INT4,
+    PgType::INT8,
+    PgType::OID,
+    PgType::FLOAT4,
+    PgType::FLOAT8,
+    PgType::MONEY,
+    PgType::DATE,
+    PgType::TIME,
+    PgType::TIMESTAMP,
+    PgType::TIMESTAMPTZ,
+    PgType::INTERVAL,
+    PgType::NUMERIC,
+    PgType::UUID,
+];
+
+/// `oid` and the `reg*` aliases share `int4`'s four-byte encoding, so an `int4`
+/// value can stand in for them (`WHERE oid = $1`).
+fn is_oid_like(ty: &PgType) -> bool {
+    [
+        PgType::OID,
+        PgType::REGCLASS,
+        PgType::REGCOLLATION,
+        PgType::REGCONFIG,
+        PgType::REGDICTIONARY,
+        PgType::REGNAMESPACE,
+        PgType::REGOPER,
+        PgType::REGOPERATOR,
+        PgType::REGPROC,
+        PgType::REGPROCEDURE,
+        PgType::REGROLE,
+        PgType::REGTYPE,
+    ]
+    .contains(ty)
+}
+
+/// Refuse a scalar value bound to a parameter of a type it could be misread as.
+///
+/// The inner encoders do not look at the parameter type, so without this check
+/// Postgres would read, for example, the eight bytes of an `int8` as a `float8`
+/// (or fail with an error that does not name the parameter's type). A domain
+/// is checked as its base type. Values that are not simple scalars are left to
+/// their own encoders.
+fn check_scalar_type(value: &PgValue, ty: &PgType) -> Result<(), Box<dyn Error + Sync + Send>> {
+    let mut base = ty;
+    while let Kind::Domain(inner) = base.kind() {
+        base = inner;
+    }
+    let wrong =
+        |fits: bool, rust: fn(PgType) -> WrongType| -> Result<(), Box<dyn Error + Sync + Send>> {
+            if fits {
+                Ok(())
+            } else {
+                Err(Box::new(rust(ty.clone())))
+            }
+        };
+    match value {
+        PgValue::BigInt(_) | PgValue::Int8(_) | PgValue::BigSerial(_) | PgValue::Serial8(_) => {
+            wrong(<i64 as ToSql>::accepts(base), WrongType::new::<i64>)
+        }
+        PgValue::Integer(_)
+        | PgValue::Int(_)
+        | PgValue::Int4(_)
+        | PgValue::Serial(_)
+        | PgValue::Serial4(_) => wrong(
+            <i32 as ToSql>::accepts(base) || is_oid_like(base),
+            WrongType::new::<i32>,
+        ),
+        PgValue::SmallInt(_) | PgValue::Int2(_) | PgValue::SmallSerial(_) | PgValue::Serial2(_) => {
+            wrong(<i16 as ToSql>::accepts(base), WrongType::new::<i16>)
+        }
+        PgValue::Double(_) | PgValue::Float8(_) => {
+            wrong(<f64 as ToSql>::accepts(base), WrongType::new::<f64>)
+        }
+        PgValue::Real(_) | PgValue::Float4(_) => {
+            wrong(<f32 as ToSql>::accepts(base), WrongType::new::<f32>)
+        }
+        PgValue::Bool(_) | PgValue::Boolean(_) => {
+            wrong(<bool as ToSql>::accepts(base), WrongType::new::<bool>)
+        }
+        PgValue::Date(_) => wrong(*base == PgType::DATE, WrongType::new::<NaiveDate>),
+        PgValue::Time(_) => wrong(*base == PgType::TIME, WrongType::new::<NaiveTime>),
+        // `timestamp` and `timestamptz` share one binary encoding (microseconds
+        // since 2000-01-01), so a value of either binds to either.
+        PgValue::Timestamp(_) => wrong(
+            matches!(*base, PgType::TIMESTAMP | PgType::TIMESTAMPTZ),
+            WrongType::new::<NaiveDateTime>,
+        ),
+        PgValue::TimestampTz(_) => wrong(
+            matches!(*base, PgType::TIMESTAMP | PgType::TIMESTAMPTZ),
+            WrongType::new::<DateTime<Utc>>,
+        ),
+        // `json`, `xml`, enums and domains over text still read text as is.
+        PgValue::Text(_)
+        | PgValue::Name(_)
+        | PgValue::Xml(_)
+        | PgValue::Char(_)
+        | PgValue::Varchar(_) => wrong(!NON_TEXT_TYPES.contains(base), WrongType::new::<String>),
+        // Sixteen bytes each, as are an `interval` and one another.
+        PgValue::Uuid(_) => wrong(*base == PgType::UUID, WrongType::new::<Uuid>),
+        PgValue::Point(_) => wrong(*base == PgType::POINT, WrongType::new::<Point<f64>>),
+        // Thirty-two bytes each.
+        PgValue::Box(_) => wrong(*base == PgType::BOX, WrongType::new::<Rect<f64>>),
+        PgValue::Lseg(_) => wrong(*base == PgType::LSEG, WrongType::new::<PgLseg>),
+        // Eight bytes, as are an `int8`, a `float8` and a `timestamp`.
+        PgValue::PgLsn(_) => wrong(*base == PgType::PG_LSN, WrongType::new::<PgLsn>),
+        PgValue::Path(_) => wrong(*base == PgType::PATH, WrongType::new::<LineString<f64>>),
+        PgValue::Polygon(_) => wrong(*base == PgType::POLYGON, WrongType::new::<PgPolygon>),
+        _ => Ok(()),
+    }
+}
+
+/// How many array levels the encoder for `value` expects its parameter type to
+/// have.
+fn array_depth(value: &PgValue) -> usize {
+    match value {
+        PgValue::Int2VectorArray(_) => 2,
+        PgValue::Int8Array(_)
+        | PgValue::BoolArray(_)
+        | PgValue::Float8Array(_)
+        | PgValue::Float4Array(_)
+        | PgValue::Int4Array(_)
+        | PgValue::NumericArray(_)
+        | PgValue::Int2Array(_)
+        | PgValue::Int2Vector(_)
+        | PgValue::BitArray(_)
+        | PgValue::VarbitArray(_)
+        | PgValue::ByteaArray(_)
+        | PgValue::CharArray(_)
+        | PgValue::VarcharArray(_)
+        | PgValue::CidrArray(_)
+        | PgValue::InetArray(_)
+        | PgValue::MacaddrArray(_)
+        | PgValue::Macaddr8Array(_)
+        | PgValue::BoxArray(_)
+        | PgValue::CircleArray(_)
+        | PgValue::LineArray(_)
+        | PgValue::LsegArray(_)
+        | PgValue::PathArray(_)
+        | PgValue::PointArray(_)
+        | PgValue::PolygonArray(_)
+        | PgValue::DateArray(_)
+        | PgValue::IntervalArray(_)
+        | PgValue::TimeArray(_)
+        | PgValue::TimeTzArray(_)
+        | PgValue::TimestampArray(_)
+        | PgValue::TimestampTzArray(_)
+        | PgValue::JsonArray(_)
+        | PgValue::JsonbArray(_)
+        | PgValue::MoneyArray(_)
+        | PgValue::PgLsnArray(_)
+        | PgValue::NameArray(_)
+        | PgValue::TextArray(_)
+        | PgValue::XmlArray(_)
+        | PgValue::UuidArray(_) => 1,
+        PgValue::Null
+        | PgValue::BigInt(_)
+        | PgValue::Int8(_)
+        | PgValue::BigSerial(_)
+        | PgValue::Serial8(_)
+        | PgValue::Bool(_)
+        | PgValue::Boolean(_)
+        | PgValue::Double(_)
+        | PgValue::Float8(_)
+        | PgValue::Real(_)
+        | PgValue::Float4(_)
+        | PgValue::Integer(_)
+        | PgValue::Int(_)
+        | PgValue::Int4(_)
+        | PgValue::Numeric(_)
+        | PgValue::Decimal(_)
+        | PgValue::Serial(_)
+        | PgValue::Serial4(_)
+        | PgValue::SmallInt(_)
+        | PgValue::Int2(_)
+        | PgValue::SmallSerial(_)
+        | PgValue::Serial2(_)
+        | PgValue::Bit(_)
+        | PgValue::BitVarying(_)
+        | PgValue::Varbit(_)
+        | PgValue::Bytea(_)
+        | PgValue::Char(_)
+        | PgValue::Varchar(_)
+        | PgValue::Cidr(_)
+        | PgValue::Inet(_)
+        | PgValue::Macaddr(_)
+        | PgValue::Macaddr8(_)
+        | PgValue::Box(_)
+        | PgValue::Circle(_)
+        | PgValue::Line(_)
+        | PgValue::Lseg(_)
+        | PgValue::Path(_)
+        | PgValue::Point(_)
+        | PgValue::Polygon(_)
+        | PgValue::Date(_)
+        | PgValue::Interval(_)
+        | PgValue::Time(_)
+        | PgValue::TimeTz(_)
+        | PgValue::Timestamp(_)
+        | PgValue::TimestampTz(_)
+        | PgValue::Json(_)
+        | PgValue::Jsonb(_)
+        | PgValue::Money(_)
+        | PgValue::PgLsn(_)
+        | PgValue::PgSnapshot(_)
+        | PgValue::TxidSnapshot(_)
+        | PgValue::Name(_)
+        | PgValue::Text(_)
+        | PgValue::Xml(_)
+        | PgValue::TsQuery(_)
+        | PgValue::TsVector(_)
+        | PgValue::Uuid(_)
+        | PgValue::Hstore(_) => 0,
+    }
+}
+
+/// Refuse an array value bound to a parameter that is not an array as deep.
+///
+/// postgres-types' slice encoder panics on any other parameter type, and the
+/// value and the SQL both come from the guest.
+fn check_array_type(value: &PgValue, ty: &PgType) -> Result<(), Box<dyn Error + Sync + Send>> {
+    let mut level = ty;
+    for _ in 0..array_depth(value) {
+        match level.kind() {
+            Kind::Array(member) => level = member,
+            _ => return Err(Box::new(WrongType::new::<Vec<PgValue>>(ty.clone()))),
+        }
+    }
+    Ok(())
+}
+
 // ── ToSql for PgValue ───────────────────────────────────────────────────────
 
 impl ToSql for PgValue {
@@ -288,6 +700,8 @@ impl ToSql for PgValue {
         ty: &PgType,
         out: &mut BytesMut,
     ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        check_array_type(self, ty)?;
+        check_scalar_type(self, ty)?;
         match self {
             PgValue::Null => Ok(IsNull::Yes),
             // Numeric
@@ -311,17 +725,11 @@ impl ToSql for PgValue {
             PgValue::Integer(n) | PgValue::Int(n) | PgValue::Int4(n) => n.to_sql(ty, out),
             PgValue::Int4Array(ns) => ns.to_sql(ty, out),
             PgValue::Numeric(s) | PgValue::Decimal(s) | PgValue::Money(s) => {
-                let bigd = pg_bigdecimal::BigDecimal::parse_bytes(s.as_bytes(), 10)
-                    .ok_or_else(|| format!("failed to parse bigint [{s}]"))?;
-                PgNumeric::new(Some(bigd)).to_sql(ty, out)
+                parse_numeric(s)?.to_sql(ty, out)
             }
             PgValue::NumericArray(ss) | PgValue::MoneyArray(ss) => ss
                 .iter()
-                .map(|s| {
-                    pg_bigdecimal::BigDecimal::parse_bytes(s.as_bytes(), 10)
-                        .map(|v| PgNumeric::new(Some(v)))
-                        .ok_or_else(|| format!("failed to parse bigint [{s}]"))
-                })
+                .map(|s| parse_numeric(s))
                 .collect::<Result<Vec<PgNumeric>, _>>()?
                 .to_sql(ty, out),
             PgValue::SmallInt(n) | PgValue::Int2(n) => n.to_sql(ty, out),
@@ -458,22 +866,15 @@ impl ToSql for PgValue {
                 )
                 .to_sql(ty, out)
             }
-            PgValue::Line(((start_x, start_y), (end_x, end_y)))
-            | PgValue::Lseg(((start_x, start_y), (end_x, end_y))) => LineString::<f64>::new(vec![
-                coord! { x: f64_from_tuple(start_x), y: f64_from_tuple(start_y) },
-                coord! { x: f64_from_tuple(end_x), y: f64_from_tuple(end_y) },
-            ])
-            .to_sql(ty, out),
-            PgValue::LineArray(lines) | PgValue::LsegArray(lines) => lines
-                .iter()
-                .map(|((start_x, start_y), (end_x, end_y))| {
-                    LineString::<f64>::new(vec![
-                        coord! { x: f64_from_tuple(start_x), y: f64_from_tuple(start_y) },
-                        coord! { x: f64_from_tuple(end_x), y: f64_from_tuple(end_y) },
-                    ])
-                })
-                .collect::<Vec<LineString>>()
-                .to_sql(ty, out),
+            // Postgres holds a line as the coefficients of `Ax + By + C = 0`,
+            // not as the two points `pg-value` has for one.
+            PgValue::Line(_) | PgValue::LineArray(_) => {
+                Err("line & line[] are not supported (consider a cast like $1::text::line)".into())
+            }
+            PgValue::Lseg(lseg) => PgLseg(lseg).to_sql(ty, out),
+            PgValue::LsegArray(lsegs) => {
+                lsegs.iter().map(PgLseg).collect::<Vec<_>>().to_sql(ty, out)
+            }
             PgValue::BoxArray(boxes) => boxes
                 .iter()
                 .map(|((start_x, start_y), (end_x, end_y))| {
@@ -492,24 +893,17 @@ impl ToSql for PgValue {
                 .map(|(x, y)| Point::<f64>::new(f64_from_tuple(x), f64_from_tuple(y)))
                 .collect::<Vec<Point>>()
                 .to_sql(ty, out),
-            PgValue::Path(points) | PgValue::Polygon(points) => {
-                if points.is_empty() {
-                    return Err("invalid polygon, no points specified".into());
-                }
-                points
-                    .iter()
-                    .map(|(x, y)| Point::<f64>::new(f64_from_tuple(x), f64_from_tuple(y)))
-                    .collect::<Vec<Point<f64>>>()
-                    .to_sql(ty, out)
-            }
-            PgValue::PathArray(paths) | PgValue::PolygonArray(paths) => paths
+            PgValue::Path(points) => line_string(points)?.to_sql(ty, out),
+            PgValue::Polygon(points) => polygon(points)?.to_sql(ty, out),
+            PgValue::PathArray(paths) => paths
                 .iter()
-                .map(|path| {
-                    path.iter()
-                        .map(|(x, y)| Point::<f64>::new(f64_from_tuple(x), f64_from_tuple(y)))
-                        .collect::<Vec<Point<f64>>>()
-                })
-                .collect::<Vec<Vec<Point<f64>>>>()
+                .map(|points| line_string(points))
+                .collect::<Result<Vec<_>, _>>()?
+                .to_sql(ty, out),
+            PgValue::PolygonArray(polygons) => polygons
+                .iter()
+                .map(|points| polygon(points))
+                .collect::<Result<Vec<_>, _>>()?
                 .to_sql(ty, out),
 
             // Date-time
@@ -618,7 +1012,8 @@ impl ToSql for PgValue {
     }
 
     fn accepts(_ty: &PgType) -> bool {
-        // Accept all types and provide specific error messages in to_sql
+        // Accept all types; `to_sql` refuses a scalar whose type does not match
+        // the parameter (see `check_scalar_type`) and gives specific errors
         true
     }
 
@@ -800,35 +1195,32 @@ impl FromSql<'_> for PgValue {
             &tokio_postgres::types::Type::CIRCLE | &tokio_postgres::types::Type::CIRCLE_ARRAY => {
                 Err("circle & circle[] are not supported".into())
             }
-            &tokio_postgres::types::Type::LINE => Ok(PgValue::Line(
-                linestring_to_hashable_f64s_tuple(LineString::<f64>::from_sql(ty, raw)?)?,
-            )),
-            &tokio_postgres::types::Type::LINE_ARRAY => Ok(PgValue::LineArray(
-                Vec::<LineString<f64>>::from_sql(ty, raw)?
-                    .into_iter()
-                    .map(linestring_to_hashable_f64s_tuple)
-                    .collect::<Result<Vec<_>, _>>()?,
-            )),
-            &tokio_postgres::types::Type::LSEG => Ok(PgValue::Lseg(
-                linestring_to_hashable_f64s_tuple(LineString::<f64>::from_sql(ty, raw)?)?,
-            )),
+            // Postgres sends a line as the coefficients of `Ax + By + C = 0`,
+            // three `float8`s, not the two points `pg-value` has for one.
+            &tokio_postgres::types::Type::LINE | &tokio_postgres::types::Type::LINE_ARRAY => {
+                Err("line & line[] are not supported (consider a cast like ::text)".into())
+            }
+            &tokio_postgres::types::Type::LSEG => {
+                Ok(PgValue::Lseg(PgLsegValue::from_sql(ty, raw)?.0))
+            }
             &tokio_postgres::types::Type::LSEG_ARRAY => Ok(PgValue::LsegArray(
-                Vec::<LineString<f64>>::from_sql(ty, raw)?
+                Vec::<PgLsegValue>::from_sql(ty, raw)?
                     .into_iter()
-                    .map(linestring_to_hashable_f64s_tuple)
-                    .collect::<Result<Vec<_>, _>>()?,
+                    .map(|lseg| lseg.0)
+                    .collect(),
             )),
             &tokio_postgres::types::Type::PATH => Ok(PgValue::Path(
-                Vec::<Point<f64>>::from_sql(ty, raw)?
+                PgPath::from_sql(ty, raw)?
+                    .0
                     .into_iter()
                     .map(point_to_hashable_f64s)
                     .collect::<Vec<_>>(),
             )),
             &tokio_postgres::types::Type::PATH_ARRAY => Ok(PgValue::PathArray(
-                Vec::<Vec<Point<f64>>>::from_sql(ty, raw)?
+                Vec::<PgPath>::from_sql(ty, raw)?
                     .into_iter()
-                    .map(|points| points.into_iter().map(point_to_hashable_f64s).collect())
-                    .collect::<Vec<_>>(),
+                    .map(|v| v.0.into_iter().map(point_to_hashable_f64s).collect())
+                    .collect::<Vec<Vec<_>>>(),
             )),
             &tokio_postgres::types::Type::POINT => {
                 let point = Point::<f64>::from_sql(ty, raw)?;
@@ -841,15 +1233,16 @@ impl FromSql<'_> for PgValue {
                     .collect::<Vec<_>>(),
             )),
             &tokio_postgres::types::Type::POLYGON => Ok(PgValue::Polygon(
-                Vec::<Point<f64>>::from_sql(ty, raw)?
+                PgPolygon::from_sql(ty, raw)?
+                    .0
                     .into_iter()
                     .map(point_to_hashable_f64s)
                     .collect::<Vec<_>>(),
             )),
             &tokio_postgres::types::Type::POLYGON_ARRAY => Ok(PgValue::PolygonArray(
-                Vec::<Vec<Point<f64>>>::from_sql(ty, raw)?
+                Vec::<PgPolygon>::from_sql(ty, raw)?
                     .into_iter()
-                    .map(|v| v.into_iter().map(point_to_hashable_f64s).collect())
+                    .map(|v| v.0.into_iter().map(point_to_hashable_f64s).collect())
                     .collect::<Vec<Vec<_>>>(),
             )),
 
@@ -993,5 +1386,829 @@ impl FromSql<'_> for PgValue {
 
     fn from_sql_null(_ty: &PgType) -> Result<Self, Box<dyn Error + Sync + Send>> {
         Ok(PgValue::Null)
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    fn bind(value: &PgValue, ty: &PgType) -> Result<(), Box<dyn Error + Sync + Send>> {
+        value.to_sql_checked(ty, &mut BytesMut::new()).map(|_| ())
+    }
+
+    #[test]
+    fn scalar_bound_to_a_different_type_is_refused() {
+        // Same width, different meaning: used to be read as `5e-324`.
+        let err = bind(&PgValue::Int8(1), &PgType::FLOAT8).unwrap_err();
+        assert!(err.is::<WrongType>(), "{err}");
+        assert!(err.to_string().contains("float8"), "{err}");
+        // Different width: used to fail with an error that names no type.
+        assert!(bind(&PgValue::Int4(1), &PgType::INT8).is_err());
+        assert!(bind(&PgValue::Int8(1), &PgType::INT4).is_err());
+        assert!(bind(&PgValue::Int8(1), &PgType::TIMESTAMPTZ).is_err());
+        assert!(bind(&PgValue::Int4(1), &PgType::DATE).is_err());
+        assert!(bind(&PgValue::Bool(true), &PgType::INT2).is_err());
+        assert!(bind(&PgValue::Date(Date::Ymd((2000, 1, 2))), &PgType::INT4).is_err());
+        assert!(
+            bind(
+                &PgValue::Time(Time {
+                    hour: 1,
+                    min: 2,
+                    sec: 3,
+                    micro: 4
+                }),
+                &PgType::INT8
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn text_is_refused_for_fixed_width_types_only() {
+        for ty in [
+            PgType::INT8,
+            PgType::FLOAT8,
+            PgType::UUID,
+            PgType::NUMERIC,
+            PgType::BOOL,
+        ] {
+            assert!(
+                bind(&PgValue::Text("12345678".into()), &ty).is_err(),
+                "{ty}"
+            );
+        }
+        for ty in [PgType::TEXT, PgType::VARCHAR, PgType::JSON, PgType::UNKNOWN] {
+            assert!(bind(&PgValue::Text("x".into()), &ty).is_ok(), "{ty}");
+        }
+    }
+
+    #[test]
+    fn matching_scalars_still_bind() {
+        assert!(bind(&PgValue::Int8(1), &PgType::INT8).is_ok());
+        assert!(bind(&PgValue::BigSerial(1), &PgType::INT8).is_ok());
+        assert!(bind(&PgValue::Int4(1), &PgType::INT4).is_ok());
+        assert!(bind(&PgValue::Int2(1), &PgType::INT2).is_ok());
+        assert!(bind(&PgValue::Bool(true), &PgType::BOOL).is_ok());
+        assert!(bind(&PgValue::Date(Date::Ymd((2000, 1, 2))), &PgType::DATE).is_ok());
+        assert!(bind(&PgValue::Null, &PgType::INT8).is_ok());
+    }
+
+    #[test]
+    fn int4_binds_to_oid_like_types() {
+        for ty in [PgType::OID, PgType::REGCLASS, PgType::REGTYPE] {
+            assert!(bind(&PgValue::Int4(1259), &ty).is_ok(), "{ty}");
+        }
+        assert!(bind(&PgValue::Int8(1259), &PgType::OID).is_err());
+    }
+
+    #[test]
+    fn array_bound_to_a_shallower_type_is_refused_not_a_panic() {
+        let err = bind(&PgValue::Int4Array(vec![1]), &PgType::INT4).unwrap_err();
+        assert!(err.is::<WrongType>(), "{err}");
+        assert!(bind(&PgValue::TextArray(vec!["x".into()]), &PgType::TEXT).is_err());
+        assert!(bind(&PgValue::Int2Vector(vec![1]), &PgType::INT2).is_err());
+        assert!(
+            bind(
+                &PgValue::Int2VectorArray(vec![vec![1]]),
+                &PgType::INT2_ARRAY
+            )
+            .is_err()
+        );
+
+        assert!(bind(&PgValue::Int4Array(vec![1]), &PgType::INT4_ARRAY).is_ok());
+        assert!(bind(&PgValue::Int2Vector(vec![1]), &PgType::INT2_VECTOR).is_ok());
+        assert!(
+            bind(
+                &PgValue::Int2VectorArray(vec![vec![1]]),
+                &PgType::INT2_VECTOR_ARRAY
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn domain_is_checked_as_its_base_type() {
+        let domain = PgType::new(
+            "positive_id".into(),
+            0,
+            Kind::Domain(PgType::INT8),
+            "public".into(),
+        );
+        assert!(bind(&PgValue::Int8(1), &domain).is_ok());
+        assert!(bind(&PgValue::Int4(1), &domain).is_err());
+    }
+
+    type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
+
+    fn round_trip<T: ToSql>(
+        value: PgValue,
+        expected: PgValue,
+        ty: PgType,
+        native: &T,
+    ) -> TestResult {
+        let mut wire = BytesMut::new();
+        assert!(matches!(native.to_sql(&ty, &mut wire)?, IsNull::No));
+        let mut encoded = BytesMut::new();
+        assert!(matches!(
+            value.to_sql_checked(&ty, &mut encoded)?,
+            IsNull::No
+        ));
+        assert!(encoded == wire, "encoding a value as {ty}");
+        let decoded = PgValue::from_sql(&ty, &wire)?;
+        assert!(
+            format!("{decoded:?}") == format!("{expected:?}"),
+            "decoding {ty}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scalars_and_arrays_match_postgres_wire_values() -> TestResult {
+        macro_rules! check {
+            ($variant:ident, $value:expr, $ty:ident) => {
+                let value = PgValue::$variant($value);
+                round_trip(value.clone(), value, PgType::$ty, &$value)?;
+            };
+            ($variant:ident, $value:expr, $ty:ident, $native:expr) => {
+                let value = PgValue::$variant($value);
+                round_trip(value.clone(), value, PgType::$ty, &$native)?;
+            };
+        }
+        check!(Bool, true, BOOL);
+        check!(BoolArray, vec![true, false], BOOL_ARRAY);
+        check!(Bytea, vec![0_u8, 255], BYTEA);
+        check!(ByteaArray, vec![vec![0_u8, 255], vec![]], BYTEA_ARRAY);
+        check!(Int2, -123_i16, INT2);
+        check!(Int2Array, vec![i16::MIN, i16::MAX], INT2_ARRAY);
+        check!(Int4, -123_i32, INT4);
+        check!(Int4Array, vec![i32::MIN, i32::MAX], INT4_ARRAY);
+        check!(Int8, -123_i64, INT8);
+        check!(Int8Array, vec![i64::MIN, i64::MAX], INT8_ARRAY);
+        check!(Float4, 1.5_f32.integer_decode(), FLOAT4, 1.5_f32);
+        check!(Float8, (-2.5_f64).integer_decode(), FLOAT8, -2.5_f64);
+        check!(
+            Float4Array,
+            vec![1.5_f32.integer_decode(), (-2.5_f32).integer_decode()],
+            FLOAT4_ARRAY,
+            vec![1.5_f32, -2.5]
+        );
+        check!(
+            Float8Array,
+            vec![1.5_f64.integer_decode(), (-2.5_f64).integer_decode()],
+            FLOAT8_ARRAY,
+            vec![1.5_f64, -2.5]
+        );
+        check!(Name, "name".to_string(), NAME);
+        check!(Text, "héllo".to_string(), TEXT);
+        check!(Xml, "<x/>".to_string(), XML);
+        check!(TextArray, vec!["héllo".to_string(), "".into()], TEXT_ARRAY);
+        check!(NameArray, vec!["one".to_string(), "two".into()], NAME_ARRAY);
+        check!(XmlArray, vec!["<x/>".to_string()], XML_ARRAY);
+        check!(Varchar, (None, b"hello".to_vec()), VARCHAR, "hello");
+        check!(
+            VarcharArray,
+            vec![(None, b"hello".to_vec())],
+            VARCHAR_ARRAY,
+            vec!["hello"]
+        );
+        check!(
+            Json,
+            "{\"a\":1}".to_string(),
+            JSON,
+            serde_json::json!({"a":1})
+        );
+        check!(
+            Jsonb,
+            "{\"a\":1}".to_string(),
+            JSONB,
+            serde_json::json!({"a":1})
+        );
+        check!(
+            JsonArray,
+            vec!["null".to_string(), "true".into()],
+            JSON_ARRAY,
+            vec![serde_json::Value::Null, serde_json::json!(true)]
+        );
+        check!(
+            JsonbArray,
+            vec!["null".to_string()],
+            JSONB_ARRAY,
+            vec![serde_json::Value::Null]
+        );
+        check!(
+            Inet,
+            "127.0.0.1".to_string(),
+            INET,
+            "127.0.0.1".parse::<IpAddr>()?
+        );
+        check!(
+            InetArray,
+            vec!["::1".to_string()],
+            INET_ARRAY,
+            vec!["::1".parse::<IpAddr>()?]
+        );
+        check!(
+            Cidr,
+            "192.0.2.0/24".to_string(),
+            CIDR,
+            "192.0.2.0/24".parse::<IpCidr>()?
+        );
+        check!(
+            CidrArray,
+            vec!["192.0.2.0/24".to_string()],
+            CIDR_ARRAY,
+            vec!["192.0.2.0/24".parse::<IpCidr>()?]
+        );
+        let uuid = Uuid::from_u128(123);
+        check!(Uuid, uuid.to_string(), UUID, uuid);
+        check!(UuidArray, vec![uuid.to_string()], UUID_ARRAY, vec![uuid]);
+        check!(PgLsn, 123_u64, PG_LSN, PgLsn::from(123));
+        check!(
+            PgLsnArray,
+            vec![123_u64, 456],
+            PG_LSN_ARRAY,
+            vec![PgLsn::from(123), PgLsn::from(456)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dates_times_and_geometry_preserve_values() -> TestResult {
+        let day = NaiveDate::from_ymd_opt(2024, 2, 29).ok_or("invalid fixture date")?;
+        let time =
+            NaiveTime::from_hms_micro_opt(23, 59, 58, 123456).ok_or("invalid fixture time")?;
+        let ts = NaiveDateTime::new(day, time);
+        for date in [day, NaiveDate::MIN, NaiveDate::MAX] {
+            round_trip(
+                PgValue::Date(naive_to_date(date)),
+                PgValue::Date(naive_to_date(date)),
+                PgType::DATE,
+                &date,
+            )?;
+        }
+        round_trip(
+            PgValue::DateArray(vec![naive_to_date(day)]),
+            PgValue::DateArray(vec![naive_to_date(day)]),
+            PgType::DATE_ARRAY,
+            &vec![day],
+        )?;
+        round_trip(
+            PgValue::Time(naive_to_time(time)),
+            PgValue::Time(naive_to_time(time)),
+            PgType::TIME,
+            &time,
+        )?;
+        round_trip(
+            PgValue::TimeArray(vec![naive_to_time(time)]),
+            PgValue::TimeArray(vec![naive_to_time(time)]),
+            PgType::TIME_ARRAY,
+            &vec![time],
+        )?;
+        round_trip(
+            PgValue::Timestamp(naive_to_timestamp(ts)),
+            PgValue::Timestamp(naive_to_timestamp(ts)),
+            PgType::TIMESTAMP,
+            &ts,
+        )?;
+        round_trip(
+            PgValue::TimestampArray(vec![naive_to_timestamp(ts)]),
+            PgValue::TimestampArray(vec![naive_to_timestamp(ts)]),
+            PgType::TIMESTAMP_ARRAY,
+            &vec![ts],
+        )?;
+        let utc = ts.and_utc();
+        round_trip(
+            PgValue::TimestampTz(utc_to_timestamptz(utc)),
+            PgValue::TimestampTz(utc_to_timestamptz(utc)),
+            PgType::TIMESTAMPTZ,
+            &utc,
+        )?;
+        round_trip(
+            PgValue::TimestampTzArray(vec![utc_to_timestamptz(utc)]),
+            PgValue::TimestampTzArray(vec![utc_to_timestamptz(utc)]),
+            PgType::TIMESTAMPTZ_ARRAY,
+            &vec![utc],
+        )?;
+        let point = Point::new(1.5, -2.5);
+        round_trip(
+            PgValue::Point(point_to_hashable_f64s(point)),
+            PgValue::Point(point_to_hashable_f64s(point)),
+            PgType::POINT,
+            &point,
+        )?;
+        round_trip(
+            PgValue::PointArray(vec![point_to_hashable_f64s(point)]),
+            PgValue::PointArray(vec![point_to_hashable_f64s(point)]),
+            PgType::POINT_ARRAY,
+            &vec![point],
+        )?;
+        let rect = Rect::new((1.0, 2.0), (3.0, 4.0));
+        round_trip(
+            PgValue::Box(rect_to_hashable_f64s(rect)),
+            PgValue::Box(rect_to_hashable_f64s(rect)),
+            PgType::BOX,
+            &rect,
+        )?;
+        round_trip(
+            PgValue::BoxArray(vec![rect_to_hashable_f64s(rect)]),
+            PgValue::BoxArray(vec![rect_to_hashable_f64s(rect)]),
+            PgType::BOX_ARRAY,
+            &vec![rect],
+        )?;
+        let mac = MacAddressEui48 {
+            bytes: (0, 1, 2, 3, 4, 255),
+        };
+        round_trip(
+            PgValue::Macaddr(mac),
+            PgValue::Macaddr(mac),
+            PgType::MACADDR,
+            &mac,
+        )?;
+        round_trip(
+            PgValue::MacaddrArray(vec![mac]),
+            PgValue::MacaddrArray(vec![mac]),
+            PgType::MACADDR_ARRAY,
+            &vec![mac],
+        )?;
+        let mac = MacAddressEui64 {
+            bytes: (0, 1, 2, 3, 4, 5, 6, 255),
+        };
+        round_trip(
+            PgValue::Macaddr8(mac),
+            PgValue::Macaddr8(mac),
+            PgType::MACADDR8,
+            &mac,
+        )?;
+        round_trip(
+            PgValue::Macaddr8Array(vec![mac]),
+            PgValue::Macaddr8Array(vec![mac]),
+            PgType::MACADDR8_ARRAY,
+            &vec![mac],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn paths_and_polygons_match_postgres_wire_values() -> TestResult {
+        let points = vec![
+            (0.5_f64.integer_decode(), (-1.0_f64).integer_decode()),
+            (2.0_f64.integer_decode(), 3.25_f64.integer_decode()),
+        ];
+        let line = LineString::<f64>::from(vec![(0.5, -1.0), (2.0, 3.25)]);
+        round_trip(
+            PgValue::Path(points.clone()),
+            PgValue::Path(points.clone()),
+            PgType::PATH,
+            &line,
+        )?;
+        round_trip(
+            PgValue::PathArray(vec![points.clone()]),
+            PgValue::PathArray(vec![points.clone()]),
+            PgType::PATH_ARRAY,
+            &vec![line],
+        )?;
+
+        // polygon_send: the point count, then each point's x and y.
+        let mut polygon = BytesMut::new();
+        polygon.put_i32(2);
+        for v in [0.5_f64, -1.0, 2.0, 3.25] {
+            polygon.put_f64(v);
+        }
+        let mut encoded = BytesMut::new();
+        PgValue::Polygon(points.clone()).to_sql_checked(&PgType::POLYGON, &mut encoded)?;
+        assert_eq!(encoded, polygon);
+        assert_eq!(
+            format!("{:?}", PgValue::from_sql(&PgType::POLYGON, &polygon)?),
+            format!("{:?}", PgValue::Polygon(points.clone()))
+        );
+        let array = PgValue::PolygonArray(vec![points.clone()]);
+        let mut encoded = BytesMut::new();
+        array.to_sql_checked(&PgType::POLYGON_ARRAY, &mut encoded)?;
+        assert_eq!(
+            format!("{:?}", PgValue::from_sql(&PgType::POLYGON_ARRAY, &encoded)?),
+            format!("{array:?}")
+        );
+
+        for (value, ty) in [
+            (PgValue::Path(points.clone()), PgType::POINT_ARRAY),
+            (PgValue::Polygon(points.clone()), PgType::PATH),
+            (PgValue::PathArray(vec![points.clone()]), PgType::PATH),
+            (PgValue::Polygon(vec![]), PgType::POLYGON),
+        ] {
+            assert!(bind(&value, &ty).is_err(), "invalid value accepted as {ty}");
+        }
+        for raw in [
+            &polygon[..3],
+            &polygon[..polygon.len() - 1],
+            &[255, 255, 255, 255],
+        ] {
+            assert!(PgValue::from_sql(&PgType::POLYGON, raw).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn path_columns_decode_closed_or_open_and_refuse_a_wrong_point_count() -> TestResult {
+        let points = vec![
+            (0.5_f64.integer_decode(), (-1.0_f64).integer_decode()),
+            (2.0_f64.integer_decode(), 3.25_f64.integer_decode()),
+        ];
+        // path_send: whether it is closed, the point count, then each point.
+        for closed in [0, 1] {
+            let mut path = BytesMut::new();
+            path.put_u8(closed);
+            path.put_i32(2);
+            for v in [0.5_f64, -1.0, 2.0, 3.25] {
+                path.put_f64(v);
+            }
+            assert_eq!(
+                format!("{:?}", PgValue::from_sql(&PgType::PATH, &path)?),
+                format!("{:?}", PgValue::Path(points.clone())),
+                "closed={closed}"
+            );
+            assert!(PgValue::from_sql(&PgType::PATH, &path[..path.len() - 1]).is_err());
+        }
+        // A count that is negative, or past the points that follow it, used to
+        // panic or abort the host while room was made for it.
+        for raw in [
+            &[1][..],
+            &[1, 255, 255, 255, 255],
+            &[1, 127, 255, 255, 255],
+            &[0, 0, 0, 0, 1],
+        ] {
+            let err = PgValue::from_sql(&PgType::PATH, raw)
+                .err()
+                .ok_or("a malformed path decoded")?;
+            assert!(err.to_string().contains("path"), "{err}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lseg_parameters_match_postgres_wire_values_and_lines_are_refused() -> TestResult {
+        let lseg = (
+            (1.0_f64.integer_decode(), 2.0_f64.integer_decode()),
+            (3.0_f64.integer_decode(), (-4.5_f64).integer_decode()),
+        );
+        // lseg_recv: the first point's x and y, then the second's.
+        let mut wire = BytesMut::new();
+        for v in [1.0_f64, 2.0, 3.0, -4.5] {
+            wire.put_f64(v);
+        }
+        let mut encoded = BytesMut::new();
+        PgValue::Lseg(lseg).to_sql_checked(&PgType::LSEG, &mut encoded)?;
+        assert_eq!(encoded, wire);
+        let mut encoded = BytesMut::new();
+        PgValue::LsegArray(vec![lseg, lseg]).to_sql_checked(&PgType::LSEG_ARRAY, &mut encoded)?;
+        assert!(encoded.ends_with(&wire), "{encoded:?}");
+
+        for (value, ty) in [
+            (PgValue::Line(lseg), PgType::LINE),
+            (PgValue::LineArray(vec![lseg]), PgType::LINE_ARRAY),
+        ] {
+            let err = bind(&value, &ty).unwrap_err();
+            assert!(err.to_string().contains("line & line[]"), "{err}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lseg_and_line_columns_decode_without_reading_a_point_count() -> TestResult {
+        // lseg_send: four float8s. A first x of 1.0 starts 0x3FF00000, which a
+        // path decoder reads as a negative point count and panicked on; one of
+        // 511.9999990463257 reads as i32::MAX and made room for 32 GiB.
+        for start_x in [1.0_f64, -1.0, 1.5, 511.999_999_046_325_7, 0.0] {
+            let mut wire = BytesMut::new();
+            for v in [start_x, 2.0, 3.0, -4.5] {
+                wire.put_f64(v);
+            }
+            let expected = (
+                (start_x.integer_decode(), 2.0_f64.integer_decode()),
+                (3.0_f64.integer_decode(), (-4.5_f64).integer_decode()),
+            );
+            match PgValue::from_sql(&PgType::LSEG, &wire)? {
+                PgValue::Lseg(lseg) => assert_eq!(lseg, expected),
+                other => panic!("an lseg decoded as {other:?}"),
+            }
+
+            // Round trip through the encoder, then as an lseg[] element.
+            let mut encoded = BytesMut::new();
+            PgValue::Lseg(expected).to_sql_checked(&PgType::LSEG, &mut encoded)?;
+            assert_eq!(encoded, wire);
+            let mut array = BytesMut::new();
+            PgValue::LsegArray(vec![expected, expected])
+                .to_sql_checked(&PgType::LSEG_ARRAY, &mut array)?;
+            match PgValue::from_sql(&PgType::LSEG_ARRAY, &array)? {
+                PgValue::LsegArray(lsegs) => assert_eq!(lsegs, vec![expected, expected]),
+                other => panic!("an lseg[] decoded as {other:?}"),
+            }
+
+            // A line is three float8s; refuse it rather than misread it.
+            let err = PgValue::from_sql(&PgType::LINE, &wire[..24])
+                .err()
+                .ok_or("a line decoded")?;
+            assert!(err.to_string().contains("line & line[]"), "{err}");
+        }
+
+        // Any other length is an error, never an allocation.
+        let wire = [0x3F, 0xF0, 0, 0, 0, 0, 0, 0].repeat(5);
+        for len in [0, 1, 8, 24, 31, 33, 40] {
+            let err = PgValue::from_sql(&PgType::LSEG, &wire[..len])
+                .err()
+                .ok_or("a malformed lseg decoded")?;
+            assert!(err.to_string().contains("lseg"), "{err}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_width_values_are_refused_for_other_types_as_wide() {
+        let point = (1.5_f64.integer_decode(), (-2.5_f64).integer_decode());
+        let uuid = Uuid::from_u128(123).to_string();
+        for (value, own, others) in [
+            (
+                PgValue::Point(point),
+                PgType::POINT,
+                vec![PgType::UUID, PgType::INTERVAL],
+            ),
+            (
+                PgValue::Uuid(uuid),
+                PgType::UUID,
+                vec![PgType::POINT, PgType::TEXT],
+            ),
+            (
+                PgValue::Box((point, point)),
+                PgType::BOX,
+                vec![PgType::LSEG],
+            ),
+            (
+                PgValue::Lseg((point, point)),
+                PgType::LSEG,
+                vec![PgType::BOX, PgType::PATH],
+            ),
+            (
+                PgValue::PgLsn(1),
+                PgType::PG_LSN,
+                vec![PgType::INT8, PgType::FLOAT8],
+            ),
+        ] {
+            // Name the case by its type, not the value, so failures never echo it.
+            assert!(bind(&value, &own).is_ok(), "{own} value as {own}");
+            for ty in others {
+                let err = bind(&value, &ty).unwrap_err();
+                assert!(err.is::<WrongType>(), "{own} value as {ty}");
+            }
+        }
+        // Text by another name is refused where text is.
+        for (name, value) in [
+            ("name", PgValue::Name("12345678".into())),
+            ("xml", PgValue::Xml("12345678".into())),
+            ("char", PgValue::Char((8, b"12345678".to_vec()))),
+            ("varchar", PgValue::Varchar((None, b"12345678".to_vec()))),
+        ] {
+            assert!(bind(&value, &PgType::INT8).is_err(), "{name} value as int8");
+            assert!(bind(&value, &PgType::TEXT).is_ok(), "{name} value as text");
+        }
+    }
+
+    #[test]
+    fn numeric_exponents_are_rescaled_or_refused() -> TestResult {
+        let ten = PgNumeric::new(pg_bigdecimal::BigDecimal::parse_bytes(b"10", 10));
+        for text in ["1e1", "1.0e1", "10"] {
+            let mut encoded = BytesMut::new();
+            PgValue::Numeric(text.into()).to_sql_checked(&PgType::NUMERIC, &mut encoded)?;
+            let mut wire = BytesMut::new();
+            ten.to_sql(&PgType::NUMERIC, &mut wire)?;
+            assert_eq!(encoded, wire, "{text}");
+        }
+        bind(
+            &PgValue::NumericArray(vec!["1e1000".into(), "-2.5e3".into()]),
+            &PgType::NUMERIC_ARRAY,
+        )?;
+        for text in [
+            "1e1001".to_string(),
+            "1e9223372036854775807".to_string(),
+            "1".repeat(MAX_NUMERIC_TEXT_LEN + 1),
+        ] {
+            assert!(bind(&PgValue::Numeric(text), &PgType::NUMERIC).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_and_unsupported_wire_values_return_errors() {
+        for ty in [
+            PgType::BOOL,
+            PgType::BOOL_ARRAY,
+            PgType::BYTEA_ARRAY,
+            PgType::CHAR_ARRAY,
+            PgType::BIT,
+            PgType::BIT_ARRAY,
+            PgType::VARBIT,
+            PgType::VARBIT_ARRAY,
+            PgType::FLOAT4,
+            PgType::FLOAT4_ARRAY,
+            PgType::FLOAT8,
+            PgType::FLOAT8_ARRAY,
+            PgType::INT2,
+            PgType::INT2_ARRAY,
+            PgType::INT2_VECTOR_ARRAY,
+            PgType::INT4,
+            PgType::INT4_ARRAY,
+            PgType::INT8,
+            PgType::INT8_ARRAY,
+            PgType::NUMERIC,
+            PgType::NUMERIC_ARRAY,
+            PgType::MONEY,
+            PgType::MONEY_ARRAY,
+            PgType::JSON,
+            PgType::JSON_ARRAY,
+            PgType::JSONB,
+            PgType::JSONB_ARRAY,
+            PgType::VARCHAR_ARRAY,
+            PgType::NAME_ARRAY,
+            PgType::TEXT_ARRAY,
+            PgType::XML_ARRAY,
+            PgType::BOX,
+            PgType::BOX_ARRAY,
+            PgType::LSEG,
+            PgType::LSEG_ARRAY,
+            PgType::PATH,
+            PgType::PATH_ARRAY,
+            PgType::POINT,
+            PgType::POINT_ARRAY,
+            PgType::POLYGON,
+            PgType::POLYGON_ARRAY,
+            PgType::CIDR,
+            PgType::CIDR_ARRAY,
+            PgType::INET,
+            PgType::INET_ARRAY,
+            PgType::MACADDR,
+            PgType::MACADDR_ARRAY,
+            PgType::MACADDR8,
+            PgType::MACADDR8_ARRAY,
+            PgType::DATE,
+            PgType::DATE_ARRAY,
+            PgType::TIME,
+            PgType::TIME_ARRAY,
+            PgType::TIMESTAMP,
+            PgType::TIMESTAMP_ARRAY,
+            PgType::TIMESTAMPTZ,
+            PgType::TIMESTAMPTZ_ARRAY,
+            PgType::UUID,
+            PgType::UUID_ARRAY,
+            PgType::PG_LSN,
+            PgType::PG_LSN_ARRAY,
+            PgType::INT4_RANGE,
+            PgType::INT8_RANGE,
+            PgType::NUM_RANGE,
+            PgType::DATE_RANGE,
+            PgType::TS_RANGE,
+            PgType::TSTZ_RANGE,
+            PgType::INTERVAL,
+            PgType::INTERVAL_ARRAY,
+            PgType::TIMETZ,
+            PgType::TIMETZ_ARRAY,
+            PgType::VOID,
+        ] {
+            assert!(
+                PgValue::from_sql(
+                    &ty,
+                    if matches!(ty, PgType::NUMERIC | PgType::NUMERIC_ARRAY | PgType::MONEY) {
+                        &[255]
+                    } else {
+                        &[]
+                    }
+                )
+                .is_err(),
+                "{ty}"
+            );
+        }
+        for ty in [PgType::TEXT, PgType::XML, PgType::NAME] {
+            assert!(PgValue::from_sql(&ty, &[255]).is_err(), "{ty}");
+        }
+        assert!(matches!(
+            PgValue::from_sql_null(&PgType::INT4),
+            Ok(PgValue::Null)
+        ));
+    }
+
+    #[test]
+    fn invalid_parameters_are_rejected_before_encoding() {
+        for (value, ty) in [
+            (PgValue::Bit((2, vec![0])), PgType::BIT),
+            (PgValue::BitArray(vec![(2, vec![0])]), PgType::BIT_ARRAY),
+            (PgValue::Varbit((Some(0), vec![0])), PgType::VARBIT),
+            (
+                PgValue::VarbitArray(vec![(Some(0), vec![0])]),
+                PgType::VARBIT_ARRAY,
+            ),
+            (PgValue::Char((2, vec![0])), PgType::CHAR),
+            (PgValue::CharArray(vec![(2, vec![0])]), PgType::CHAR_ARRAY),
+            (PgValue::Varchar((Some(0), vec![0])), PgType::VARCHAR),
+            (
+                PgValue::VarcharArray(vec![(Some(0), vec![0])]),
+                PgType::VARCHAR_ARRAY,
+            ),
+            (PgValue::Numeric("bad".into()), PgType::NUMERIC),
+            (
+                PgValue::NumericArray(vec!["bad".into()]),
+                PgType::NUMERIC_ARRAY,
+            ),
+            (PgValue::Cidr("bad".into()), PgType::CIDR),
+            (PgValue::CidrArray(vec!["bad".into()]), PgType::CIDR_ARRAY),
+            (PgValue::Inet("bad".into()), PgType::INET),
+            (PgValue::InetArray(vec!["bad".into()]), PgType::INET_ARRAY),
+            (PgValue::Uuid("bad".into()), PgType::UUID),
+            (PgValue::UuidArray(vec!["bad".into()]), PgType::UUID_ARRAY),
+            (PgValue::Json("bad".into()), PgType::JSON),
+            (PgValue::JsonArray(vec!["bad".into()]), PgType::JSON_ARRAY),
+            (PgValue::Path(vec![]), PgType::PATH),
+            (PgValue::Date(Date::Ymd((2024, 2, 30))), PgType::DATE),
+            (
+                PgValue::Time(Time {
+                    hour: 24,
+                    min: 0,
+                    sec: 0,
+                    micro: 0,
+                }),
+                PgType::TIME,
+            ),
+        ] {
+            assert!(
+                value.to_sql_checked(&ty, &mut BytesMut::new()).is_err(),
+                "invalid value accepted as {ty}"
+            );
+        }
+        for offset in [
+            Offset::EasternHemisphereSecs(86400),
+            Offset::WesternHemisphereSecs(86400),
+        ] {
+            assert!(offset_to_fixed(offset).is_err());
+        }
+    }
+
+    #[test]
+    fn bitfield_decoding_preserves_bit_lengths_and_hstore_preserves_nulls() -> TestResult {
+        fn decode<T: ToSql>(native: &T, ty: PgType, expected: PgValue) -> TestResult {
+            let mut wire = BytesMut::new();
+            native.to_sql(&ty, &mut wire)?;
+            assert_eq!(
+                format!("{:?}", PgValue::from_sql(&ty, &wire)?),
+                format!("{expected:?}")
+            );
+            Ok(())
+        }
+        let bits = BitVec::from_bytes(&[0b1010_0101]);
+        decode(&bits, PgType::BIT, PgValue::Bit((8, vec![0b1010_0101])))?;
+        decode(
+            &bits,
+            PgType::VARBIT,
+            PgValue::BitVarying((Some(8), vec![0b1010_0101])),
+        )?;
+        decode(
+            &vec![bits.clone()],
+            PgType::BIT_ARRAY,
+            PgValue::BitArray(vec![(8, vec![0b1010_0101])]),
+        )?;
+        decode(
+            &vec![bits],
+            PgType::VARBIT_ARRAY,
+            PgValue::VarbitArray(vec![(Some(8), vec![0b1010_0101])]),
+        )?;
+        let ty = PgType::new("hstore".into(), 16384, Kind::Simple, "public".into());
+        for value in [Some("value".to_string()), None] {
+            let pairs = vec![("key".to_string(), value)];
+            round_trip(
+                PgValue::Hstore(pairs.clone()),
+                PgValue::Hstore(pairs.clone()),
+                ty.clone(),
+                &HashMap::<String, Option<String>>::from_iter(pairs),
+            )?;
+        }
+        assert!(matches!(
+            PgValue::Null.to_sql_checked(&PgType::TEXT, &mut BytesMut::new())?,
+            IsNull::Yes
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn mac_helpers_enforce_sizes_and_types() -> TestResult {
+        let mac48 = MacAddressEui48 {
+            bytes: (0, 1, 2, 3, 4, 5),
+        };
+        let mac64 = MacAddressEui64 {
+            bytes: (0, 1, 2, 3, 4, 5, 6, 7),
+        };
+        assert!(mac48.to_sql(&PgType::TEXT, &mut BytesMut::new()).is_err());
+        assert!(mac64.to_sql(&PgType::TEXT, &mut BytesMut::new()).is_err());
+        assert!(mac_eui48_from_bytes(&[0; 5]).is_err());
+        assert!(mac_eui64_from_bytes(&[0; 7]).is_err());
+        assert!(!<MacAddressEui48 as ToSql>::accepts(&PgType::TEXT));
+        assert!(!<MacAddressEui64 as FromSql>::accepts(&PgType::TEXT));
+        Ok(())
     }
 }

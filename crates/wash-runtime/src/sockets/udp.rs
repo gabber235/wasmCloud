@@ -73,6 +73,12 @@ pub struct NetworkUdpSocket {
     /// guest's own virtual loopback by address alone.
     connected_plane: Option<super::Plane>,
 
+    /// When the decision that permitted the connected peer lapses, if it does.
+    connected_until: Option<std::time::Instant>,
+
+    /// Wake pending P3 receives when their peer or transport plane changes.
+    connection_changed: Arc<tokio::sync::Notify>,
+
     /// Peers this socket has sent to, when it is bound to the unspecified
     /// address and therefore reachable on every interface.
     ///
@@ -105,6 +111,8 @@ impl NetworkUdpSocket {
             socket_addr_check: None,
             quota_slot: None,
             connected_plane: None,
+            connected_until: None,
+            connection_changed: Arc::default(),
             egress_peers: None,
         })
     }
@@ -185,6 +193,34 @@ impl NetworkUdpSocket {
         }
     }
 
+    /// [`Self::connect`], recording the policy's plane and deadline for the
+    /// peer only once it is the peer.
+    ///
+    /// A refused connect can leave the previous peer connected, and that peer
+    /// keeps the decision it connected under — taking the new one early would
+    /// hand it a deadline it was never given. One that failed at the OS leaves
+    /// no peer, so nothing is kept.
+    fn connect_on(
+        &mut self,
+        addr: SocketAddr,
+        plane: super::Plane,
+        valid_until: Option<std::time::Instant>,
+    ) -> Result<(), ErrorCode> {
+        let connected = self.connect(addr);
+        match (&connected, self.is_connected()) {
+            (Ok(()), _) => {
+                self.connected_plane = Some(plane);
+                self.connected_until = valid_until;
+            }
+            (Err(_), true) => {}
+            (Err(_), false) => {
+                self.connected_plane = None;
+                self.connected_until = None;
+            }
+        }
+        connected
+    }
+
     fn local_address(&self) -> Result<SocketAddr, ErrorCode> {
         if matches!(self.udp_state, UdpState::Default | UdpState::BindStarted) {
             return Err(ErrorCode::InvalidState);
@@ -258,10 +294,13 @@ impl super::loopback::UdpSocket {
     pub fn new(
         socket: &NetworkUdpSocket,
         state: super::loopback::UdpState,
+        receive_permits: Arc<tokio::sync::Semaphore>,
     ) -> Result<Self, ErrorCode> {
         let hop_limit = get_unicast_hop_limit(&socket.socket, socket.family)?;
 
-        let receive_buffer_size = receive_buffer_size(&socket.socket)?;
+        let receive_buffer_size =
+            receive_buffer_size(&socket.socket)?.min(Self::MAX_RECEIVE_BUFFER_SIZE);
+        receive_permits.add_permits(receive_buffer_size as usize);
 
         let send_buffer_size = send_buffer_size(&socket.socket)?;
         let send_buffer_size = send_buffer_size
@@ -272,6 +311,8 @@ impl super::loopback::UdpSocket {
             state,
             hop_limit,
             receive_buffer_size,
+            receive_permits,
+            connection_changed: Arc::clone(&socket.connection_changed),
             send_buffer_size,
             family: socket.family,
             socket_addr_check: socket.socket_addr_check.clone(),
@@ -336,13 +377,15 @@ impl UdpSocket {
             }
         };
 
-        let (addr, rx) = loopback.bind_udp(addr)?;
+        let receive_permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let (addr, rx) = loopback.bind_udp(addr, Arc::clone(&receive_permits))?;
         let lo = super::loopback::UdpSocket::new(
             socket,
             super::loopback::UdpState::BindStarted {
                 local_address: addr,
                 rx,
             },
+            receive_permits,
         )?;
 
         if ip.is_unspecified() {
@@ -357,14 +400,15 @@ impl UdpSocket {
     }
 
     pub(crate) fn finish_bind(&mut self) -> Result<(), ErrorCode> {
-        match self {
+        let finished = match self {
             Self::Network(socket) => socket.finish_bind(),
             Self::Loopback(socket) => socket.finish_bind(),
-            Self::Unspecified { net, lo } => {
-                net.finish_bind()?;
-                lo.finish_bind()
-            }
-        }
+            Self::Unspecified { net, lo } => net.finish_bind().and_then(|()| lo.finish_bind()),
+        };
+        // A receive pending on the unbound socket has no filter or virtual
+        // endpoint until it reads the state installed here.
+        self.connection_changed().notify_waiters();
+        finished
     }
 
     pub(crate) fn is_connected(&self) -> bool {
@@ -395,41 +439,51 @@ impl UdpSocket {
         &mut self,
         loopback: &mut super::loopback::Network,
     ) -> Result<(), ErrorCode> {
-        match self {
+        let disconnected = match self {
             Self::Network(socket) => socket.disconnect(),
             Self::Loopback(socket) => socket.disconnect(loopback),
             Self::Unspecified { net, lo } => {
-                net.disconnect()?;
-                lo.disconnect(loopback)
+                net.disconnect().and_then(|()| lo.disconnect(loopback))
             }
-        }
+        };
+        // Also wakes after a failure, which can leave the native half changed.
+        self.connection_changed().notify_waiters();
+        disconnected
     }
 
     /// Connect to `addr` on `plane`.
     ///
     /// `plane` comes from the socket policy rather than from the address; see
     /// [`TcpSocket::start_connect`](super::tcp::TcpSocket::start_connect).
+    /// `valid_until` is the policy's deadline for that decision, which a send
+    /// with no explicit destination holds itself to.
     pub(crate) fn connect(
         &mut self,
         addr: SocketAddr,
         plane: super::Plane,
+        valid_until: Option<std::time::Instant>,
         loopback: &mut super::loopback::Network,
     ) -> Result<(), ErrorCode> {
-        match self {
-            Self::Network(socket) => {
-                socket.connected_plane = Some(plane);
-                socket.connect(addr)
-            }
+        let connected = match self {
+            Self::Network(socket) => socket.connect_on(addr, plane, valid_until),
             Self::Loopback(socket) => socket.connect(addr, loopback),
             // An unspecified-bound socket is simultaneously a real socket and a
             // virtual endpoint, so both sides record the peer, and the plane
             // recorded here is what later decides which half carries a datagram
             // sent with no explicit destination.
-            Self::Unspecified { net, lo } => {
-                net.connected_plane = Some(plane);
-                net.connect(addr)?;
-                lo.connect(addr, loopback)
-            }
+            Self::Unspecified { net, lo } => net
+                .connect_on(addr, plane, valid_until)
+                .and_then(|()| lo.connect(addr, loopback)),
+        };
+        // Also wakes after a failure, which can disconnect the native half.
+        self.connection_changed().notify_waiters();
+        connected
+    }
+
+    pub(crate) fn connection_changed(&self) -> &Arc<tokio::sync::Notify> {
+        match self {
+            Self::Network(net) | Self::Unspecified { net, .. } => &net.connection_changed,
+            Self::Loopback(lo) => &lo.connection_changed,
         }
     }
 
@@ -442,6 +496,15 @@ impl UdpSocket {
             Self::Network(net) | Self::Unspecified { net, .. } => net.connected_plane,
             // A purely virtual endpoint has no other half to choose.
             Self::Loopback(_) => Some(super::Plane::Virtual),
+        }
+    }
+
+    /// The connected peer's deadline, for a send to check and extend. `None`
+    /// for a purely virtual endpoint, whose decision does not lapse.
+    pub(crate) fn connected_until_mut(&mut self) -> Option<&mut Option<std::time::Instant>> {
+        match self {
+            Self::Network(net) | Self::Unspecified { net, .. } => Some(&mut net.connected_until),
+            Self::Loopback(_) => None,
         }
     }
 
@@ -581,6 +644,7 @@ impl UdpSocket {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::sockets::WasiSocketsCtx;
@@ -891,3 +955,7 @@ mod tests {
         assert!(matches!(result, Err(ErrorCode::InvalidArgument)));
     }
 }
+
+#[cfg(test)]
+#[path = "udp_tests.rs"]
+mod behavior_tests;

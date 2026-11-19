@@ -4,12 +4,15 @@
 //! a plugin sees this map, so credentials arrive here already resolved and are
 //! never read from a manifest by this module.
 
-use std::collections::HashMap;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use zeroize::Zeroizing;
+
+use crate::nats_credentials::{AuthHook, Credentials, Secret};
+use crate::wit::{Config, ConfigStr, ConfigValue};
 
 /// Default per-consumer in-flight limit.
 const DEFAULT_MAX_IN_FLIGHT: usize = 64;
@@ -48,21 +51,29 @@ const MIN_DERIVED_MAX_ACK_PENDING: usize = 16;
 /// How a workload authenticates to NATS.
 ///
 /// Seeds are held in `Zeroizing` so they are wiped when the config is dropped.
-/// The signing callback built from `JwtNkey` stays host-side; the seed never
-/// crosses the sandbox boundary.
+/// The signing callback built from them stays host-side; the seed never
+/// crosses the sandbox boundary. A secret given as a file is reread on every
+/// connect, so a rotated one is presented on the next reconnect.
+///
+/// `jwt_as_token` repeats the user JWT as `auth_token`, for an auth callout
+/// behind a server without trusted operators, which never sees the `jwt`.
 pub enum NatsAuth {
     Anonymous,
-    CredsFile(PathBuf),
+    CredsFile {
+        path: PathBuf,
+        jwt_as_token: bool,
+    },
     JwtNkey {
         jwt: String,
-        seed: Zeroizing<String>,
+        seed: Secret,
+        jwt_as_token: bool,
     },
-    NkeySeed(Zeroizing<String>),
+    NkeySeed(Secret),
     UserPassword {
         username: String,
-        password: Zeroizing<String>,
+        password: Secret,
     },
-    Token(Zeroizing<String>),
+    Token(Secret),
 }
 
 impl NatsAuth {
@@ -70,11 +81,62 @@ impl NatsAuth {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Anonymous => "anonymous",
-            Self::CredsFile(_) => "creds-file",
-            Self::JwtNkey { .. } => "jwt+nkey",
-            Self::NkeySeed(_) => "nkey",
-            Self::UserPassword { .. } => "user-password",
-            Self::Token(_) => "token",
+            Self::CredsFile { .. } => "creds-file",
+            Self::JwtNkey {
+                seed: Secret::Value(_),
+                ..
+            } => "jwt+nkey",
+            Self::JwtNkey {
+                seed: Secret::File(_),
+                ..
+            } => "jwt+nkey-file",
+            Self::NkeySeed(Secret::Value(_)) => "nkey",
+            Self::NkeySeed(Secret::File(_)) => "nkey-file",
+            Self::UserPassword {
+                password: Secret::Value(_),
+                ..
+            } => "user-password",
+            Self::UserPassword {
+                password: Secret::File(_),
+                ..
+            } => "user-password-file",
+            Self::Token(Secret::Value(_)) => "token",
+            Self::Token(Secret::File(_)) => "token-file",
+        }
+    }
+
+    /// What a connection on this binding presents.
+    pub fn credentials(&self) -> Credentials {
+        match self {
+            Self::Anonymous => Credentials::default(),
+            Self::CredsFile { path, jwt_as_token } => Credentials {
+                credentials: Some(path.clone()),
+                hook: jwt_as_token.then(AuthHook::jwt_as_token),
+                ..Default::default()
+            },
+            Self::JwtNkey {
+                jwt,
+                seed,
+                jwt_as_token,
+            } => Credentials {
+                jwt: Some(jwt.clone()),
+                nkey: Some(seed.clone()),
+                hook: jwt_as_token.then(AuthHook::jwt_as_token),
+                ..Default::default()
+            },
+            Self::NkeySeed(seed) => Credentials {
+                nkey: Some(seed.clone()),
+                ..Default::default()
+            },
+            Self::UserPassword { username, password } => Credentials {
+                user: Some(username.clone()),
+                password: Some(password.clone()),
+                ..Default::default()
+            },
+            Self::Token(token) => Credentials {
+                token: Some(token.clone()),
+                ..Default::default()
+            },
         }
     }
 }
@@ -99,6 +161,7 @@ pub struct TlsConfig {
 pub struct PolicySpec {
     pub subject_allow: Vec<String>,
     pub stream_allow: Vec<String>,
+    pub stream_delete_allow: Vec<String>,
     pub bucket_allow: Vec<String>,
 }
 
@@ -233,13 +296,16 @@ pub enum AckMode {
 }
 
 /// A workload's complete NATS configuration.
-#[derive(Debug)]
-pub struct NatsConfig {
+///
+/// `A` is how it authenticates: [`NatsAuth`] once every value is known, and
+/// `Option<NatsAuth>` while a key a plugin secret supplies may decide it.
+pub struct NatsConfig<A = NatsAuth> {
+    pub secret_keys: BTreeSet<String>,
     pub servers: Vec<String>,
     pub name: Option<String>,
     pub jetstream_domain: Option<String>,
     pub inbox_prefix: Option<String>,
-    pub auth: NatsAuth,
+    pub auth: A,
     pub tls: TlsConfig,
     pub policy: PolicySpec,
     pub limits: Limits,
@@ -247,73 +313,148 @@ pub struct NatsConfig {
     pub request_timeout: Option<Duration>,
 }
 
-/// Reads a key through the plugin's key table, in whichever spelling — or
-/// alias — a manifest used.
+/// A config map, and the keys of it a plugin secret supplies at bind.
 ///
-/// Going through [`super::keys`] rather than reading the map directly is what
-/// keeps this reader and [`super::binding_schema`] from drifting: a key asked
-/// for here that the table does not name trips a debug assertion, and a key in
-/// the table nothing asks for is dead weight the table's own tests name.
-fn get<'a>(cfg: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
-    super::keys::get(cfg, key)
+/// A pending key counts as set for every rule its presence decides. Its value
+/// is not read, so each rule on a value is checked at bind, once it has one.
+struct Layer<'a> {
+    cfg: &'a Config,
+    pending: &'a BTreeSet<String>,
 }
 
-/// Splits a comma-separated list, dropping empties.
-fn list(cfg: &HashMap<String, String>, key: &str) -> Vec<String> {
-    get(cfg, key)
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn parse_usize(cfg: &HashMap<String, String>, key: &str, default: usize) -> anyhow::Result<usize> {
-    match get(cfg, key) {
-        Some(raw) => raw
-            .parse()
-            .with_context(|| format!("`{key}` must be a positive integer, got `{raw}`")),
-        None => Ok(default),
+impl Layer<'_> {
+    /// Reads a key through the plugin's key table, in whichever spelling — or
+    /// alias — a manifest used.
+    ///
+    /// Going through [`super::keys`] rather than reading the map directly is
+    /// what keeps this reader and [`super::binding_schema`] from drifting: a key
+    /// asked for here that the table does not name trips a debug assertion, and
+    /// a key in the table nothing asks for is dead weight the table's own tests
+    /// name.
+    fn get(&self, key: &str) -> Option<ConfigStr<'_>> {
+        super::keys::get(self.cfg, key)
     }
-}
 
-fn parse_bool(cfg: &HashMap<String, String>, key: &str) -> anyhow::Result<bool> {
-    match get(cfg, key) {
-        Some(raw) => raw
-            .parse()
-            .with_context(|| format!("`{key}` must be `true` or `false`, got `{raw}`")),
-        None => Ok(false),
+    /// Whether a plugin secret supplies `key`, in any spelling.
+    fn is_pending(&self, key: &str) -> bool {
+        super::keys::find(key).is_some_and(|row| row.spellings().any(|s| self.pending.contains(s)))
+    }
+
+    /// Whether `key` has a value, or will have one at bind.
+    fn is_set(&self, key: &str) -> bool {
+        self.get(key).is_some() || self.is_pending(key)
+    }
+
+    /// Refuses identity keys whose only values are blank, which [`Self::get`]
+    /// reads as unset: a secret resolving empty must not change who a binding
+    /// connects as.
+    fn refuse_blank_identity(&self) -> anyhow::Result<()> {
+        let mut blank: Vec<&str> = self
+            .cfg
+            .iter()
+            .filter(|(_, value)| value.expose().is_some_and(|v| v.trim().is_empty()))
+            .filter(|(key, _)| {
+                super::keys::find(key).is_some_and(|row| {
+                    row.identity != super::keys::Identity::None
+                        && self.get(row.canonical).is_none()
+                        && !self.is_pending(row.canonical)
+                })
+            })
+            .map(|(key, _)| key.as_str())
+            .collect();
+        if blank.is_empty() {
+            return Ok(());
+        }
+        blank.sort_unstable();
+        bail!(
+            "NATS identity keys have empty values: `{}`",
+            blank.join("`, `")
+        )
+    }
+
+    /// Splits a comma-separated list, dropping empties.
+    fn list(&self, key: &str) -> Vec<String> {
+        self.get(key)
+            .map(|raw| {
+                raw.expose()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn parse_usize(&self, key: &str, default: usize) -> anyhow::Result<usize> {
+        match self.get(key) {
+            Some(raw) => raw
+                .expose()
+                .parse()
+                .with_context(|| format!("`{key}` must be a positive integer, got `{raw}`")),
+            None => Ok(default),
+        }
+    }
+
+    fn parse_bool(&self, key: &str) -> anyhow::Result<bool> {
+        match self.get(key) {
+            Some(raw) => raw
+                .expose()
+                .parse()
+                .with_context(|| format!("`{key}` must be `true` or `false`, got `{raw}`")),
+            None => Ok(false),
+        }
+    }
+
+    /// A secret given inline as `key` or as a file named by `file_key`, but
+    /// not both. `None` when neither has a value yet.
+    fn secret(&self, key: &str, file_key: &str) -> anyhow::Result<Option<Secret>> {
+        if self.is_set(key) && self.is_set(file_key) {
+            bail!("`{key}` and `{file_key}` were both supplied; set one");
+        }
+        Ok(match (self.get(key), self.get(file_key)) {
+            (Some(value), _) => Some(Secret::Value(Zeroizing::new(value.expose().to_string()))),
+            (None, Some(path)) => Some(Secret::File(PathBuf::from(path.expose()))),
+            (None, None) => None,
+        })
     }
 }
 
 /// Selects exactly one auth mechanism, or fails.
 ///
 /// Silently preferring one when several are set hides a misconfiguration until
-/// the connection is refused, so a conflict is an error at bind time.
-fn parse_auth(cfg: &HashMap<String, String>) -> anyhow::Result<NatsAuth> {
+/// the connection is refused, so a conflict is an error at bind time. `None`
+/// when a pending key is part of the mechanism selected.
+fn parse_layer_auth(r: &Layer<'_>) -> anyhow::Result<Option<NatsAuth>> {
     // One `get` per setting: aliases are resolved by the key table, so
     // `creds-file` and `creds` are the same lookup rather than two.
-    let creds = get(cfg, "creds");
-    let jwt = get(cfg, "jwt");
-    let seed = get(cfg, "nkey-seed");
-    let username = get(cfg, "username");
-    let password = get(cfg, "password");
-    let token = get(cfg, "token");
+    let creds = r.get("creds");
+    let jwt = r.get("jwt");
+    let seed = r.secret("nkey-seed", "nkey-seed-file")?;
+    let username = r.get("username");
+    let password = r.secret("password", "password-file")?;
+    let token = r.secret("token", "token-file")?;
+    let jwt_as_token = r.parse_bool("jwt-as-token")?;
+    let jwt_as_token_pending = r.is_pending("jwt-as-token");
+
+    let has_creds = r.is_set("creds");
+    let has_jwt = r.is_set("jwt");
+    let has_seed = r.is_set("nkey-seed") || r.is_set("nkey-seed-file");
+    let has_username = r.is_set("username");
+    let has_password = r.is_set("password") || r.is_set("password-file");
+    let has_token = r.is_set("token") || r.is_set("token-file");
 
     let mut selected: Vec<&str> = Vec::new();
-    if creds.is_some() {
+    if has_creds {
         selected.push("creds");
     }
-    if jwt.is_some() || seed.is_some() {
+    if has_jwt || has_seed {
         selected.push("jwt/nkey-seed");
     }
-    if username.is_some() || password.is_some() {
+    if has_username || has_password {
         selected.push("username/password");
     }
-    if token.is_some() {
+    if has_token {
         selected.push("token");
     }
 
@@ -324,131 +465,235 @@ fn parse_auth(cfg: &HashMap<String, String>) -> anyhow::Result<NatsAuth> {
         );
     }
 
-    if let Some(path) = creds {
-        return Ok(NatsAuth::CredsFile(PathBuf::from(path)));
+    if has_creds {
+        return Ok(match (creds, jwt_as_token_pending) {
+            (Some(path), false) => Some(NatsAuth::CredsFile {
+                path: PathBuf::from(path.expose()),
+                jwt_as_token,
+            }),
+            _ => None,
+        });
     }
-    match (jwt, seed) {
-        (Some(jwt), Some(seed)) => {
-            return Ok(NatsAuth::JwtNkey {
-                jwt: jwt.to_string(),
-                seed: Zeroizing::new(seed.to_string()),
+    if jwt_as_token && !has_jwt {
+        bail!("`jwt-as-token` requires `creds` or `jwt`");
+    }
+    match (has_jwt, has_seed) {
+        (true, true) => {
+            return Ok(match (jwt, seed, jwt_as_token_pending) {
+                (Some(jwt), Some(seed), false) => Some(NatsAuth::JwtNkey {
+                    jwt: jwt.expose().to_string(),
+                    seed,
+                    jwt_as_token,
+                }),
+                _ => None,
             });
         }
-        (Some(_), None) => bail!("`jwt` requires `nkey-seed`"),
-        (None, Some(seed)) => return Ok(NatsAuth::NkeySeed(Zeroizing::new(seed.to_string()))),
-        (None, None) => {}
+        (true, false) => bail!("`jwt` requires `nkey-seed` or `nkey-seed-file`"),
+        (false, true) => return Ok(seed.map(NatsAuth::NkeySeed)),
+        (false, false) => {}
     }
-    match (username, password) {
-        (Some(username), Some(password)) => {
-            return Ok(NatsAuth::UserPassword {
-                username: username.to_string(),
-                password: Zeroizing::new(password.to_string()),
-            });
+    match (has_username, has_password) {
+        (true, true) => {
+            return Ok(username
+                .zip(password)
+                .map(|(username, password)| NatsAuth::UserPassword {
+                    username: username.expose().to_string(),
+                    password,
+                }));
         }
-        (Some(_), None) => bail!("`username` requires `password`"),
-        (None, Some(_)) => bail!("`password` requires `username`"),
-        (None, None) => {}
+        (true, false) => bail!("`username` requires `password` or `password-file`"),
+        (false, true) => bail!("`password` requires `username`"),
+        (false, false) => {}
     }
-    if let Some(token) = token {
-        return Ok(NatsAuth::Token(Zeroizing::new(token.to_string())));
+    if has_token {
+        return Ok(token.map(NatsAuth::Token));
     }
-    Ok(NatsAuth::Anonymous)
+    Ok(Some(NatsAuth::Anonymous))
+}
+
+/// Whether a binding names who it connects as.
+#[cfg_attr(not(feature = "wasi-blobstore"), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BindingIdentity {
+    /// No NATS credentials and no TLS client certificate.
+    Absent,
+    /// NATS credentials, a TLS client certificate, or both.
+    Explicit,
+}
+
+/// Classifies a binding's identity after all its secrets have resolved. A blank
+/// identity key is an error rather than absent.
+#[cfg_attr(not(feature = "wasi-blobstore"), allow(dead_code))]
+pub(crate) fn binding_identity(cfg: &Config) -> anyhow::Result<BindingIdentity> {
+    let layer = Layer {
+        cfg,
+        pending: &BTreeSet::new(),
+    };
+    layer.refuse_blank_identity()?;
+    let auth = parse_layer_auth(&layer)?.context("NATS credentials have no value")?;
+    Ok(
+        if matches!(auth, NatsAuth::Anonymous)
+            && !layer.is_set("tls-cert")
+            && !layer.is_set("tls-key")
+        {
+            BindingIdentity::Absent
+        } else {
+            BindingIdentity::Explicit
+        },
+    )
+}
+
+/// Parses and validates a config layer, leaving its pending keys unread.
+/// `auth` settles the credentials `parse_layer_auth` found, `None` when a pending
+/// key decides them.
+fn read<A>(
+    r: &Layer<'_>,
+    auth: impl FnOnce(Option<NatsAuth>) -> anyhow::Result<A>,
+) -> anyhow::Result<NatsConfig<A>> {
+    r.refuse_blank_identity()?;
+    let servers = r.list("servers");
+    if servers.is_empty() && !r.is_pending("servers") {
+        bail!("wasmcloud:nats requires a `servers` config value");
+    }
+    for server in &servers {
+        if server.contains('@') {
+            bail!(
+                "credentials embedded in `servers` are not applied by the NATS client and \
+                 would connect unauthenticated; use `creds`, `jwt`/`nkey-seed`, \
+                 `username`/`password`, `token`, or their `-file` keys instead"
+            );
+        }
+        // Without async-nats's `websockets` feature these dial plain TCP and
+        // skip the TLS upgrade, `require_tls` included.
+        let scheme = server.split_once("://").map(|(scheme, _)| scheme);
+        if scheme.is_some_and(|s| s.eq_ignore_ascii_case("ws") || s.eq_ignore_ascii_case("wss")) {
+            bail!("`{server}`: WebSocket NATS servers are not supported");
+        }
+    }
+
+    let ack_mode = match r.get("ack-mode") {
+        None => AckMode::Auto,
+        Some(raw) => match raw.expose() {
+            "auto" => AckMode::Auto,
+            "manual" => AckMode::Manual,
+            _ => bail!("`ack-mode` must be `auto` or `manual`, got `{raw}`"),
+        },
+    };
+
+    let request_timeout = match r.get("request-timeout-ms") {
+        Some(raw) => Some(Duration::from_millis(raw.expose().parse().with_context(
+            || format!("`request-timeout-ms` must be a positive integer, got `{raw}`"),
+        )?)),
+        None => None,
+    };
+
+    let limits = Limits {
+        max_in_flight: r.parse_usize("max-in-flight", DEFAULT_MAX_IN_FLIGHT)?,
+        subscription_capacity: r
+            .parse_usize("subscription-capacity", DEFAULT_SUBSCRIPTION_CAPACITY)?,
+        subscription_capacity_bytes: r.parse_usize(
+            "subscription-capacity-bytes",
+            DEFAULT_SUBSCRIPTION_CAPACITY_BYTES,
+        )?,
+        // Zero is meaningful here -- it is how an operator says "server
+        // default" -- so unlike the other two it is not rejected.
+        max_ack_pending: match r.get("max-ack-pending") {
+            Some(raw) => Some(raw.expose().parse().with_context(|| {
+                format!("`max-ack-pending` must be a non-negative integer, got `{raw}`")
+            })?),
+            None => None,
+        },
+        // Zero is meaningful here too: it is how an operator asks for the
+        // server's unlimited redelivery back.
+        max_deliver: match r.get("max-deliver") {
+            Some(raw) => Some(raw.expose().parse().with_context(|| {
+                format!("`max-deliver` must be a non-negative integer, got `{raw}`")
+            })?),
+            None => None,
+        },
+    };
+    if limits.max_in_flight == 0 {
+        bail!("`max-in-flight` must be greater than zero");
+    }
+    if limits.subscription_capacity == 0 {
+        bail!("`subscription-capacity` must be greater than zero");
+    }
+    if limits.subscription_capacity_bytes == 0 {
+        bail!("`subscription-capacity-bytes` must be greater than zero");
+    }
+    // Each sizes a semaphore or a bounded channel, which panic above this.
+    const MAX_PERMITS: usize = tokio::sync::Semaphore::MAX_PERMITS;
+    for (key, value) in [
+        ("max-in-flight", limits.max_in_flight),
+        ("subscription-capacity", limits.subscription_capacity),
+    ] {
+        if value > MAX_PERMITS {
+            let value = r
+                .get(key)
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            bail!("`{key}` must be at most {MAX_PERMITS}, got {value}");
+        }
+    }
+
+    let tls = TlsConfig {
+        ca: r.get("tls-ca").map(|v| PathBuf::from(v.expose())),
+        cert: r.get("tls-cert").map(|v| PathBuf::from(v.expose())),
+        key: r.get("tls-key").map(|v| PathBuf::from(v.expose())),
+        first: r.parse_bool("tls-first")?,
+    };
+    if r.is_set("tls-cert") != r.is_set("tls-key") {
+        bail!("`tls-cert` and `tls-key` must be set together");
+    }
+
+    Ok(NatsConfig {
+        secret_keys: r
+            .cfg
+            .iter()
+            .filter(|(_, value)| value.is_secret())
+            .map(|(key, _)| super::keys::canonical(key))
+            .collect(),
+        servers,
+        name: r.get("name").map(|v| v.expose().to_string()),
+        jetstream_domain: r.get("jetstream-domain").map(|v| v.expose().to_string()),
+        inbox_prefix: r.get("inbox-prefix").map(|v| v.expose().to_string()),
+        auth: auth(parse_layer_auth(r)?)?,
+        tls,
+        policy: PolicySpec {
+            subject_allow: r.list("subject-allow"),
+            stream_allow: r.list("stream-allow"),
+            stream_delete_allow: r.list("stream-delete-allow"),
+            bucket_allow: r.list("bucket-allow"),
+        },
+        limits,
+        ack_mode,
+        request_timeout,
+    })
+}
+
+impl<A> std::fmt::Debug for NatsConfig<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NatsConfig").finish_non_exhaustive()
+    }
 }
 
 impl NatsConfig {
+    /// Checks a binding's layer before bind, with the keys in `pending` still
+    /// waiting on a plugin secret, and returns the servers known now.
+    pub fn check_layer(cfg: &Config, pending: &BTreeSet<String>) -> anyhow::Result<Vec<String>> {
+        Ok(read(&Layer { cfg, pending }, Ok)?.servers)
+    }
+
     /// Parses and validates a workload's config map.
-    pub fn from_map(cfg: &HashMap<String, String>) -> anyhow::Result<Self> {
-        let servers = list(cfg, "servers");
-        if servers.is_empty() {
-            bail!("wasmcloud:nats requires a `servers` config value");
-        }
-        for server in &servers {
-            if server.contains('@') {
-                bail!(
-                    "credentials embedded in `servers` are not applied by the NATS client and \
-                     would connect unauthenticated; use `creds`, `jwt`/`nkey-seed`, \
-                     `username`/`password`, or `token` instead"
-                );
-            }
-        }
-
-        let ack_mode = match get(cfg, "ack-mode") {
-            None | Some("auto") => AckMode::Auto,
-            Some("manual") => AckMode::Manual,
-            Some(other) => bail!("`ack-mode` must be `auto` or `manual`, got `{other}`"),
+    pub fn from_map(cfg: &Config) -> anyhow::Result<Self> {
+        let layer = Layer {
+            cfg,
+            pending: &BTreeSet::new(),
         };
-
-        let request_timeout = match get(cfg, "request-timeout-ms") {
-            Some(raw) => Some(Duration::from_millis(raw.parse().with_context(|| {
-                format!("`request-timeout-ms` must be a positive integer, got `{raw}`")
-            })?)),
-            None => None,
-        };
-
-        let limits = Limits {
-            max_in_flight: parse_usize(cfg, "max-in-flight", DEFAULT_MAX_IN_FLIGHT)?,
-            subscription_capacity: parse_usize(
-                cfg,
-                "subscription-capacity",
-                DEFAULT_SUBSCRIPTION_CAPACITY,
-            )?,
-            subscription_capacity_bytes: parse_usize(
-                cfg,
-                "subscription-capacity-bytes",
-                DEFAULT_SUBSCRIPTION_CAPACITY_BYTES,
-            )?,
-            // Zero is meaningful here -- it is how an operator says "server
-            // default" -- so unlike the other two it is not rejected.
-            max_ack_pending: match get(cfg, "max-ack-pending") {
-                Some(raw) => Some(raw.parse().with_context(|| {
-                    format!("`max-ack-pending` must be a non-negative integer, got `{raw}`")
-                })?),
-                None => None,
-            },
-            // Zero is meaningful here too: it is how an operator asks for the
-            // server's unlimited redelivery back.
-            max_deliver: match get(cfg, "max-deliver") {
-                Some(raw) => Some(raw.parse().with_context(|| {
-                    format!("`max-deliver` must be a non-negative integer, got `{raw}`")
-                })?),
-                None => None,
-            },
-        };
-        if limits.max_in_flight == 0 {
-            bail!("`max-in-flight` must be greater than zero");
-        }
-        if limits.subscription_capacity == 0 {
-            bail!("`subscription-capacity` must be greater than zero");
-        }
-        if limits.subscription_capacity_bytes == 0 {
-            bail!("`subscription-capacity-bytes` must be greater than zero");
-        }
-
-        let tls = TlsConfig {
-            ca: get(cfg, "tls-ca").map(PathBuf::from),
-            cert: get(cfg, "tls-cert").map(PathBuf::from),
-            key: get(cfg, "tls-key").map(PathBuf::from),
-            first: parse_bool(cfg, "tls-first")?,
-        };
-        if tls.cert.is_some() != tls.key.is_some() {
-            bail!("`tls-cert` and `tls-key` must be set together");
-        }
-
-        Ok(Self {
-            servers,
-            name: get(cfg, "name").map(String::from),
-            jetstream_domain: get(cfg, "jetstream-domain").map(String::from),
-            inbox_prefix: get(cfg, "inbox-prefix").map(String::from),
-            auth: parse_auth(cfg)?,
-            tls,
-            policy: PolicySpec {
-                subject_allow: list(cfg, "subject-allow"),
-                stream_allow: list(cfg, "stream-allow"),
-                bucket_allow: list(cfg, "bucket-allow"),
-            },
-            limits,
-            ack_mode,
-            request_timeout,
+        // With nothing pending, every mechanism `parse_layer_auth` selects has its
+        // values.
+        read(&layer, |auth| {
+            auth.context("NATS credentials have no value")
         })
     }
 
@@ -468,27 +713,33 @@ impl NatsConfig {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         match &self.auth {
             NatsAuth::Anonymous => 0u8.hash(&mut hasher),
-            NatsAuth::CredsFile(path) => {
+            NatsAuth::CredsFile { path, jwt_as_token } => {
                 1u8.hash(&mut hasher);
                 path.hash(&mut hasher);
+                jwt_as_token.hash(&mut hasher);
             }
-            NatsAuth::JwtNkey { jwt, seed } => {
+            NatsAuth::JwtNkey {
+                jwt,
+                seed,
+                jwt_as_token,
+            } => {
                 2u8.hash(&mut hasher);
                 jwt.hash(&mut hasher);
-                seed.as_str().hash(&mut hasher);
+                hash_secret(seed, &mut hasher);
+                jwt_as_token.hash(&mut hasher);
             }
             NatsAuth::NkeySeed(seed) => {
                 3u8.hash(&mut hasher);
-                seed.as_str().hash(&mut hasher);
+                hash_secret(seed, &mut hasher);
             }
             NatsAuth::UserPassword { username, password } => {
                 4u8.hash(&mut hasher);
                 username.hash(&mut hasher);
-                password.as_str().hash(&mut hasher);
+                hash_secret(password, &mut hasher);
             }
             NatsAuth::Token(token) => {
                 5u8.hash(&mut hasher);
-                token.as_str().hash(&mut hasher);
+                hash_secret(token, &mut hasher);
             }
         }
         self.tls.ca.hash(&mut hasher);
@@ -507,6 +758,7 @@ impl NatsConfig {
         for allow in [
             &self.policy.subject_allow,
             &self.policy.stream_allow,
+            &self.policy.stream_delete_allow,
             &self.policy.bucket_allow,
         ] {
             let mut sorted = allow.clone();
@@ -522,6 +774,7 @@ impl NatsConfig {
         self.request_timeout.hash(&mut hasher);
 
         ConnKey {
+            servers_secret: self.secret_keys.contains("servers"),
             servers: self.servers.clone(),
             name: self.name.clone(),
             jetstream_domain: self.jetstream_domain.clone(),
@@ -531,14 +784,37 @@ impl NatsConfig {
     }
 }
 
+/// A file's path stands in for its contents, which change under rotation
+/// without changing the binding.
+fn hash_secret(secret: &Secret, hasher: &mut impl std::hash::Hasher) {
+    use std::hash::Hash as _;
+    match secret {
+        Secret::Value(value) => {
+            0u8.hash(hasher);
+            value.as_str().hash(hasher);
+        }
+        Secret::File(path) => {
+            1u8.hash(hasher);
+            path.hash(hasher);
+        }
+    }
+}
+
 /// Identity of a connection within a workload. Never shared across workloads.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ConnKey {
+    pub servers_secret: bool,
     pub servers: Vec<String>,
     pub name: Option<String>,
     pub jetstream_domain: Option<String>,
     pub inbox_prefix: Option<String>,
     pub credential_fingerprint: u64,
+}
+
+impl std::fmt::Debug for ConnKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnKey").finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -760,22 +1036,180 @@ pub(super) fn parse_kv_watches(binding: &str, raw: &str) -> anyhow::Result<Vec<K
 /// One declared subscription as the author wrote it, used both to recognise the
 /// same subscription arriving on a second component and to name it in the error
 /// that refuses the pair.
-pub(super) fn subscription_spec(key: &str, binding: &str, value: String) -> String {
-    if binding.is_empty() {
+pub(super) fn subscription_spec(
+    key: &str,
+    binding: &str,
+    source: ConfigStr<'_>,
+    value: String,
+) -> ConfigValue {
+    let spec = if binding.is_empty() {
         format!("`{key}: {value}`")
     } else {
         format!("`{key}: {value}` on binding `{binding}`")
+    };
+    if source.is_secret() {
+        ConfigValue::Secret(crate::plugin::SecretValue::new(spec))
+    } else {
+        ConfigValue::Text(spec)
     }
 }
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
-    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
+    #[test]
+    fn binding_identity_classifies_resolved_config() -> anyhow::Result<()> {
+        for absent in [
+            map(&[]),
+            map(&[("servers", "nats://data:4222"), ("tls-ca", "/ca.crt")]),
+            map(&[("jwt-as-token", "false")]),
+        ] {
+            assert_eq!(binding_identity(&absent)?, BindingIdentity::Absent);
+        }
+        for explicit in [
+            map(&[("user", "tenant"), ("password", "secret")]),
+            map(&[("TLS_CERT", "/tenant.crt"), ("TLS_KEY", "/tenant.key")]),
+            map(&[("token", "tenant"), ("tls-cert", "/c"), ("tls-key", "/k")]),
+        ] {
+            assert_eq!(binding_identity(&explicit)?, BindingIdentity::Explicit);
+        }
+        assert!(binding_identity(&map(&[("username", "tenant")])).is_err());
+        assert!(
+            binding_identity(&map(&[
+                ("username", "tenant"),
+                ("password", "secret"),
+                ("token", "other")
+            ]))
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn websocket_servers_are_refused() {
+        for server in ["ws://data:443", "wss://data:443", "WSS://data:443"] {
+            let cfg = map(&[("servers", &format!("nats://ok:4222, {server}"))]);
+            let error = NatsConfig::from_map(&cfg).err().unwrap().to_string();
+            assert!(error.contains("WebSocket"), "{error}");
+            assert!(NatsConfig::check_layer(&cfg, &BTreeSet::new()).is_err());
+        }
+        for server in ["nats://data:4222", "tls://data:4222", "data:4222"] {
+            NatsConfig::from_map(&map(&[("servers", server)])).unwrap();
+        }
+    }
+
+    #[test]
+    fn blank_identity_keys_are_refused() {
+        for blank in [
+            map(&[("token", "")]),
+            map(&[("TOKEN_FILE", " \t")]),
+            map(&[("creds-file", "")]),
+            map(&[("tls-cert", ""), ("tls-key", "")]),
+            map(&[("username", "tenant"), ("password", "")]),
+        ] {
+            let error = binding_identity(&blank).unwrap_err().to_string();
+            assert!(error.contains("empty values"), "{error}");
+        }
+        assert_eq!(
+            binding_identity(&map(&[("name", ""), ("tls-ca", "")])).unwrap(),
+            BindingIdentity::Absent
+        );
+        assert_eq!(
+            binding_identity(&map(&[("creds", "/tenant.creds"), ("creds-file", "")])).unwrap(),
+            BindingIdentity::Explicit
+        );
+    }
+
+    #[test]
+    fn nats_bindings_refuse_blank_identity_keys() {
+        let cfg = map(&[("servers", "nats://data:4222"), ("token", " ")]);
+        let error = NatsConfig::from_map(&cfg).err().unwrap().to_string();
+        assert!(error.contains("empty values: `token`"), "{error}");
+        assert!(NatsConfig::check_layer(&cfg, &BTreeSet::new()).is_err());
+        NatsConfig::check_layer(&cfg, &pending(&["token"])).unwrap();
+    }
+
+    #[test]
+    fn oversized_secret_limits_are_not_quoted() {
+        for key in ["max-in-flight", "subscription-capacity"] {
+            let value = usize::MAX.to_string();
+            for secret in [false, true] {
+                let mut config = map(&[("servers", "nats://localhost:4222")]);
+                if secret {
+                    config.insert(key, crate::plugin::SecretValue::new(value.clone()));
+                } else {
+                    config.insert(key, value.clone());
+                }
+                let error = NatsConfig::from_map(&config).unwrap_err().to_string();
+                assert_eq!(error.contains(&value), !secret, "{error}");
+            }
+        }
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> Config {
+        pairs.iter().copied().collect()
+    }
+
+    fn pending(keys: &[&str]) -> BTreeSet<String> {
+        keys.iter().map(|k| k.to_string()).collect()
+    }
+
+    fn read_pending(
+        cfg: &Config,
+        pending: &BTreeSet<String>,
+    ) -> anyhow::Result<NatsConfig<Option<NatsAuth>>> {
+        read(&Layer { cfg, pending }, Ok)
+    }
+
+    /// A layer whose credentials wait on a secret reads, with no credentials
+    /// yet; one whose secret supplies only an unrelated key keeps its own.
+    #[test]
+    fn a_pending_key_leaves_its_credentials_unresolved() {
+        let layer = map(&[("servers", "nats://a:4222"), ("username", "svc")]);
+        let read = read_pending(&layer, &pending(&["password"])).unwrap();
+        assert!(read.auth.is_none());
+
+        let layer = map(&[("servers", "nats://a:4222"), ("token", "t")]);
+        let read = read_pending(&layer, &pending(&["name"])).unwrap();
+        assert!(matches!(read.auth, Some(NatsAuth::Token(_))));
+        assert_eq!(read.name, None);
+    }
+
+    /// A pending alias is the same key as its canonical spelling.
+    #[test]
+    fn a_pending_alias_reads_as_set() {
+        let layer = map(&[("servers", "nats://a:4222")]);
+        let read = read_pending(&layer, &pending(&["creds-file"])).unwrap();
+        assert!(read.auth.is_none());
+        let err = read_pending(
+            &map(&[("servers", "nats://a:4222"), ("token", "t")]),
+            &pending(&["creds-file"]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("conflicting"), "{err:#}");
+    }
+
+    /// A pending `servers` satisfies the requirement and contributes no
+    /// address.
+    #[test]
+    fn a_pending_servers_is_present_with_no_address() {
+        let read = read_pending(&map(&[]), &pending(&["servers"])).unwrap();
+        assert!(read.servers.is_empty());
+        assert!(matches!(read.auth, Some(NatsAuth::Anonymous)));
+    }
+
+    #[test]
+    fn stream_delete_grant_is_deny_by_default_and_part_of_connection_identity() {
+        let base = NatsConfig::from_map(&map(&[("servers", "nats://localhost:4222")])).unwrap();
+        assert!(base.policy.stream_delete_allow.is_empty());
+        let grant = NatsConfig::from_map(&map(&[
+            ("servers", "nats://localhost:4222"),
+            ("stream-delete-allow", "ORDERS"),
+        ]))
+        .unwrap();
+        assert_eq!(grant.policy.stream_delete_allow, ["ORDERS"]);
+        assert_ne!(base.connection_key(), grant.connection_key());
     }
 
     #[test]
@@ -833,6 +1267,126 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.to_string().contains("requires `password`"));
+    }
+
+    /// Each inline secret has a `-file` key, so a Secret can be mounted and
+    /// rotated rather than resolved into the binding once.
+    #[test]
+    fn secrets_may_be_files() {
+        let auth = |pairs: &[(&str, &str)]| {
+            let mut pairs = pairs.to_vec();
+            pairs.push(("servers", "nats://localhost:4222"));
+            NatsConfig::from_map(&map(&pairs)).map(|cfg| cfg.auth)
+        };
+        let file = |secret: &Secret| match secret {
+            Secret::File(path) => Some(path.clone()),
+            Secret::Value(_) => None,
+        };
+
+        let token = auth(&[("token-file", "/s/token")]).unwrap();
+        assert_eq!(token.kind(), "token-file");
+        assert!(matches!(&token, NatsAuth::Token(t) if file(t) == Some("/s/token".into())));
+
+        let seed = auth(&[("nkey-file", "/s/seed")]).unwrap();
+        assert_eq!(seed.kind(), "nkey-file");
+        assert!(matches!(&seed, NatsAuth::NkeySeed(s) if file(s) == Some("/s/seed".into())));
+
+        let jwt = auth(&[("jwt", "eyJ0"), ("nkey-seed-file", "/s/seed")]).unwrap();
+        assert_eq!(jwt.kind(), "jwt+nkey-file");
+        assert!(matches!(&jwt, NatsAuth::JwtNkey { seed, .. } if file(seed).is_some()));
+
+        let user = auth(&[("username", "u"), ("password-file", "/s/pass")]).unwrap();
+        assert_eq!(user.kind(), "user-password-file");
+        assert!(
+            matches!(&user, NatsAuth::UserPassword { password, .. } if file(password).is_some())
+        );
+    }
+
+    #[test]
+    fn jwt_as_token_needs_a_jwt() {
+        let parse = |pairs: &[(&str, &str)]| {
+            let mut pairs = pairs.to_vec();
+            pairs.push(("servers", "nats://localhost:4222"));
+            pairs.push(("jwt-as-token", "true"));
+            NatsConfig::from_map(&map(&pairs))
+        };
+        let creds = parse(&[("creds", "/s/creds")]).unwrap();
+        assert!(matches!(
+            creds.auth,
+            NatsAuth::CredsFile {
+                jwt_as_token: true,
+                ..
+            }
+        ));
+        let jwt = parse(&[("jwt", "eyJ0"), ("nkey-seed-file", "/s/seed")]).unwrap();
+        assert!(matches!(
+            jwt.auth,
+            NatsAuth::JwtNkey {
+                jwt_as_token: true,
+                ..
+            }
+        ));
+        for pairs in [&[("token", "t")][..], &[("nkey-seed-file", "/s/seed")], &[]] {
+            let err = parse(pairs).unwrap_err();
+            assert!(
+                err.to_string().contains("requires `creds` or `jwt`"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_key_separates_jwt_as_token() {
+        let key = |pairs: &[(&str, &str)]| {
+            let mut pairs = pairs.to_vec();
+            pairs.push(("servers", "nats://localhost:4222"));
+            pairs.push(("creds", "/s/creds"));
+            NatsConfig::from_map(&map(&pairs)).unwrap().connection_key()
+        };
+        assert_eq!(key(&[]), key(&[("jwt-as-token", "false")]));
+        assert_ne!(key(&[]), key(&[("jwt-as-token", "true")]));
+    }
+
+    #[test]
+    fn a_secret_and_its_file_conflict() {
+        for (key, file_key) in [
+            ("token", "token-file"),
+            ("password", "password-file"),
+            ("nkey-seed", "nkey-seed-file"),
+        ] {
+            let err = NatsConfig::from_map(&map(&[
+                ("servers", "nats://localhost:4222"),
+                ("username", "u"),
+                (key, "inline"),
+                (file_key, "/s/file"),
+            ]))
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("were both supplied"),
+                "{key}: {err}"
+            );
+        }
+        let err = NatsConfig::from_map(&map(&[
+            ("servers", "nats://localhost:4222"),
+            ("creds", "/s/creds"),
+            ("token-file", "/s/token"),
+        ]))
+        .unwrap_err();
+        assert!(err.to_string().contains("conflicting NATS credentials"));
+    }
+
+    /// A file's path is its identity: two bindings reading one file share a
+    /// connection, and a value is never mistaken for a path that spells it.
+    #[test]
+    fn connection_key_separates_secret_files() {
+        let key = |pairs: &[(&str, &str)]| {
+            let mut pairs = pairs.to_vec();
+            pairs.push(("servers", "nats://localhost:4222"));
+            NatsConfig::from_map(&map(&pairs)).unwrap().connection_key()
+        };
+        assert_eq!(key(&[("token-file", "/a")]), key(&[("token-file", "/a")]));
+        assert_ne!(key(&[("token-file", "/a")]), key(&[("token-file", "/b")]));
+        assert_ne!(key(&[("token-file", "/a")]), key(&[("token", "/a")]));
     }
 
     #[test]
@@ -910,8 +1464,14 @@ mod tests {
             .limits
             .ack_pending_advisory(64 * 1024 * 1024)
             .expect("the floor overruled the byte budget");
-        assert!(advisory.contains("serialise"), "{advisory}");
-        assert!(advisory.contains("max-ack-pending"), "{advisory}");
+        assert!(
+            advisory.contains("serialise"),
+            "missing delivery-floor guidance"
+        );
+        assert!(
+            advisory.contains("max-ack-pending"),
+            "missing configuration key"
+        );
 
         // An operator who set it themselves is not second-guessed.
         let explicit = NatsConfig::from_map(&map(&[
@@ -1047,6 +1607,28 @@ mod tests {
         }
     }
 
+    /// Workload config, so a huge value must fail the bind rather than panic
+    /// the host in `Semaphore::new` or `mpsc::channel`.
+    #[test]
+    fn limits_above_what_a_semaphore_holds_fail() {
+        let max = tokio::sync::Semaphore::MAX_PERMITS;
+        for key in ["max-in-flight", "subscription-capacity"] {
+            for value in [(max + 1).to_string(), usize::MAX.to_string()] {
+                let err = NatsConfig::from_map(&map(&[
+                    ("servers", "nats://localhost:4222"),
+                    (key, &value),
+                ]))
+                .unwrap_err();
+                assert!(err.to_string().contains("at most"), "{key}={value}: {err}");
+            }
+            NatsConfig::from_map(&map(&[
+                ("servers", "nats://localhost:4222"),
+                (key, &max.to_string()),
+            ]))
+            .unwrap_or_else(|e| panic!("{key}={max}: {e}"));
+        }
+    }
+
     #[test]
     fn bad_ack_mode_fails() {
         let err = NatsConfig::from_map(&map(&[
@@ -1148,9 +1730,13 @@ mod tests {
             ("token", "super-secret"),
         ]))
         .unwrap();
-        let rendered = format!("{cfg:?}");
-        assert!(!rendered.contains("super-secret"));
-        assert!(rendered.contains("token"));
+        assert!(!format!("{cfg:?}").contains("super-secret"));
+        let auth = format!("{:?}", cfg.auth);
+        assert!(!auth.contains("super-secret"));
+        assert!(
+            auth.contains("token"),
+            "missing token field in debug output"
+        );
     }
     #[test]
     fn jetstream_subs_basic() {

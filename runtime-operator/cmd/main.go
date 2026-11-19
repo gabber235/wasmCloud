@@ -17,10 +17,11 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"flag"
-	"net/http"
+	"fmt"
 	"os"
 	"strings"
 
@@ -32,15 +33,17 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	"go.wasmcloud.dev/runtime-operator/v2/pkg/logging"
+	"go.wasmcloud.dev/runtime-operator/v2/pkg/natsclient"
 	"go.wasmcloud.dev/runtime-operator/v2/pkg/wasmbus"
 
 	"github.com/nats-io/nats.go"
@@ -61,11 +64,30 @@ func init() {
 	// +kubebuilder:scaffold:scheme
 }
 
+// invalidLoggingError is returned before a logger exists to report it.
+type invalidLoggingError struct{ error }
+
 func main() {
+	err := run(ctrl.SetupSignalHandler(), flag.CommandLine, os.Args[1:], ctrl.GetConfig)
+	var invalidLogging invalidLoggingError
+	switch {
+	case err == nil:
+	case errors.As(err, &invalidLogging):
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	default:
+		setupLog.Error(err, "operator exited")
+		os.Exit(1)
+	}
+}
+
+// run parses args into fs, starts the operator, and blocks until ctx is done
+// or the manager fails. getConfig runs after parsing so it sees -kubeconfig.
+func run(ctx context.Context, fs *flag.FlagSet, args []string, getConfig func() (*rest.Config, error)) error {
 	var (
 		metricsAddr                 string
 		natsUrl                     string
-		natsCreds                   string
+		natsClient                  = natsclient.Flags{Name: "runtime-operator"}
 		natsCa                      string
 		natsClientCert              string
 		natsClientKey               string
@@ -74,7 +96,6 @@ func main() {
 		probeAddr                   string
 		secureMetrics               bool
 		enableHTTP2                 bool
-		jsonLog                     bool
 		cpuBackpressureThreshold    float64
 		memoryBackpressureThreshold float64
 		disableArtifactController   bool
@@ -83,45 +104,44 @@ func main() {
 		allowSharedHosts            bool
 	)
 
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8081", "The address the metrics endpoint binds to. "+
+	fs.StringVar(&metricsAddr, "metrics-bind-address", ":8081", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8082", "The address the probe endpoint binds to.")
-	flag.StringVar(&natsCreds, "nats-creds", "", "Path to NATS credentials file.")
-	flag.StringVar(&natsCa, "nats-ca", "", "Path to TLS CA pem")
-	flag.StringVar(&natsClientCert, "nats-client-cert", "", "Path to TLS client certificate pem")
-	flag.StringVar(&natsClientKey, "nats-client-key", "", "Path to TLS client key pem")
-	flag.BoolVar(&natsTLSFirst, "nats-tls-first", false, "Skip NATS Server discovery during TLS")
-	flag.StringVar(&natsUrl, "nats-url", wasmbus.NatsDefaultURL, "The nats server address to connect to.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
+	fs.StringVar(&probeAddr, "health-probe-bind-address", ":8082", "The address the probe endpoint binds to.")
+	natsClient.Register(fs, "nats")
+	fs.StringVar(&natsCa, "nats-ca", "", "Path to TLS CA pem")
+	fs.StringVar(&natsClientCert, "nats-client-cert", "", "Path to TLS client certificate pem")
+	fs.StringVar(&natsClientKey, "nats-client-key", "", "Path to TLS client key pem")
+	fs.BoolVar(&natsTLSFirst, "nats-tls-first", false, "Skip NATS Server discovery during TLS")
+	fs.StringVar(&natsUrl, "nats-url", wasmbus.NatsDefaultURL, "The nats server address to connect to.")
+	fs.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
-	flag.BoolVar(&secureMetrics, "metrics-secure", false,
+	fs.BoolVar(&secureMetrics, "metrics-secure", false,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
-	flag.BoolVar(&enableHTTP2, "enable-http2", false,
+	fs.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
-	flag.BoolVar(&jsonLog, "json-log", false, "Output logs in JSON format")
-	flag.Float64Var(&cpuBackpressureThreshold, "cpu-backpressure-threshold", 80.0, "CPU backpressure threshold (%)")
-	flag.Float64Var(
+	fs.Float64Var(&cpuBackpressureThreshold, "cpu-backpressure-threshold", 80.0, "CPU backpressure threshold (%)")
+	fs.Float64Var(
 		&memoryBackpressureThreshold,
 		"memory-backpressure-threshold",
 		80.0,
 		"Memory backpressure threshold (%)")
-	flag.BoolVar(
+	fs.BoolVar(
 		&disableArtifactController,
 		"disable-artifact-controller",
 		false,
 		"Delegates Artifact reconciliation to an external controller.",
 	)
-	flag.StringVar(
+	fs.StringVar(
 		&watchNamespaces,
 		"watch-namespaces",
 		"",
 		"Comma-separated list of namespaces to watch for WorkloadDeployment-side resources "+
-			"(artifacts, workloads, workloadreplicasets, workloaddeployments + the "+
+			"(artifacts, workloads, workloadreplicasets, workloaddeployments, workloaddaemonsets + the "+
 			"services/endpointslices/configmaps/secrets/events the workload reconcilers touch). "+
 			"If empty, watches all namespaces.",
 	)
-	flag.StringVar(
+	fs.StringVar(
 		&hostNamespaces,
 		"host-namespaces",
 		"",
@@ -131,7 +151,7 @@ func main() {
 			"always lives in the operator's own namespace. If empty, host Pods are assumed to "+
 			"run only in the operator's own namespace.",
 	)
-	flag.BoolVar(
+	fs.BoolVar(
 		&allowSharedHosts,
 		"allow-shared-hosts",
 		true,
@@ -141,28 +161,22 @@ func main() {
 			"environment is rejected.",
 	)
 
-	opts := zap.Options{
-		Development: true,
+	logOptions := logging.Options{Development: true}
+	logOptions.BindFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
-	opts.BindFlags(flag.CommandLine)
-	flag.Parse()
-
-	zapOpts := []zap.Opts{
-		zap.UseFlagOptions(&opts),
+	logger, err := logOptions.Logger(os.Stderr)
+	if err != nil {
+		return invalidLoggingError{err}
 	}
-	if jsonLog {
-		zapOpts = append(zapOpts, zap.JSONEncoder())
-	}
-	ctrl.SetLogger(zap.New(
-		zapOpts...,
-	))
+	logging.Configure(logger)
 
 	// OPERATOR_NAMESPACE is required: every Host CRD is created here, and
 	// the namespaced Role for Host CRUD binds to this namespace.
 	operatorNamespace := os.Getenv("OPERATOR_NAMESPACE")
 	if operatorNamespace == "" {
-		setupLog.Error(errors.New("OPERATOR_NAMESPACE is unset"), "missing required configuration")
-		os.Exit(1)
+		return errors.New("missing required configuration: OPERATOR_NAMESPACE is unset")
 	}
 
 	operatorCfg := runtime_operator.EmbeddedOperatorConfig{
@@ -176,9 +190,11 @@ func main() {
 		AllowSharedHosts:          allowSharedHosts,
 	}
 
-	if natsCreds != "" {
-		operatorCfg.NatsOptions = append(operatorCfg.NatsOptions, nats.UserCredentials(natsCreds))
+	clientOptions, err := natsClient.Options()
+	if err != nil {
+		return fmt.Errorf("invalid NATS client configuration: %w", err)
 	}
+	operatorCfg.NatsOptions = append(operatorCfg.NatsOptions, clientOptions...)
 
 	if natsCa != "" {
 		operatorCfg.NatsOptions = append(operatorCfg.NatsOptions, nats.RootCAs(natsCa))
@@ -204,6 +220,9 @@ func main() {
 			setupLog.Error(nil, "nats connection closed")
 		}),
 	)
+	// Last, so it wraps the handlers above rather than replacing them.
+	liveness := natsclient.NewLiveness(natsClient.AuthFailureGrace)
+	operatorCfg.NatsOptions = append(operatorCfg.NatsOptions, liveness.Option())
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -281,7 +300,12 @@ func main() {
 		&corev1.Pod{}:           {Namespaces: podCacheNamespaces},
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	restConfig, err := getConfig()
+	if err != nil {
+		return fmt.Errorf("unable to get kubeconfig: %w", err)
+	}
+
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		Cache:                  cacheOpts,
@@ -302,57 +326,37 @@ func main() {
 		// LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
-		setupLog.Error(err, "unable to start manager")
-		os.Exit(1)
+		return fmt.Errorf("unable to start manager: %w", err)
 	}
-
-	ctx := ctrl.SetupSignalHandler()
 
 	embeddedOperator, err := runtime_operator.NewEmbeddedOperator(ctx, mgr, operatorCfg)
 	if err != nil {
-		setupLog.Error(err, "unable to create runtime operator")
-		os.Exit(1)
+		return fmt.Errorf("unable to create runtime operator: %w", err)
 	}
 
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up health check")
-		os.Exit(1)
+		return fmt.Errorf("unable to set up health check: %w", err)
 	}
-	// Liveness must reflect NATS connectivity: a permanently closed connection
-	// means the operator can no longer observe host heartbeats, so the kubelet
-	// should restart the pod. Only the terminal closed state fails the probe —
-	// transient reconnecting stays healthy so routine NATS rollouts don't
-	// trigger restart storms.
-	if err := mgr.AddHealthzCheck("nats", natsLivenessCheck(embeddedOperator.NatsConn)); err != nil {
-		setupLog.Error(err, "unable to set up nats health check")
-		os.Exit(1)
+	// Liveness must reflect NATS connectivity: a closed connection, or one whose
+	// credential the server has refused past the grace, means the operator can
+	// no longer observe host heartbeats, so the kubelet should restart the pod.
+	// Reconnecting for any other reason stays healthy so routine NATS rollouts
+	// don't trigger restart storms.
+	liveness.Watch(embeddedOperator.NatsConn)
+	if err := mgr.AddHealthzCheck("nats", liveness.Check); err != nil {
+		return fmt.Errorf("unable to set up nats health check: %w", err)
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up ready check")
-		os.Exit(1)
+		return fmt.Errorf("unable to set up ready check: %w", err)
 	}
 
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctx); err != nil {
-		setupLog.Error(err, "problem running manager")
-		os.Exit(1)
+		return fmt.Errorf("problem running manager: %w", err)
 	}
-}
-
-// natsLivenessCheck reports the operator as unhealthy only when the NATS
-// connection is permanently closed. A closed connection means the operator can
-// no longer observe host heartbeats, so Kubernetes should restart the pod. It
-// deliberately stays healthy while merely reconnecting so routine NATS rollouts
-// don't trigger restart storms.
-func natsLivenessCheck(nc *nats.Conn) healthz.Checker {
-	return func(_ *http.Request) error {
-		if nc.IsClosed() {
-			return errors.New("nats connection permanently closed")
-		}
-		return nil
-	}
+	return nil
 }
 
 // splitCSVList parses a comma-separated string into a trimmed, non-empty

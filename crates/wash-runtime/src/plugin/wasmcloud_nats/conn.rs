@@ -15,7 +15,7 @@ use anyhow::Context as _;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
-use super::config::{ConnKey, NatsAuth, NatsConfig};
+use super::config::{ConnKey, NatsConfig};
 use super::policy::PolicyEngine;
 
 /// Budget for draining one connection's in-flight work at shutdown.
@@ -34,12 +34,6 @@ const REPLY_GRANT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 /// Cap on outstanding reply grants, so a firehose of unanswered requests cannot
 /// grow the map without bound.
 const MAX_PENDING_REPLIES: usize = 1024;
-
-/// How long to wait on a credentials-file read before failing the bind.
-///
-/// The read is off the executor either way; the timeout is so a hung mount
-/// fails the deploy with something legible rather than parking it forever.
-const CREDS_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A live connection plus everything derived from the config that opened it.
 pub struct ConnHandle {
@@ -66,6 +60,7 @@ pub struct ConnHandle {
     pub subscription_denials: tokio::sync::broadcast::Sender<String>,
     pub client: async_nats::Client,
     pub jetstream: async_nats::jetstream::Context,
+    pub(super) jetstream_prefix: String,
     pub policy: Arc<PolicyEngine>,
     pub ack_mode: super::config::AckMode,
     pub limits: super::config::Limits,
@@ -185,40 +180,6 @@ pub struct ConnectionRegistry {
     workloads: RwLock<HashMap<String, WorkloadConns>>,
 }
 
-/// Applies auth to a builder. The nkey signing callback stays here, host-side.
-async fn apply_auth(
-    opts: async_nats::ConnectOptions,
-    auth: &NatsAuth,
-) -> anyhow::Result<async_nats::ConnectOptions> {
-    Ok(match auth {
-        NatsAuth::Anonymous => opts,
-        NatsAuth::CredsFile(path) => {
-            // Blocking here would pin a runtime worker for as long as the mount
-            // takes to answer, which on a hung NFS/FUSE path is forever.
-            let creds = tokio::time::timeout(CREDS_READ_TIMEOUT, tokio::fs::read_to_string(path))
-                .await
-                .with_context(|| format!("timed out reading NATS creds file {}", path.display()))?
-                .with_context(|| format!("failed to read NATS creds file {}", path.display()))?;
-            async_nats::ConnectOptions::with_credentials(&creds)
-                .context("failed to parse NATS creds file")?
-        }
-        NatsAuth::JwtNkey { jwt, seed } => {
-            let key_pair = std::sync::Arc::new(
-                nkeys::KeyPair::from_seed(seed).context("invalid NATS nkey seed")?,
-            );
-            opts.jwt(jwt.clone(), move |nonce| {
-                let key_pair = key_pair.clone();
-                async move { key_pair.sign(&nonce).map_err(async_nats::AuthError::new) }
-            })
-        }
-        NatsAuth::NkeySeed(seed) => opts.nkey(seed.to_string()),
-        NatsAuth::UserPassword { username, password } => {
-            opts.user_and_password(username.clone(), password.to_string())
-        }
-        NatsAuth::Token(token) => opts.token(token.to_string()),
-    })
-}
-
 /// Builds connect options from a workload's config.
 ///
 /// `reconnects` is bumped from the event callback, which is the only place the
@@ -229,7 +190,9 @@ async fn build_options(
     denials: tokio::sync::broadcast::Sender<String>,
     ignore_discovered_servers: bool,
 ) -> anyhow::Result<async_nats::ConnectOptions> {
-    let mut opts = apply_auth(async_nats::ConnectOptions::new(), &config.auth).await?;
+    // The signing callback stays here, host-side, and rereads any credential
+    // file on every connect.
+    let mut opts = config.auth.credentials().primed_connect_options().await?;
 
     if let Some(name) = &config.name {
         opts = opts.name(name);
@@ -244,17 +207,27 @@ async fn build_options(
     // becomes the sole timer when the operator configures no cap of their own.
     opts = opts.request_timeout(config.request_timeout);
     opts = opts.subscription_capacity(config.limits.subscription_capacity);
+    // A CA means TLS is required, not left to the server's plaintext INFO,
+    // which a peer on the path can rewrite.
     if let Some(ca) = &config.tls.ca {
-        opts = opts.add_root_certificates(ca.clone());
+        opts = opts.add_root_certificates(ca.clone()).require_tls(true);
     }
     if config.tls.first {
         opts = opts.tls_first();
     }
     if let (Some(cert), Some(key)) = (&config.tls.cert, &config.tls.key) {
-        opts = opts.add_client_certificate(cert.clone(), key.clone());
+        // Without TLS the certificate is never presented, and a plaintext
+        // server would admit the connection under whatever it gives anonymous
+        // clients.
+        opts = opts
+            .add_client_certificate(cert.clone(), key.clone())
+            .require_tls(true);
     }
-    if ignore_discovered_servers {
-        // Only operator-declared servers were checked against the policy.
+    // Only operator-declared servers are checked against an egress policy. A
+    // server the plaintext INFO advertises may also be `ws://`, which
+    // async-nats dials without TLS whatever it is told to require.
+    let tls_required = config.tls.ca.is_some() || config.tls.cert.is_some() || config.tls.first;
+    if ignore_discovered_servers || tls_required {
         opts = opts.ignore_discovered_servers();
     }
 
@@ -273,6 +246,34 @@ async fn build_options(
             handle_nats_event(&event, &reconnects, &denials, &initial_connect_seen);
         }
     }))
+}
+
+/// Connects as `config` says — to its servers, with its credentials and TLS —
+/// and opens JetStream in its domain.
+///
+/// `wasi:blobstore`'s NATS plugin connects a binding that names credentials
+/// through here too, so the same keys reach the same account in both plugins.
+pub(crate) async fn connect(
+    config: &NatsConfig,
+    reconnects: tokio::sync::watch::Sender<u64>,
+    denials: tokio::sync::broadcast::Sender<String>,
+    ignore_discovered_servers: bool,
+) -> anyhow::Result<async_nats::jetstream::Context> {
+    let client = build_options(config, reconnects, denials, ignore_discovered_servers)
+        .await?
+        .connect(config.servers.clone())
+        .await
+        .with_context(|| {
+            format!(
+                "failed to connect to NATS at {} using {} auth",
+                config.servers.join(","),
+                config.auth.kind()
+            )
+        })?;
+    Ok(match &config.jetstream_domain {
+        Some(domain) => async_nats::jetstream::with_domain(client, domain),
+        None => async_nats::jetstream::new(client),
+    })
 }
 
 /// Routes one connection event, extracted from the callback so it is testable.
@@ -405,7 +406,11 @@ fn sanitize_subject_token(raw: &str) -> String {
 
 /// Drains one connection, logging exactly one outcome line for it.
 async fn drain_one(workload_id: &str, key: &ConnKey, handle: &Arc<ConnHandle>) {
-    let servers = key.servers.join(",");
+    let servers = if key.servers_secret {
+        "<redacted>".to_string()
+    } else {
+        key.servers.join(",")
+    };
     // Before the drain, not after: the lifetime totals are what a run that
     // finished inside one report interval never got to see, and this is the
     // last moment they exist.
@@ -449,34 +454,24 @@ impl ConnectionRegistry {
 
         let (reconnects, _) = tokio::sync::watch::channel(0);
         let (subscription_denials, _) = tokio::sync::broadcast::channel(64);
-        let opts = build_options(
+        let jetstream = connect(
             config,
             reconnects.clone(),
             subscription_denials.clone(),
             ignore_discovered_servers,
         )
         .await?;
-        let client = opts
-            .connect(config.servers.clone())
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to connect to NATS at {} using {} auth",
-                    config.servers.join(","),
-                    config.auth.kind()
-                )
-            })?;
-
-        let jetstream = match &config.jetstream_domain {
-            Some(domain) => async_nats::jetstream::with_domain(client.clone(), domain),
-            None => async_nats::jetstream::new(client.clone()),
-        };
+        let client = jetstream.client();
 
         let handle = Arc::new(ConnHandle {
             reconnects,
             subscription_denials,
             client,
             jetstream,
+            jetstream_prefix: config.jetstream_domain.as_ref().map_or_else(
+                || "$JS.API".to_string(),
+                |domain| format!("$JS.{domain}.API"),
+            ),
             policy: Arc::new(PolicyEngine::new(&config.policy, lattice_prefixes)),
             ack_mode: config.ack_mode,
             limits: config.limits.clone(),
@@ -587,6 +582,7 @@ impl ConnectionRegistry {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -704,6 +700,148 @@ mod tests {
             denied_subscription_subject("Unknown Protocol Operation"),
             None
         );
+    }
+
+    /// A binding's secret file is read on every connect, so a rotated Secret
+    /// is what the next reconnect presents, with no rebind.
+    #[tokio::test]
+    async fn a_rotated_token_file_is_presented_on_reconnect() -> anyhow::Result<()> {
+        use crate::nats_credentials::tests::accept_connect;
+
+        let dir = tempfile::tempdir()?;
+        let token = dir.path().join("token");
+        std::fs::write(&token, "first\n")?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let config = NatsConfig::from_map(
+            &[
+                ("servers", format!("nats://{}", listener.local_addr()?)),
+                ("token-file", token.display().to_string()),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+        )?;
+
+        let registry = ConnectionRegistry::default();
+        let (first, _handle) = tokio::try_join!(
+            accept_connect(&listener),
+            registry.acquire("wl", UNNAMED_BINDING, &config, Vec::new(), true),
+        )?;
+        assert_eq!(first["auth_token"], "first");
+
+        std::fs::write(&token, "second\n")?;
+        let second = accept_connect(&listener).await?;
+        assert_eq!(second["auth_token"], "second");
+        Ok(())
+    }
+
+    /// A binding with a `tls-ca` gets a TLS handshake from a server whose INFO
+    /// omits `tls_required`, never a plaintext CONNECT carrying its token.
+    #[tokio::test]
+    async fn a_binding_ca_requires_tls() -> anyhow::Result<()> {
+        use crate::nats_credentials::tests::{record_after_plaintext_info, write_ca};
+        crate::init_crypto();
+
+        let dir = tempfile::tempdir()?;
+        let ca = write_ca(dir.path())?;
+        let token = dir.path().join("token");
+        std::fs::write(&token, "secret-token")?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let config = NatsConfig::from_map(
+            &[
+                ("servers", format!("nats://{}", listener.local_addr()?)),
+                ("token-file", token.display().to_string()),
+                ("tls-ca", ca.display().to_string()),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+        )?;
+
+        let (received, client) = tokio::join!(
+            record_after_plaintext_info(&listener),
+            connect(
+                &config,
+                tokio::sync::watch::channel(0).0,
+                tokio::sync::broadcast::channel(1).0,
+                false,
+            ),
+        );
+        let received = received?;
+        assert!(!received.contains("CONNECT"), "{received}");
+        assert!(!received.contains("secret-token"), "{received}");
+        assert!(client.is_err());
+        Ok(())
+    }
+
+    /// A `ws://` server is dialed without TLS, so a binding that requires TLS
+    /// never takes one from the plaintext INFO.
+    #[tokio::test]
+    async fn a_binding_ca_ignores_advertised_servers() -> anyhow::Result<()> {
+        let server = crate::nats_test::TlsServer::new()?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let config = NatsConfig::from_map(
+            &[
+                (
+                    "servers",
+                    format!("nats://localhost:{}", listener.local_addr()?.port()),
+                ),
+                ("tls-ca", server.ca.display().to_string()),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+        )?;
+        let (_stream, jetstream) = tokio::try_join!(
+            server.accept_advertising(&listener, "ws://127.0.0.1:1"),
+            connect(
+                &config,
+                tokio::sync::watch::channel(0).0,
+                tokio::sync::broadcast::channel(1).0,
+                false,
+            ),
+        )?;
+        let pool = jetstream.client().server_pool().await?;
+        assert_eq!(pool.len(), 1);
+        assert!(pool.iter().all(|s| !s.is_discovered));
+        Ok(())
+    }
+
+    /// `jwt-as-token` repeats whichever JWT the creds file holds on each
+    /// connect, so the token follows a rotation too.
+    #[tokio::test]
+    async fn jwt_as_token_repeats_the_current_jwt() -> anyhow::Result<()> {
+        use crate::nats_credentials::tests::{accept_connect, creds_file};
+
+        let dir = tempfile::tempdir()?;
+        let creds = dir.path().join("user.creds");
+        let key = nkeys::KeyPair::new_user();
+        std::fs::write(&creds, creds_file("first.jwt", &key.seed()?))?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let config = NatsConfig::from_map(
+            &[
+                ("servers", format!("nats://{}", listener.local_addr()?)),
+                ("creds", creds.display().to_string()),
+                ("jwt-as-token", "true".to_string()),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+        )?;
+
+        let registry = ConnectionRegistry::default();
+        let (first, _handle) = tokio::try_join!(
+            accept_connect(&listener),
+            registry.acquire("wl", UNNAMED_BINDING, &config, Vec::new(), true),
+        )?;
+        assert_eq!(first["jwt"], "first.jwt");
+        assert_eq!(first["auth_token"], "first.jwt");
+
+        std::fs::write(&creds, creds_file("rotated.jwt", &key.seed()?))?;
+        let second = accept_connect(&listener).await?;
+        assert_eq!(second["jwt"], "rotated.jwt");
+        assert_eq!(second["auth_token"], "rotated.jwt");
+        Ok(())
     }
 
     #[test]

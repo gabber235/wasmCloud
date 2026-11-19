@@ -23,9 +23,19 @@ wasm_component_model_implements = ["wash-runtime/wasm_component_model_implements
 # Host component plugins: host capabilities provided by wasm components running
 # in their own supervised stores (wash-runtime's `plugin::component_host`).
 host-component-plugins = ["wash-runtime/host-component-plugins"]
-# On by default. Pulls in git-only wasi-gfx deps (no crates.io release);
-# disable with `--no-default-features` for a build without the git sources.
+# On by default: the `wasi:webgpu` host from wasi-gfx and wgpu. Disable with
+# `--no-default-features` for a build without the GPU stack.
 wasi-webgpu = ["wash-runtime/wasi-webgpu"]
+# Replace the system allocator with mimalloc or jemalloc. Off by default.
+# Either allocator starts warm workloads about 45% faster than glibc on a 64-core
+# arm64 host, for about 1% (jemalloc) or 5% (mimalloc) more host memory per
+# workload. See "The allocator" in `crates/wash-runtime/benches/scale_density.md`.
+# jemalloc does not build for MSVC, so on MSVC targets `jemalloc` is accepted and
+# does nothing. With both enabled, mimalloc wins. `wash --version` names the
+# allocator a build got. arm64 Linux builds of jemalloc use 64 KiB pages; see
+# `.cargo/config.toml`.
+mimalloc = ["dep:mimalloc"]
+jemalloc = ["dep:tikv-jemallocator"]
 
 [lints]
 workspace = true
@@ -54,7 +64,7 @@ ctrlc = { workspace = true }
 dialoguer = { workspace = true, features = ["editor", "password", "zeroize", "fuzzy-select", "fuzzy-matcher"] }
 etcetera = { workspace = true }
 fastrand = { workspace = true }
-figment = { workspace = true, features = ["json", "env", "yaml", "toml"] }
+figment = { workspace = true, features = ["json", "env", "toml"] }
 flate2 = { workspace = true, features = ["rust_backend"] }
 humansize = { workspace = true }
 humantime = { workspace = true }
@@ -65,7 +75,7 @@ sha2 = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["std"] }
-serde_yaml_ng = { workspace = true }
+serde-saphyr = { workspace = true, features = ["deserialize", "serialize", "figment"] }
 tar = { workspace = true }
 toml = { workspace = true }
 tempfile = { workspace = true }
@@ -79,6 +89,7 @@ wasm-pkg-client = { workspace = true }
 wasm-pkg-core = { workspace = true }
 wash-runtime = { workspace = true, features = ["washlet", "oci", "wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "wasi-otel", "wasmcloud-nats"] }
 wit-component = { workspace = true }
+mimalloc = { workspace = true, optional = true }
 
 [dev-dependencies]
 bytes = { version = "1", default-features = false }
@@ -93,8 +104,13 @@ tokio = { version = "1.45.1", default-features = false, features = ["full"] }
 tokio-rustls = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 wash-runtime = { workspace = true, features = ["wasi-keyvalue", "wasi-blobstore"] }
+wasmtime = { workspace = true }
 testcontainers = { workspace = true }
-wat = { workspace = true }
+wat = { workspace = true, features = ["component-model"] }
+
+# jemalloc does not build for MSVC; see the `jemalloc` feature.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

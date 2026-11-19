@@ -16,9 +16,8 @@
 //! key: `creds` and `creds-file` are the same setting, and classifying only one
 //! of them would both deny nothing and refuse the other spelling as unknown.
 
-use std::collections::HashMap;
-
 use crate::plugin::KeyOwnership;
+use crate::wit::{Config, ConfigStr};
 
 /// One config key, its aliases, and who it belongs to.
 pub struct Key {
@@ -28,8 +27,21 @@ pub struct Key {
     pub aliases: &'static [&'static str],
     /// Who may write it.
     pub ownership: KeyOwnership,
+    /// Whether it names who a connection is.
+    pub identity: Identity,
     /// Whether this setting belongs to one interface entry rather than the binding.
     pub entry: bool,
+}
+
+/// What a key says about who a connection is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Identity {
+    /// Nothing.
+    None,
+    /// A NATS protocol credential.
+    Credential,
+    /// Half of a TLS client certificate.
+    ClientCert,
 }
 
 impl Key {
@@ -44,15 +56,27 @@ const fn host(canonical: &'static str) -> Key {
         canonical,
         aliases: &[],
         ownership: KeyOwnership::Host,
+        identity: Identity::None,
         entry: false,
     }
 }
 
-const fn host_aliased(canonical: &'static str, aliases: &'static [&'static str]) -> Key {
+const fn credential(canonical: &'static str, aliases: &'static [&'static str]) -> Key {
     Key {
         canonical,
         aliases,
         ownership: KeyOwnership::Host,
+        identity: Identity::Credential,
+        entry: false,
+    }
+}
+
+const fn client_cert(canonical: &'static str) -> Key {
+    Key {
+        canonical,
+        aliases: &[],
+        ownership: KeyOwnership::Host,
+        identity: Identity::ClientCert,
         entry: false,
     }
 }
@@ -63,6 +87,7 @@ const fn ceiling(canonical: &'static str) -> Key {
         canonical,
         aliases: &[],
         ownership: KeyOwnership::HostCeiling,
+        identity: Identity::None,
         entry: false,
     }
 }
@@ -72,6 +97,7 @@ const fn workload(canonical: &'static str) -> Key {
         canonical,
         aliases: &[],
         ownership: KeyOwnership::Workload,
+        identity: Identity::None,
         entry: false,
     }
 }
@@ -97,19 +123,24 @@ pub const KEYS: &[Key] = &[
     host("name"),
     host("jetstream-domain"),
     host("inbox-prefix"),
-    host_aliased("creds", &["creds-file"]),
-    host("jwt"),
-    host_aliased("nkey-seed", &["nkey"]),
-    host_aliased("username", &["user"]),
-    host("password"),
-    host("token"),
+    credential("creds", &["creds-file"]),
+    credential("jwt", &[]),
+    credential("nkey-seed", &["nkey"]),
+    credential("nkey-seed-file", &["nkey-file"]),
+    credential("username", &["user"]),
+    credential("password", &[]),
+    credential("password-file", &[]),
+    credential("token", &[]),
+    credential("token-file", &[]),
+    host("jwt-as-token"),
     host("tls-ca"),
-    host("tls-cert"),
-    host("tls-key"),
+    client_cert("tls-cert"),
+    client_cert("tls-key"),
     host("tls-first"),
     // Grants — what it may reach.
     ceiling("subject-allow"),
     ceiling("stream-allow"),
+    ceiling("stream-delete-allow"),
     ceiling("bucket-allow"),
     // The workload's own behaviour within that grant.
     workload("ack-mode"),
@@ -125,6 +156,17 @@ pub const KEYS: &[Key] = &[
     entry("component"),
 ];
 
+/// The keys whose values name files the host reads.
+pub const FILES: &[&str] = &[
+    "creds",
+    "nkey-seed-file",
+    "password-file",
+    "token-file",
+    "tls-ca",
+    "tls-cert",
+    "tls-key",
+];
+
 /// The canonical spelling of `key`, for comparing two spellings of one key.
 #[must_use]
 pub fn canonical(key: &str) -> String {
@@ -133,9 +175,8 @@ pub fn canonical(key: &str) -> String {
 
 /// The row `key` belongs to, matched on the canonical spelling or any alias.
 ///
-/// Alias-aware because the reader asks for aliases directly — `parse_auth`
-/// reaches for `creds-file` by name — and an alias is the same key, not an
-/// unknown one.
+/// Alias-aware because a config map may use any spelling, and an alias is
+/// the same key, not an unknown one.
 pub fn find(key: &str) -> Option<&'static Key> {
     let key = canonical(key);
     KEYS.iter().find(|row| row.spellings().any(|s| s == key))
@@ -159,7 +200,7 @@ pub fn find(key: &str) -> Option<&'static Key> {
 /// Debug builds only, when `canonical` is not in [`KEYS`]: a key the reader
 /// asks for and the table does not name would be one the schema cannot
 /// classify, which is the drift this module exists to prevent.
-pub fn get<'a>(cfg: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+pub fn get<'a>(cfg: &'a Config, key: &str) -> Option<ConfigStr<'a>> {
     let row = find(key);
     debug_assert!(
         row.is_some(),
@@ -172,16 +213,38 @@ pub fn get<'a>(cfg: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
     spellings.into_iter().find_map(|spelling| {
         cfg.iter()
             .find(|(k, _)| canonical(k) == spelling)
-            .map(|(_, v)| v.as_str())
-            .map(str::trim)
+            .and_then(|(_, v)| v.as_config_str())
+            .map(ConfigStr::trim)
             .filter(|v| !v.is_empty())
     })
+}
+
+/// Connection errors can quote server URLs and credential or TLS file paths.
+pub(crate) fn guard_connection<T>(cfg: &Config, result: anyhow::Result<T>) -> anyhow::Result<T> {
+    let secret = std::iter::once("servers")
+        .chain(FILES.iter().copied())
+        .find_map(|key| {
+            get(cfg, key)
+                .filter(|value| value.is_secret())
+                .map(|value| (key, value))
+        });
+    match secret {
+        Some((key, value)) => value.guard(key, result),
+        None => result,
+    }
 }
 
 /// The keys the host owns outright, every spelling.
 pub fn host_owned() -> impl Iterator<Item = &'static str> {
     KEYS.iter()
         .filter(|key| key.ownership == KeyOwnership::Host)
+        .flat_map(Key::spellings)
+}
+
+/// The NATS protocol credential keys, every spelling.
+pub fn credential_keys() -> impl Iterator<Item = &'static str> {
+    KEYS.iter()
+        .filter(|key| key.identity == Identity::Credential)
         .flat_map(Key::spellings)
 }
 
@@ -205,8 +268,35 @@ pub fn entry_owned() -> impl Iterator<Item = &'static str> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    /// A workload must not be able to point a file key elsewhere, and every
+    /// spelling of one is reserved.
+    #[test]
+    fn file_keys_are_host_owned_and_reserved_in_any_spelling() {
+        for key in FILES {
+            let row = find(key).unwrap_or_else(|| panic!("`{key}` is not declared"));
+            assert_eq!(row.ownership, KeyOwnership::Host, "{key}");
+        }
+        let config: Config = [
+            ("creds-file", "/s/creds"),
+            ("nkey-file", "/s/seed"),
+            ("Token_File", "/s/token"),
+            ("tls-key", "/s/key"),
+            ("servers", "nats://localhost:4222"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let mut paths = super::super::host_paths(&config);
+        paths.sort();
+        assert_eq!(
+            paths,
+            ["/s/creds", "/s/key", "/s/seed", "/s/token"].map(std::path::PathBuf::from)
+        );
+    }
 
     #[test]
     fn every_key_is_declared_once_under_one_spelling() {
@@ -248,39 +338,48 @@ mod tests {
     /// a `HashMap` happened to put them — for `creds` that is a credential.
     #[test]
     fn an_alias_loses_to_the_canonical_spelling_every_time() {
-        let cfg: HashMap<String, String> = [
+        let cfg: Config = [
             ("creds".to_string(), "/canonical.creds".to_string()),
             ("creds-file".to_string(), "/alias.creds".to_string()),
         ]
         .into_iter()
         .collect();
         for _ in 0..64 {
-            assert_eq!(get(&cfg, "creds"), Some("/canonical.creds"));
+            assert_eq!(
+                get(&cfg, "creds").map(ConfigStr::expose),
+                Some("/canonical.creds")
+            );
             // Asking by the alias is asking for the same key, so it answers the
             // same way.
-            assert_eq!(get(&cfg, "creds-file"), Some("/canonical.creds"));
+            assert_eq!(
+                get(&cfg, "creds-file").map(ConfigStr::expose),
+                Some("/canonical.creds")
+            );
         }
 
         // A blank canonical is unset rather than empty, so the alias is read.
-        let blank: HashMap<String, String> = [
+        let blank: Config = [
             ("creds".to_string(), "  ".to_string()),
             ("creds-file".to_string(), "/alias.creds".to_string()),
         ]
         .into_iter()
         .collect();
-        assert_eq!(get(&blank, "creds"), Some("/alias.creds"));
+        assert_eq!(
+            get(&blank, "creds").map(ConfigStr::expose),
+            Some("/alias.creds")
+        );
     }
 
     #[test]
     fn get_reads_any_spelling_of_an_alias() {
-        let cfg: HashMap<String, String> = [("Creds_File".to_string(), " /x.creds ".to_string())]
+        let cfg: Config = [("Creds_File".to_string(), " /x.creds ".to_string())]
             .into_iter()
             .collect();
-        assert_eq!(get(&cfg, "creds"), Some("/x.creds"));
+        assert_eq!(get(&cfg, "creds").map(ConfigStr::expose), Some("/x.creds"));
 
-        let blank: HashMap<String, String> = [("creds".to_string(), "   ".to_string())]
+        let blank: Config = [("creds".to_string(), "   ".to_string())]
             .into_iter()
             .collect();
-        assert_eq!(get(&blank, "creds"), None);
+        assert_eq!(get(&blank, "creds").map(ConfigStr::expose), None);
     }
 }

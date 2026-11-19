@@ -3,10 +3,12 @@ package condition
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -483,7 +485,8 @@ func TestConditionedReconcilerOptimisticLock(t *testing.T) {
 	}
 	scheme.AddKnownTypes(corev1.SchemeGroupVersion, &conditionedResource{})
 
-	for _, locked := range []bool{true, false} {
+	for _, mode := range []string{"per-pass", "controller", "none"} {
+		locked := mode != "none"
 		obj := &conditionedResource{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace:  testNamespace,
@@ -498,9 +501,12 @@ func TestConditionedReconcilerOptimisticLock(t *testing.T) {
 			Build()
 
 		r := NewConditionedReconciler(kubeClient, scheme, obj, time.Second)
+		if mode == "controller" {
+			r.OptimisticStatusWrites()
+		}
 		r.SetFinalizer(finalizerName, func(context.Context, *conditionedResource) error { return nil })
 		r.SetCondition(testCondition, func(ctx context.Context, _ *conditionedResource) error {
-			if locked {
+			if mode == "per-pass" {
 				RequireOptimisticLock(ctx)
 			}
 			newer := &conditionedResource{}
@@ -527,5 +533,269 @@ func TestConditionedReconcilerOptimisticLock(t *testing.T) {
 		if locked && result.RequeueAfter == 0 {
 			t.Errorf("a conflicting patch was not requeued")
 		}
+	}
+}
+
+// An object that finishes deleting during a pass has no status left to write,
+// which is not a failure. NotFound on any other object is one.
+func TestConditionedReconcilerStatusPatchNotFound(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add corev1 to scheme: %v", err)
+	}
+	scheme.AddKnownTypes(corev1.SchemeGroupVersion, &conditionedResource{})
+
+	for _, deleting := range []bool{true, false} {
+		obj := &conditionedResource{ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testName}}
+		if deleting {
+			now := metav1.Now()
+			obj.DeletionTimestamp = &now
+			obj.Finalizers = []string{"held"}
+		}
+		kubeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(obj).
+			WithStatusSubresource(obj).
+			Build()
+
+		r := NewConditionedReconciler(kubeClient, scheme, obj, time.Second)
+		r.SetCondition(testCondition, func(ctx context.Context, current *conditionedResource) error {
+			if !deleting {
+				return kubeClient.Delete(ctx, current)
+			}
+			gone := current.DeepCopy()
+			gone.Finalizers = nil
+			return kubeClient.Update(ctx, gone)
+		})
+
+		_, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(obj)})
+		if deleting && err != nil {
+			t.Errorf("deleting object: expected no error, got %v", err)
+		}
+		if !deleting && !apierrors.IsNotFound(err) {
+			t.Errorf("object not being deleted: expected NotFound, got %v", err)
+		}
+	}
+}
+
+// With TrackGeneration, each condition carries the generation it was computed
+// for, so the one a pass stopped before is told apart from the one it set.
+func TestConditionedReconcilerTrackGeneration(t *testing.T) {
+	const later ConditionType = "Later"
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add corev1 to scheme: %v", err)
+	}
+	scheme.AddKnownTypes(corev1.SchemeGroupVersion, &conditionedResource{})
+	obj := &conditionedResource{
+		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testName, Generation: 3},
+	}
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(obj).
+		WithStatusSubresource(obj).
+		Build()
+
+	r := NewConditionedReconciler(kubeClient, scheme, obj, time.Second)
+	r.TrackGeneration()
+	r.SetCondition(testCondition, func(context.Context, *conditionedResource) error { return nil })
+	r.SetCondition(later, func(context.Context, *conditionedResource) error { return nil })
+
+	generations := func() (int64, int64) {
+		stored := &conditionedResource{}
+		if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(obj), stored); err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		return stored.Status.GetCondition(testCondition).ObservedGeneration,
+			stored.Status.GetCondition(later).ObservedGeneration
+	}
+	req := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(obj)}
+
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	// The first condition changed, so the pass stopped before the second.
+	if first, second := generations(); first != 3 || second != 0 {
+		t.Fatalf("after one pass: generations = %d, %d; want 3, 0", first, second)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if first, second := generations(); first != 3 || second != 3 {
+		t.Fatalf("after two passes: generations = %d, %d; want 3, 3", first, second)
+	}
+
+	// A new generation that changes no condition's state restamps them all
+	// in one pass, and is not a transition.
+	stored := &conditionedResource{}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(obj), stored); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	transitioned := stored.Status.GetCondition(testCondition).LastTransitionTime
+	stored.Generation = 4
+	if err := kubeClient.Update(context.Background(), stored); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if first, second := generations(); first != 4 || second != 4 {
+		t.Fatalf("after a spec change: generations = %d, %d; want 4, 4 in one pass", first, second)
+	}
+	if err := kubeClient.Get(context.Background(), client.ObjectKeyFromObject(obj), stored); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got := stored.Status.GetCondition(testCondition).LastTransitionTime; !got.Equal(&transitioned) {
+		t.Errorf("a restamp moved LastTransitionTime from %v to %v", transitioned, got)
+	}
+}
+
+func TestForcedStatusUpdateSkipsEmptyPatch(t *testing.T) {
+	for _, locked := range []bool{false, true} {
+		for _, changed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("locked=%v/changed=%v", locked, changed), func(t *testing.T) {
+				scheme := runtime.NewScheme()
+				scheme.AddKnownTypes(corev1.SchemeGroupVersion, &conditionedResource{})
+				obj := &conditionedResource{
+					ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testName},
+				}
+				obj.Status.SetConditions(ReadyCondition(testCondition))
+				patches := 0
+				c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(obj).
+					WithStatusSubresource(obj).WithInterceptorFuncs(interceptor.Funcs{
+					SubResourcePatch: func(ctx context.Context, c client.Client, subresource string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+						patches++
+						return c.SubResource(subresource).Patch(ctx, obj, patch, opts...)
+					},
+				}).Build()
+				r := NewConditionedReconciler(c, scheme, obj, time.Minute)
+				r.SetCondition(testCondition, func(ctx context.Context, obj *conditionedResource) error {
+					ForceStatusUpdate(ctx)
+					if locked {
+						RequireOptimisticLock(ctx)
+					}
+					if changed {
+						obj.Status.SetConditions(UnknownCondition(testCondition, "Waiting", "replicas pending"))
+					}
+					return ErrNoop()
+				})
+				result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(obj)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := 0
+				if changed {
+					want = 1
+				}
+				if patches != want {
+					t.Fatalf("status patches = %d, want %d", patches, want)
+				}
+				if result.RequeueAfter != time.Minute {
+					t.Fatalf("requeue = %s, want one minute", result.RequeueAfter)
+				}
+			})
+		}
+	}
+}
+
+func TestBatchStatusUpdatesPreserveOrderAndStops(t *testing.T) {
+	const second ConditionType = "Second"
+	const third ConditionType = "Third"
+	for _, tc := range []struct {
+		name  string
+		batch bool
+		stop  error
+		want  int
+	}{
+		{name: "default persists first", want: 1},
+		{name: "all in one write", batch: true, want: 3},
+		{name: "explicit skip", batch: true, stop: ErrSkipReconciliation(), want: 2},
+		{name: "hard error", batch: true, stop: errors.New("api read failed"), want: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			scheme.AddKnownTypes(corev1.SchemeGroupVersion, &conditionedResource{})
+			obj := &conditionedResource{
+				ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testName},
+			}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(obj).WithStatusSubresource(obj).Build()
+			r := NewConditionedReconciler(c, scheme, obj, time.Minute)
+			if tc.batch {
+				r.BatchStatusUpdates()
+			}
+			r.SetCondition(testCondition, func(context.Context, *conditionedResource) error { return nil })
+			r.SetCondition(second, func(_ context.Context, current *conditionedResource) error {
+				if !current.Status.AllTrue(testCondition) {
+					t.Error("second condition did not see first change")
+				}
+				return tc.stop
+			})
+			r.SetCondition(third, func(_ context.Context, current *conditionedResource) error {
+				if !current.Status.AllTrue(testCondition, second) {
+					t.Error("third condition did not see earlier changes")
+				}
+				return nil
+			})
+			key := client.ObjectKeyFromObject(obj)
+			if _, err := r.Reconcile(t.Context(), reconcile.Request{NamespacedName: key}); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Get(t.Context(), key, obj); err != nil {
+				t.Fatal(err)
+			}
+			if got := len(obj.Status.Conditions); got != tc.want {
+				t.Fatalf("persisted %d conditions, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReadyRequeueIntervalOnlyChangesStableHealthyObjects(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		ready       bool
+		observed    int64
+		deleting    bool
+		becomeReady bool
+		interval    time.Duration
+		want        time.Duration
+	}{
+		{name: "default", ready: true, want: time.Minute},
+		{name: "steady ready", ready: true, observed: 3, interval: 10 * time.Minute, want: 10 * time.Minute},
+		{name: "not ready", interval: 10 * time.Minute, want: time.Minute},
+		{name: "stale ready", ready: true, observed: 2, interval: 10 * time.Minute, want: time.Minute},
+		{name: "deleting", ready: true, deleting: true, interval: 10 * time.Minute, want: time.Minute},
+		{name: "transition still requeues immediately", becomeReady: true, interval: 10 * time.Minute, want: time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			scheme.AddKnownTypes(corev1.SchemeGroupVersion, &conditionedResource{})
+			obj := &conditionedResource{
+				ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: testName, Generation: 3},
+			}
+			if tc.ready {
+				ready := ReadyCondition(TypeReady)
+				ready.ObservedGeneration = tc.observed
+				obj.Status.SetConditions(ready)
+			}
+			if tc.deleting {
+				now := metav1.Now()
+				obj.DeletionTimestamp = &now
+				obj.Finalizers = []string{"test"}
+			}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(obj).WithStatusSubresource(obj).Build()
+			r := NewConditionedReconciler(c, scheme, obj, time.Minute)
+			r.ReadyRequeueInterval(tc.interval)
+			if tc.becomeReady {
+				r.SetCondition(TypeReady, func(context.Context, *conditionedResource) error { return nil })
+			}
+			result, err := r.Reconcile(t.Context(), reconcile.Request{NamespacedName: client.ObjectKeyFromObject(obj)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.RequeueAfter != tc.want {
+				t.Fatalf("requeue = %s, want %s", result.RequeueAfter, tc.want)
+			}
+		})
 	}
 }

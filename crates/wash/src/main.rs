@@ -1,3 +1,5 @@
+#![cfg_attr(all(test, coverage_nightly), feature(coverage_attribute))]
+#![cfg_attr(all(test, coverage_nightly), allow(unstable_features))]
 // Increase the default recursion limit
 #![recursion_limit = "256"]
 
@@ -14,11 +16,45 @@ use wash::cli::{
     CONFIG_DIR_NAME, CONFIG_FILE_NAME, CliCommand, CliContext, CommandOutput, OutputKind,
 };
 
+// Opt-in global allocator; see the `mimalloc` and `jemalloc` features in
+// Cargo.toml. mimalloc wins when both are enabled, and jemalloc is skipped on
+// MSVC, which it does not support.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(all(
+    feature = "jemalloc",
+    not(feature = "mimalloc"),
+    not(target_env = "msvc")
+))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// `wash --version` names an opt-in allocator, since a `jemalloc` build on MSVC
+// or one with both features silently gets another. Default builds are unchanged.
+#[cfg(feature = "mimalloc")]
+const LONG_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\nallocator: mimalloc");
+#[cfg(all(
+    feature = "jemalloc",
+    not(feature = "mimalloc"),
+    not(target_env = "msvc")
+))]
+const LONG_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\nallocator: jemalloc");
+#[cfg(all(feature = "jemalloc", not(feature = "mimalloc"), target_env = "msvc"))]
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nallocator: system (jemalloc is unsupported on MSVC)"
+);
+#[cfg(not(any(feature = "mimalloc", feature = "jemalloc")))]
+const LONG_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "wash",
     about,
     version,
+    long_version = LONG_VERSION,
     arg_required_else_help = true,
     color = clap::ColorChoice::Auto
 )]
@@ -141,8 +177,41 @@ impl CliCommand for WashCliCommand {
     }
 }
 
-#[tokio::main]
-async fn main() {
+/// The stack wash's top-level future runs on. Linux (by default, through
+/// `ulimit -s`) and macOS give the main thread 8 MiB, but Windows gives it only
+/// 1 MiB, which a debug build of wash can overrun. So wash runs on a thread of
+/// its own with the stack the other platforms usually give. Tasks spawned onto
+/// the runtime, and `spawn_blocking` closures, still run on tokio's own
+/// threads with tokio's default stack.
+const MAIN_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+fn main() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("failed to start the async runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    let wash = std::thread::Builder::new()
+        .name("main".to_string())
+        .stack_size(MAIN_STACK_SIZE)
+        .spawn(move || runtime.block_on(run()));
+    match wash.map(std::thread::JoinHandle::join) {
+        Ok(Ok(())) => {}
+        // The panic has already been reported; keep its exit status.
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        Err(e) => {
+            eprintln!("failed to start wash: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn run() {
     let global_parser = Cli::command_for_update()
         .arg_required_else_help(false)
         .subcommand_required(false)
@@ -375,6 +444,7 @@ fn find_project_root() -> PathBuf {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use wash_runtime::observability::MeterKind;

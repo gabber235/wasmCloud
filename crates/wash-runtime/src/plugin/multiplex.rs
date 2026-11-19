@@ -18,19 +18,68 @@
 //! eviction). The cap bounds *cached* connections; a connection still held by a
 //! live bind keeps working after eviction. Eviction only means a future bind
 //! re-instantiates it.
+//!
+//! ## Egress policy
+//!
+//! A plugin whose `host.plugins` entry declares `allowedHosts` hands the policy
+//! to [`Multiplexer::configure_egress_policy`]. Every bind then runs
+//! [`BackendProvider::check_egress`] on the resolved config *before* the pool
+//! is consulted, so a pooled connection is never handed to a binding whose url
+//! the policy refuses. A url naming a host is matched by name, then
+//! [`BackendProvider::check_resolved_egress`] judges what it resolves to now.
+//! The client resolves it again itself, so a later reconnect is not judged.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use tokio::sync::{Mutex, OnceCell};
 
-use crate::wit::WitInterface;
+use crate::plugin::PluginEgressPolicy;
+use crate::wit::{Config, WitInterface};
 
 /// `config` key naming the backend type for a named host interface (e.g.
 /// `redis`, `nats`, `filesystem`). Shared by every multiplexed builtin.
 pub const BACKEND_CONFIG_KEY: &str = "backend";
+
+/// The keys that decide what a keyvalue backend reaches: its address (`url`,
+/// `root`) and the slice of a shared redis it reads (`prefix`), plus how the
+/// redis provider holds that connection (its reconnect retries and delay, and
+/// its connect and response timeouts). Each package claims only the keys its
+/// providers read; all are the operator's under `workloadConfig: deny`.
+/// `backend` stays the workload's, and an operator can lock it with
+/// `hostOwnedKeys`.
+///
+/// The redis connection settings are the operator's because they spend host
+/// resources against an endpoint the operator approved: a workload that could
+/// raise them could keep host tasks redialing for minutes.
+///
+/// A value on a plugin entry's own `config` is shared by every workload that
+/// binds that label; per-label `bindings` are what keep tenants apart.
+pub const KEYVALUE_HOST_OWNED_KEYS: &[&str] = &[
+    "url",
+    "root",
+    "prefix",
+    "backend-reconnect-num-retries",
+    "backend-reconnect-max-delay-ms",
+    "backend-connection-timeout-ms",
+    "backend-response-timeout-ms",
+];
+
+/// The blobstore providers' address keys. See [`KEYVALUE_HOST_OWNED_KEYS`].
+pub const BLOBSTORE_HOST_OWNED_KEYS: &[&str] = &["url", "root"];
+
+/// The messaging providers' address key. See [`KEYVALUE_HOST_OWNED_KEYS`].
+pub const MESSAGING_HOST_OWNED_KEYS: &[&str] = &["url"];
+
+/// The [`crate::plugin::HostPlugin::binding_schema`] of a multiplexed builtin
+/// whose providers read `keys`.
+#[must_use]
+pub fn backend_binding_schema(keys: &[&str]) -> crate::plugin::BindingSchema {
+    crate::plugin::BindingSchema::with_host_owned_keys(keys)
+}
 
 /// Default ceiling on pooled (cached) connections, *per backend type* per
 /// multiplexer — so e.g. redis and NATS are capped independently (a multiplexer
@@ -51,7 +100,29 @@ pub trait BackendProvider<Id>: Send + Sync {
     /// The `config.backend` discriminator this provider handles.
     fn backend_type(&self) -> &'static str;
     /// Build a backend from a named host interface's config.
-    async fn instantiate(&self, config: &HashMap<String, String>) -> anyhow::Result<Id>;
+    ///
+    /// `egress` is the plugin's declared ceiling, already checked against
+    /// `config` by [`BackendProvider::check_egress`] and
+    /// [`BackendProvider::check_resolved_egress`]; a client that can learn
+    /// further endpoints on the wire should stay on the checked ones under it.
+    async fn instantiate(
+        &self,
+        config: &Config,
+        egress: Option<&PluginEgressPolicy>,
+    ) -> anyhow::Result<Id>;
+    /// Check every endpoint `config` would dial against the plugin's declared
+    /// ceiling. A provider that does not connect out returns `Ok(())`.
+    fn check_egress(&self, config: &Config, policy: &PluginEgressPolicy) -> anyhow::Result<()>;
+    /// Check what the endpoints [`BackendProvider::check_egress`] accepted
+    /// resolve to now. Runs on every bind, before the pool, so a pooled
+    /// connection answers to the current policy too.
+    async fn check_resolved_egress(
+        &self,
+        _config: &Config,
+        _policy: &PluginEgressPolicy,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// A pool key for connection reuse, or `None` to never pool.
     ///
     /// Providers backed by a shared external connection (redis, NATS) return
@@ -59,7 +130,7 @@ pub trait BackendProvider<Id>: Send + Sync {
     /// interfaces with the same configuration share one backend and thus one
     /// connection, instead of opening a fresh one per workload bind. Isolated
     /// providers (in-memory) return `None` and always produce a fresh backend.
-    fn pool_key(&self, _config: &HashMap<String, String>) -> Option<String> {
+    fn pool_key(&self, _config: &Config) -> Option<String> {
         None
     }
 }
@@ -104,6 +175,8 @@ pub struct Multiplexer<Id> {
     /// plugin default without requiring a label. A `std::sync::Mutex` because the
     /// critical section is a tiny map touch with no `await` held across it.
     defaults: Arc<std::sync::Mutex<HashMap<Arc<str>, Id>>>,
+    /// The ceiling from the plugin's `host.plugins` entry, when it declared one.
+    egress: arc_swap::ArcSwapOption<PluginEgressPolicy>,
 }
 
 impl<Id: Clone + Send + Sync + 'static> Multiplexer<Id> {
@@ -125,7 +198,16 @@ impl<Id: Clone + Send + Sync + 'static> Multiplexer<Id> {
             idle_ttl: DEFAULT_IDLE_TTL,
             reaper_started: AtomicBool::new(false),
             defaults: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            egress: arc_swap::ArcSwapOption::empty(),
         }
+    }
+
+    /// Install the ceiling declared for the owning plugin, checked on every
+    /// later [`Multiplexer::instantiate`]. The whole of a multiplexed plugin's
+    /// [`crate::plugin::HostPlugin::configure_egress_policy`].
+    pub fn configure_egress_policy(&self, policy: Arc<PluginEgressPolicy>) -> anyhow::Result<()> {
+        self.egress.store(Some(policy));
+        Ok(())
     }
 
     /// Record the workload's default (unnamed `""`) backend from a built
@@ -201,28 +283,54 @@ impl<Id: Clone + Send + Sync + 'static> Multiplexer<Id> {
     /// post-process (e.g. wrap with a decorator) before inserting into a
     /// registry.
     pub async fn instantiate(&self, iface: &WitInterface) -> anyhow::Result<Id> {
-        let backend_type = iface
+        let backend = iface
             .config
-            .get(BACKEND_CONFIG_KEY)
-            .map(String::as_str)
-            .unwrap_or(self.default_backend_type);
+            .value(BACKEND_CONFIG_KEY)
+            .unwrap_or_else(|| self.default_backend_type.into());
+        let backend_type = backend.expose();
         let provider = self.providers.get(backend_type).ok_or_else(|| {
             anyhow::anyhow!(
-                "no {}:{} provider registered for backend '{backend_type}'",
+                "no {}:{} provider registered for backend '{backend}'",
                 self.namespace,
                 self.package
             )
         })?;
 
+        // Before the pool: a cached connection to a refused url must not be
+        // handed out just because some earlier bind opened it.
+        let egress = self.egress.load_full();
+        if let Some(policy) = &egress {
+            let checked = match provider.check_egress(&iface.config, policy) {
+                Ok(()) => provider.check_resolved_egress(&iface.config, policy).await,
+                Err(e) => Err(e),
+            };
+            checked.with_context(|| {
+                format!(
+                    "{}:{} binding `{}` (backend '{backend}') is refused by the egress \
+                         policy declared for this plugin",
+                    self.namespace,
+                    self.package,
+                    crate::plugin::bindings::describe_binding(
+                        iface.name.as_deref().unwrap_or_default()
+                    )
+                )
+            })?;
+        }
+        let egress = egress.as_deref();
+
         // Unpooled providers (in-memory, filesystem) always build a fresh,
         // isolated backend — nothing to share or reap.
         let Some(pool_key) = provider.pool_key(&iface.config) else {
-            return provider.instantiate(&iface.config).await;
+            return provider.instantiate(&iface.config, egress).await;
         };
         // `backend_type` is a fixed `&'static str` from a closed set with no
         // null byte, so the `\u{0}` separator makes cross-type collisions
         // impossible.
-        let key = format!("{backend_type}\u{0}{pool_key}");
+        let pool_key = zeroize::Zeroizing::new(pool_key);
+        let key = format!(
+            "{backend_type}\u{0}{}",
+            pool_fingerprint(&pool_key, &iface.config)
+        );
 
         self.ensure_reaper_running();
 
@@ -245,7 +353,7 @@ impl<Id: Clone + Send + Sync + 'static> Multiplexer<Id> {
         // the cell is left empty, so a later bind retries rather than caching a
         // failed connection.
         let backend = cell
-            .get_or_try_init(|| provider.instantiate(&iface.config))
+            .get_or_try_init(|| provider.instantiate(&iface.config, egress))
             .await?
             .clone();
 
@@ -352,12 +460,14 @@ impl<Id: Clone + Send + Sync + 'static> Multiplexer<Id> {
 
     /// Test-only view of the current pool size.
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     async fn pool_len(&self) -> usize {
         self.pool.lock().await.len()
     }
 
     /// Test-only count of pooled connections for one backend type.
     #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
     async fn pool_count_for(&self, backend_type: &str) -> usize {
         let prefix = format!("{backend_type}\u{0}");
         self.pool
@@ -366,6 +476,58 @@ impl<Id: Clone + Send + Sync + 'static> Multiplexer<Id> {
             .keys()
             .filter(|k| k.starts_with(&prefix))
             .count()
+    }
+}
+
+/// Pool keys retain neither credentials nor URLs. Secrecy affects diagnostics.
+fn pool_fingerprint(key: &str, config: &Config) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update((key.len() as u64).to_le_bytes());
+    hash.update(key.as_bytes());
+    for (name, value) in config {
+        if value.is_secret() {
+            hash.update((name.len() as u64).to_le_bytes());
+            hash.update(name.as_bytes());
+        }
+    }
+    format!("{:x}", hash.finalize())
+}
+
+/// Connect the client behind a multiplexed NATS backend.
+///
+/// A host setting or declared egress policy restricts the client to `url`.
+/// Advertised servers have not passed the egress check.
+pub(crate) async fn connect_nats(
+    url: crate::wit::ConfigStr<'_>,
+    egress: Option<&PluginEgressPolicy>,
+    ignore_discovered_servers: bool,
+) -> anyhow::Result<async_nats::Client> {
+    let mut options = async_nats::ConnectOptions::new();
+    if ignore_discovered_servers || egress.is_some() {
+        options = options.ignore_discovered_servers();
+    }
+    url.guard("url", options.connect(url.expose()).await)
+}
+
+/// Check a multiplexed NATS backend's `url`, when the config names one. A
+/// config without one is left to `instantiate`, which refuses it.
+pub(crate) fn check_nats_url(config: &Config, policy: &PluginEgressPolicy) -> anyhow::Result<()> {
+    match config.value("url") {
+        Some(url) => url.guard("url", policy.check_nats_server(url.expose())),
+        None => Ok(()),
+    }
+}
+
+/// What a multiplexed NATS backend's `url`, which [`check_nats_url`]
+/// accepted, resolves to now.
+pub(crate) async fn check_nats_url_resolved(
+    config: &Config,
+    policy: &PluginEgressPolicy,
+) -> anyhow::Result<()> {
+    match config.value("url") {
+        Some(url) => url.guard("url", policy.check_nats_server_resolved(url.expose()).await),
+        None => Ok(()),
     }
 }
 
@@ -410,17 +572,85 @@ fn enforce_limit<Id>(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering::SeqCst;
 
+    #[tokio::test]
+    async fn nats_discovery_respects_host_setting_and_egress_policy() -> anyhow::Result<()> {
+        use crate::nats_test::accept_advertising;
+
+        for (ignore, policy) in [(false, false), (true, false), (false, true), (true, true)] {
+            let given = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let advertised = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("nats://{}", given.local_addr()?);
+            let egress = policy.then(|| PluginEgressPolicy::allowing(&[&url]));
+            let (_socket, client) = tokio::try_join!(
+                accept_advertising(&given, advertised.local_addr()?),
+                connect_nats(url.as_str().into(), egress.as_deref(), ignore),
+            )?;
+            let pool = client.server_pool().await?;
+            let discover = !ignore && !policy;
+            assert_eq!(pool.len(), if discover { 2 } else { 1 });
+            assert_eq!(
+                pool.iter().filter(|s| s.is_discovered).count(),
+                usize::from(discover)
+            );
+        }
+        Ok(())
+    }
+
     fn registry(entries: &[(&str, i32)]) -> HashMap<String, i32> {
         entries.iter().map(|(k, v)| (k.to_string(), *v)).collect()
     }
 
+    #[test]
+    fn pool_keys_hide_secrets_and_separate_diagnostic_policies() {
+        let url = "nats://user:password@private-host";
+        let plain = Config::from_iter([("url", url)]);
+        let mut secret = Config::new();
+        secret.insert("url", crate::plugin::SecretValue::new(url));
+        let key = pool_fingerprint(url, &secret);
+        assert!(!key.contains("password"));
+        assert_ne!(key, pool_fingerprint(url, &plain));
+        assert_ne!(key, pool_fingerprint("nats://different", &secret));
+    }
+
     fn mux() -> Multiplexer<i32> {
         Multiplexer::new("wasi", "keyvalue", "in-memory")
+    }
+
+    #[test]
+    fn every_multiplexed_builtin_keeps_backend_addresses_from_workloads() {
+        use crate::plugin::KeyOwnership;
+
+        let plugins = crate::plugin::multiplexed_plugins();
+        assert!(!plugins.is_empty());
+        for plugin in plugins {
+            let id = plugin.id();
+            let claimed = match id {
+                _ if id.contains("keyvalue") => KEYVALUE_HOST_OWNED_KEYS,
+                _ if id.contains("blobstore") => BLOBSTORE_HOST_OWNED_KEYS,
+                _ if id.contains("messaging") => MESSAGING_HOST_OWNED_KEYS,
+                _ => panic!("unexpected multiplexed plugin {id}"),
+            };
+            let schema = plugin.binding_schema();
+            for key in ["url", "root", "prefix"] {
+                let expected = if claimed.contains(&key) {
+                    KeyOwnership::Host
+                } else {
+                    KeyOwnership::Workload
+                };
+                assert_eq!(schema.ownership(key), expected, "{id} {key}");
+            }
+            assert_eq!(
+                schema.ownership(BACKEND_CONFIG_KEY),
+                KeyOwnership::Workload,
+                "{id}"
+            );
+        }
     }
 
     #[test]
@@ -473,6 +703,7 @@ mod tests {
         count: AtomicUsize,
         pooled: bool,
         delay: Duration,
+        refuse_resolved: AtomicBool,
     }
 
     impl CountingProvider {
@@ -488,6 +719,7 @@ mod tests {
                 count: AtomicUsize::new(0),
                 pooled,
                 delay,
+                refuse_resolved: AtomicBool::new(false),
             })
         }
     }
@@ -497,14 +729,37 @@ mod tests {
         fn backend_type(&self) -> &'static str {
             self.backend
         }
-        async fn instantiate(&self, _: &HashMap<String, String>) -> anyhow::Result<Arc<usize>> {
+        async fn instantiate(
+            &self,
+            _: &Config,
+            _: Option<&PluginEgressPolicy>,
+        ) -> anyhow::Result<Arc<usize>> {
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
             }
             Ok(Arc::new(self.count.fetch_add(1, SeqCst)))
         }
-        fn pool_key(&self, config: &HashMap<String, String>) -> Option<String> {
-            self.pooled.then(|| config.get("url").cloned()).flatten()
+        fn check_egress(&self, config: &Config, policy: &PluginEgressPolicy) -> anyhow::Result<()> {
+            policy.check_url(
+                config.get("url").unwrap(),
+                crate::host::declared_port::Protocol::Tcp,
+                6379,
+            )
+        }
+        async fn check_resolved_egress(
+            &self,
+            _: &Config,
+            _: &PluginEgressPolicy,
+        ) -> anyhow::Result<()> {
+            if self.refuse_resolved.load(SeqCst) {
+                anyhow::bail!("resolves into a denied range");
+            }
+            Ok(())
+        }
+        fn pool_key(&self, config: &Config) -> Option<String> {
+            self.pooled
+                .then(|| config.get("url").map(str::to_string))
+                .flatten()
         }
     }
 
@@ -514,7 +769,7 @@ mod tests {
             package: "keyvalue".to_string(),
             interfaces: ["store".to_string()].into_iter().collect(),
             version: None,
-            config: HashMap::from([
+            config: crate::wit::Config::from_iter([
                 ("backend".to_string(), backend.to_string()),
                 ("url".to_string(), url.to_string()),
             ]),
@@ -668,5 +923,103 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60)).await;
         let _b = mux.instantiate(&url_iface("redis://b")).await.unwrap();
         assert_eq!(mux.pool_len().await, 1, "idle 'a' should have been reaped");
+    }
+
+    /// The check runs on every bind, so a connection some earlier bind pooled
+    /// is not handed to a binding the policy refuses.
+    #[tokio::test]
+    async fn egress_is_checked_before_a_pooled_connection_is_reused() {
+        let provider = CountingProvider::new(true);
+        let mux = Multiplexer::new("wasi", "keyvalue", "test").with_provider(provider.clone());
+        mux.instantiate(&url_iface("redis://outside.example:6379"))
+            .await
+            .unwrap();
+
+        mux.configure_egress_policy(PluginEgressPolicy::allowing(&[
+            "redis://inside.example:6379",
+        ]))
+        .unwrap();
+        let err = mux
+            .instantiate(&url_iface("redis://outside.example:6379"))
+            .await
+            .expect_err("a pooled connection outside the policy must be refused");
+        assert!(
+            format!("{err:#}").contains("outside.example"),
+            "names the host: {err:#}"
+        );
+        mux.instantiate(&url_iface("redis://inside.example:6379"))
+            .await
+            .unwrap();
+        assert_eq!(provider.count.load(SeqCst), 2);
+    }
+
+    /// What a name resolves to is judged on every bind, so a pooled connection
+    /// is not handed out once the name no longer passes.
+    #[tokio::test]
+    async fn resolution_is_checked_before_a_pooled_connection_is_reused() {
+        let provider = CountingProvider::new(true);
+        let mux = Multiplexer::new("wasi", "keyvalue", "test").with_provider(provider.clone());
+        mux.configure_egress_policy(PluginEgressPolicy::allowing(&["redis://db.example:6379"]))
+            .unwrap();
+        mux.instantiate(&url_iface("redis://db.example:6379"))
+            .await
+            .unwrap();
+
+        provider.refuse_resolved.store(true, SeqCst);
+        let err = mux
+            .instantiate(&url_iface("redis://db.example:6379"))
+            .await
+            .expect_err("a pooled connection whose name no longer passes must be refused");
+        assert!(format!("{err:#}").contains("denied range"), "{err:#}");
+        assert_eq!(provider.count.load(SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_nats_url_resolving_to_loopback_is_refused() {
+        let policy = PluginEgressPolicy::allowing(&["nats://localhost:4222"]);
+        let config = Config::from_iter([("url", "nats://localhost:4222")]);
+        check_nats_url_resolved(&config, &policy).await.unwrap_err();
+        check_nats_url_resolved(&Config::new(), &policy)
+            .await
+            .unwrap();
+    }
+
+    /// A malformed url is reported as malformed, not as a policy refusal.
+    #[test]
+    fn an_invalid_nats_url_is_not_reported_as_denied() {
+        let policy = PluginEgressPolicy::allowing(&["nats://nats.internal:4222"]);
+        let config = Config::from_iter([("url", "nats://host:42x2")]);
+        let err = format!("{:#}", check_nats_url(&config, &policy).unwrap_err());
+        assert!(
+            err.contains("is invalid") && !err.contains("is denied"),
+            "{err}"
+        );
+    }
+
+    /// A multiplexed NATS url is read as `async_nats` reads it.
+    #[test]
+    fn a_nats_url_is_checked_at_its_default_port() {
+        let policy = PluginEgressPolicy::allowing(&["nats://nats.internal:4222"]);
+        let config = |url: &str| Config::from_iter([("url", url)]);
+        check_nats_url(&config("nats.internal"), &policy).unwrap();
+        check_nats_url(&config("nats://nats.internal:4222"), &policy).unwrap();
+        assert!(check_nats_url(&config("nats://nats.internal:6222"), &policy).is_err());
+        assert!(check_nats_url(&config("nats://other.internal:4222"), &policy).is_err());
+    }
+
+    #[test]
+    fn a_malformed_url_is_quoted_unless_it_is_a_secret() {
+        let policy = PluginEgressPolicy::allowing(&["nats.internal:4222"]);
+        let malformed = "nats://[hunter2";
+
+        let text: Config = [("url", malformed)].into_iter().collect();
+        let err = format!("{:#}", check_nats_url(&text, &policy).unwrap_err());
+        assert!(err.contains("hunter2"), "{err}");
+
+        let mut secret = Config::new();
+        secret.insert("url", crate::plugin::SecretValue::new(malformed));
+        let err = format!("{:#}", check_nats_url(&secret, &policy).unwrap_err());
+        assert!(!err.contains("hunter2"), "{err}");
+        assert!(err.contains("`url`"), "{err}");
     }
 }

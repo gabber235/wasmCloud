@@ -1,0 +1,334 @@
+header:
+  schema-version: 2.2.0
+  last-updated: '2026-11-08'
+  last-reviewed: '2026-10-27'
+  url: https://raw.githubusercontent.com/wasmCloud/wasmCloud/main/security-insights.yml
+
+project:
+  name: wasmCloud
+  homepage: https://wasmcloud.com
+  roadmap: https://github.com/wasmCloud/wasmCloud/blob/main/ROADMAP.md
+  steward:
+    uri: https://www.linuxfoundation.org/security
+    comment: >-
+      wasmCloud is a CNCF project, supported under the Linux Foundation CRA
+      stewardship framework. The security team escalates actively exploited
+      vulnerabilities and severe incidents to steward@linuxfoundation.org, as
+      described in
+      https://github.com/wasmCloud/wasmCloud/blob/main/CONTRIBUTING.md#escalating-to-the-cra-steward
+  administrators:
+    - name: wasmCloud org maintainers (@wasmCloud/org-maintainers)
+      social: https://github.com/wasmCloud/wasmCloud/blob/main/MAINTAINERS.md#wasmcloudorg-maintainers
+      primary: true
+  repositories:
+    - name: wasmCloud
+      url: https://github.com/wasmCloud/wasmCloud
+      comment: >-
+        Monorepo for the wash CLI, the wash-runtime host, the runtime gateway,
+        the runtime operator and its Helm chart, WIT interfaces, and templates.
+    - name: go
+      url: https://github.com/wasmCloud/go
+      comment: Go SDK, examples, and Go tooling outside the monorepo.
+    - name: typescript
+      url: https://github.com/wasmCloud/typescript
+      comment: TypeScript SDKs, examples, and tooling.
+    - name: wasmcloud.com
+      url: https://github.com/wasmCloud/wasmcloud.com
+      comment: Source of the wasmcloud.com website and project documentation.
+  vulnerability-reporting:
+    reports-accepted: true
+    bug-bounty-available: false
+    policy: https://github.com/wasmCloud/wasmCloud/blob/main/SECURITY.md
+    contact:
+      name: wasmCloud Security Team
+      email: security@wasmcloud.com
+      primary: true
+    comment: >-
+      Report privately through GitHub at
+      https://github.com/wasmCloud/wasmCloud/security/advisories/new or by email
+      to security@wasmcloud.com. Reports are acknowledged within 3 business days. Advisories are published as GitHub
+      Security Advisories in the affected repository.
+    in-scope:
+      - Any repository in the wasmCloud GitHub organization
+      - Vulnerabilities in dependencies of wasmCloud projects
+    out-of-scope:
+      - Applications deployed to a wasmCloud host
+      - Guidance on securing a wasmCloud deployment
+      - Help applying security updates
+  documentation:
+    detailed-guide: https://wasmcloud.com/docs/
+    quickstart-guide: https://wasmcloud.com/docs/quickstart
+    code-of-conduct: https://github.com/cncf/foundation/blob/main/code-of-conduct.md
+    release-process: https://github.com/wasmCloud/wasmCloud/blob/main/RELEASE_RUNBOOK.md
+    support-policy: https://github.com/wasmCloud/wasmCloud/blob/main/SUPPORT.md
+    design: https://github.com/wasmCloud/wasmCloud/blob/main/ARCHITECTURE.md
+    signature-verification: https://wasmcloud.com/docs/verify-releases/
+
+repository:
+  url: https://github.com/wasmCloud/wasmCloud
+  status: active
+  accepts-change-request: true
+  accepts-automated-change-request: true
+  core-team:
+    - name: wasmCloud maintainers (CNCF maintainer roster)
+      social: https://github.com/wasmCloud/.project/blob/main/maintainers.yaml
+      primary: true
+  license:
+    url: https://github.com/wasmCloud/wasmCloud/blob/main/LICENSE
+    expression: Apache-2.0
+  documentation:
+    contributing-guide: https://github.com/wasmCloud/wasmCloud/blob/main/CONTRIBUTING.md
+    dependency-management-policy: https://github.com/wasmCloud/wasmCloud/blob/main/CONTRIBUTING.md#dependencies
+    governance: https://github.com/wasmCloud/wasmCloud/blob/main/GOVERNANCE.md
+    review-policy: https://github.com/wasmCloud/wasmCloud/blob/main/CONTRIBUTING.md#code-review
+    security-policy: https://github.com/wasmCloud/wasmCloud/blob/main/SECURITY.md
+  release:
+    automated-pipeline: true
+    distribution-points:
+      - uri: https://github.com/wasmCloud/wasmCloud/releases
+        comment: GitHub Releases with wash binaries and their Sigstore attestation bundle.
+      - uri: https://github.com/wasmCloud/wasmCloud/pkgs/container/wash
+        comment: ghcr.io/wasmcloud/wash container image.
+      - uri: https://github.com/wasmCloud/wasmCloud/pkgs/container/runtime-gateway
+        comment: ghcr.io/wasmcloud/runtime-gateway container image.
+      - uri: https://github.com/wasmCloud/wasmCloud/pkgs/container/runtime-operator
+        comment: ghcr.io/wasmcloud/runtime-operator container image.
+      - uri: https://github.com/wasmCloud/wasmCloud/pkgs/container/charts%2Fruntime-operator
+        comment: ghcr.io/wasmcloud/charts/runtime-operator Helm chart (OCI).
+      - uri: https://github.com/orgs/wasmCloud/packages?repo_name=wasmCloud
+        comment: >-
+          WIT interface packages at ghcr.io/wasmcloud/interfaces/<ns>/<name>:<version>,
+          published from wit/ on pushes to main.
+      - uri: https://github.com/wasmCloud/homebrew-wasmcloud
+        comment: Homebrew tap for wash.
+      - uri: https://github.com/microsoft/winget-pkgs/tree/master/manifests/w/wasmCloud/wash
+        comment: winget package for wash.
+    changelog: https://github.com/wasmCloud/wasmCloud/releases/tag/v{version}
+    attestations:
+      - name: SLSA build provenance
+        location: https://github.com/wasmCloud/wasmCloud/attestations
+        predicate-uri: https://slsa.dev/provenance/v1
+        comment: >-
+          Release binaries, container images and WIT interface packages carry
+          Sigstore-signed SLSA provenance. Verify with `gh attestation verify --repo wasmCloud/wasmCloud`.
+      - name: OpenVEX non-exploitability assessments
+        location: https://github.com/wasmCloud/wasmCloud/releases/latest/download/wasmcloud.openvex.json
+        predicate-uri: https://openvex.dev/ns/v0.2.0
+        comment: >-
+          Each release includes wasmcloud.openvex.json and wasmcloud.openvex.sigstore.json
+          alongside the SBOMs. The source assessments are maintained at
+          https://github.com/wasmCloud/wasmCloud/blob/main/vex/wasmcloud.openvex.json.
+  security:
+    assessments:
+      self:
+        name: wasmCloud security self-assessment
+        evidence: https://github.com/wasmCloud/wasmCloud/blob/main/SELF_ASSESSMENT.md
+        date: '2026-10-27'
+        comment: >-
+          Written with the OpenSSF self-assessment template. The threat model
+          it refers to, THREAT_MODEL.md, holds the trust boundaries, security
+          goals and known limitations. Gemara v1.6.0 capability and threat catalogs for the host
+          are in docs/security/.
+      third-party:
+        - name: OSTIF and Trail of Bits security audit
+          evidence: https://ostif.org/wp-content/uploads/2023/10/wasmcloud-audit-ostif-trail-of-bits-final.pdf
+          date: '2023-10-17'
+          comment: >-
+            Covered wasmCloud 1.x. The 2.x host in this repository replaced the
+            audited code.
+    tools:
+      - name: GitHub secret scanning
+        type: secret
+        comment: >-
+          Secret scanning and push protection are enabled on the repository,
+          so a push containing a detected secret is blocked.
+        rulesets:
+          - default
+        integration:
+          adhoc: true
+          ci: true
+          release: false
+        results:
+          ci:
+            name: GitHub secret scanning
+            predicate-uri: https://docs.github.com/en/code-security/secret-scanning/introduction/about-secret-scanning
+            location: https://github.com/wasmCloud/wasmCloud/blob/main/SECURITY.md#stored-secrets
+      - name: CodeQL
+        type: SAST
+        comment: >-
+          Rust and Go analysis with the security-extended suite on every pull
+          request, merge queue run and push to main, plus weekly. The main
+          ruleset blocks merges that add high or critical alerts. Threshold
+          policy: SECURITY.md#code-scanning.
+        rulesets:
+          - security-extended
+        integration:
+          adhoc: true
+          ci: true
+          release: false
+        results:
+          ci:
+            name: CodeQL
+            predicate-uri: https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html
+            location: https://github.com/wasmCloud/wasmCloud/actions/workflows/codeql.yml
+      - name: cargo-audit
+        type: SCA
+        comment: >-
+          RustSec advisory check daily, on pushes to main, and on pull requests
+          that change a Cargo manifest or the lockfile.
+        rulesets:
+          - default
+        integration:
+          adhoc: true
+          ci: true
+          release: false
+        results:
+          ci:
+            name: cargo-audit
+            predicate-uri: https://rustsec.org
+            location: https://github.com/wasmCloud/wasmCloud/actions/workflows/audit.yml
+      - name: OSV-Scanner
+        type: SCA
+        comment: >-
+          Scans every Cargo, Go and npm lockfile against OSV, including the
+          OpenSSF malicious-packages feed, on every pull request, merge queue
+          run, push to main and daily. Fails gate-audit on any finding not
+          ignored in osv-scanner.toml, except RustSec informational advisories,
+          which warn as they do in cargo-audit; malicious packages always fail.
+          Released-code ignores require a VEX statement. Policy:
+          SECURITY.md#malicious-dependencies.
+        rulesets:
+          - default
+        integration:
+          adhoc: true
+          ci: true
+          release: false
+        results:
+          ci:
+            name: osv-scanner
+            predicate-uri: https://osv.dev
+            location: https://github.com/wasmCloud/wasmCloud/actions/workflows/audit.yml
+      - name: Dependency Review
+        type: SCA
+        comment: >-
+          Checks dependency changes across supported ecosystems, including Rust
+          and Go, on pull requests and merge groups that change dependency files,
+          GitHub Actions, or the dependency policy. Blocks advisories of any
+          severity in runtime, development, and unknown scopes through gate-audit.
+          Checks licenses against the allowlist and crate exemptions mirrored from
+          deny.toml in .github/dependency-review-config.yml; cargo-deny enforces
+          the specific licenses approved for exempted crates in every Rust
+          workspace, including standalone examples and templates.
+        rulesets:
+          - default
+        integration:
+          adhoc: false
+          ci: true
+          release: false
+        results:
+          ci:
+            name: dependency-review
+            predicate-uri: https://github.com/actions/dependency-review-action
+            location: https://github.com/wasmCloud/wasmCloud/actions/workflows/audit.yml
+      - name: Dependabot
+        type: SCA
+        comment: >-
+          Dependabot alerts and security-update PRs, plus weekly version
+          updates for cargo, gomod, github-actions, and docker.
+        rulesets:
+          - default
+        integration:
+          adhoc: true
+          ci: false
+          release: false
+        results: {}
+      - name: zizmor
+        type: SAST
+        comment: Static analysis of GitHub Actions workflows.
+        rulesets:
+          - default
+        integration:
+          adhoc: false
+          ci: true
+          release: false
+        results:
+          ci:
+            name: zizmor
+            predicate-uri: https://docs.zizmor.sh
+            location: https://github.com/wasmCloud/wasmCloud/actions/workflows/lint-workflows.yml
+      - name: Trivy
+        type: SAST
+        comment: Misconfiguration scanning of the Helm chart.
+        rulesets:
+          - default
+        integration:
+          adhoc: false
+          ci: true
+          release: false
+        results:
+          ci:
+            name: trivy config
+            predicate-uri: https://trivy.dev
+            location: https://github.com/wasmCloud/wasmCloud/actions/workflows/charts.yml
+      - name: Checkov
+        type: SAST
+        comment: Misconfiguration scanning of the Helm chart.
+        rulesets:
+          - default
+        integration:
+          adhoc: false
+          ci: true
+          release: false
+        results:
+          ci:
+            name: checkov
+            predicate-uri: https://www.checkov.io
+            location: https://github.com/wasmCloud/wasmCloud/actions/workflows/charts.yml
+      - name: OpenSSF Scorecard
+        type: other
+        comment: Weekly supply-chain posture check with published results.
+        rulesets:
+          - default
+        integration:
+          adhoc: true
+          ci: false
+          release: false
+        results:
+          adhoc:
+            name: OpenSSF Scorecard
+            predicate-uri: https://github.com/ossf/scorecard
+            location: https://scorecard.dev/viewer/?uri=github.com/wasmCloud/wasmCloud
+      - name: OSPS Baseline Scanner
+        type: other
+        comment: >-
+          OSPS Baseline Maturity Level 1 assessment on every push to main and
+          weekly, the only level the scanner action evaluates. The project
+          targets Level 3. Failed controls are uploaded to code scanning.
+        rulesets:
+          - osps-baseline-2026-08
+        integration:
+          adhoc: true
+          ci: true
+          release: false
+        results:
+          ci:
+            name: OSPS Baseline evaluation
+            predicate-uri: https://github.com/revanite-io/osps-baseline-action
+            location: https://github.com/wasmCloud/wasmCloud/actions/workflows/osps-baseline.yml
+      - name: OSPS Baseline Scanner (grc.store)
+        type: other
+        comment: >-
+          OSPS Baseline Maturity Level 3 assessment weekly and on demand,
+          published to grc.store as a signed log by the publish-results
+          workflow.
+        rulesets:
+          - osps-baseline
+        integration:
+          adhoc: true
+          ci: true
+          release: false
+        results:
+          ci:
+            name: OSPS Baseline evaluation
+            predicate-uri: https://github.com/revanite-io/pvtr-publish-results
+            location: https://grc.store/targets/wasmcloud/wasmcloud

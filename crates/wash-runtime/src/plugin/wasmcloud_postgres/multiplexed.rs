@@ -21,13 +21,14 @@ use tokio::sync::RwLock;
 use url::Url;
 
 use crate::engine::ctx::ActiveCtx;
+use crate::plugin::PluginEgressPolicy;
 use crate::plugin::multiplex::{BackendProvider, Multiplexer};
 use crate::wit::WitInterface;
 
 use super::{
     DEFAULT_POOL_SIZE, PLUGIN_POSTGRES_ID, PgValue, PreparedEntry, PreparedStatementExecError,
     QueryError, ResultRow, StatementPrepareError, WasmcloudPostgres, bindings, execute_query,
-    extract_pool_size, extract_tls_requirement, pg_error_string,
+    extract_pool_size, extract_tls_requirement, pg_error_string, wrong_type_message,
 };
 
 /// The single `wasmcloud:postgres` backend type. Unlike `wasi:keyvalue` (which
@@ -47,6 +48,18 @@ const POSTGRES_BACKEND: &str = "postgres";
 #[derive(Clone)]
 pub struct PgId {
     pool: Pool,
+}
+
+fn check_url_egress(url: &str, policy: &PluginEgressPolicy) -> anyhow::Result<()> {
+    let pg_config: tokio_postgres::Config =
+        url.parse().context("failed to parse postgres config")?;
+    super::check_egress(&pg_config, policy)
+}
+
+async fn check_resolved_url_egress(url: &str, policy: &PluginEgressPolicy) -> anyhow::Result<()> {
+    let pg_config: tokio_postgres::Config =
+        url.parse().context("failed to parse postgres config")?;
+    super::check_resolved_egress(&pg_config, policy).await
 }
 
 /// Build a deadpool connection pool from a full postgres URL (credentials +
@@ -83,6 +96,11 @@ fn build_pool_from_url(url: &str) -> anyhow::Result<Pool> {
 }
 
 impl PgId {
+    #[cfg(test)]
+    pub(super) fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
     /// Acquire a pooled connection for this named import. `pub(super)` so the
     /// async (`0.2.0`) binding can stream from the same per-credential pool.
     pub(super) async fn client(&self) -> Result<deadpool_postgres::Client, String> {
@@ -179,10 +197,10 @@ impl PgId {
             .map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
         client.execute_raw(&stmt, param_refs).await.map_err(|e| {
-            PreparedStatementExecError::QueryError(QueryError::Unexpected(format!(
-                "execute failed: {}",
-                pg_error_string(&e)
-            )))
+            PreparedStatementExecError::QueryError(match wrong_type_message(&e) {
+                Some(msg) => QueryError::InvalidParams(msg),
+                None => QueryError::Unexpected(format!("execute failed: {}", pg_error_string(&e))),
+            })
         })
     }
 }
@@ -198,17 +216,43 @@ impl BackendProvider<PgId> for PostgresProvider {
         POSTGRES_BACKEND
     }
 
-    fn pool_key(&self, config: &HashMap<String, String>) -> Option<String> {
-        config.get("url").cloned()
+    fn pool_key(&self, config: &crate::wit::Config) -> Option<String> {
+        config.expose("url").map(str::to_string)
     }
 
-    async fn instantiate(&self, config: &HashMap<String, String>) -> anyhow::Result<PgId> {
-        let url = config.get("url").ok_or_else(|| {
+    async fn instantiate(
+        &self,
+        config: &crate::wit::Config,
+        _egress: Option<&PluginEgressPolicy>,
+    ) -> anyhow::Result<PgId> {
+        let url = config.value("url").ok_or_else(|| {
             anyhow::anyhow!("named wasmcloud:postgres interface requires a 'url' config")
         })?;
         Ok(PgId {
-            pool: build_pool_from_url(url)?,
+            pool: url.guard("url", build_pool_from_url(url.expose()))?,
         })
+    }
+
+    fn check_egress(
+        &self,
+        config: &crate::wit::Config,
+        policy: &PluginEgressPolicy,
+    ) -> anyhow::Result<()> {
+        let Some(url) = config.value("url") else {
+            return Ok(());
+        };
+        url.guard("url", check_url_egress(url.expose(), policy))
+    }
+
+    async fn check_resolved_egress(
+        &self,
+        config: &crate::wit::Config,
+        policy: &PluginEgressPolicy,
+    ) -> anyhow::Result<()> {
+        let Some(url) = config.value("url") else {
+            return Ok(());
+        };
+        url.guard("url", check_resolved_url_egress(url.expose(), policy).await)
     }
 }
 
@@ -289,5 +333,43 @@ impl<'a> bindings::named_imports::wasmcloud::postgres0_1_1_draft::prepared::Host
         Ok(id
             .exec(&plugin.prepared_statements, &stmt_token, &params)
             .await)
+    }
+}
+
+#[cfg(test)]
+mod secret_url_tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_url_is_quoted_unless_it_is_a_secret() {
+        let policy = PluginEgressPolicy::allowing(&["db.internal:5432"]);
+        let url = "postgres://db.internal/app?hunter2=1";
+
+        let text: crate::wit::Config = [("url", url)].into_iter().collect();
+        let err = format!(
+            "{:#}",
+            PostgresProvider.check_egress(&text, &policy).unwrap_err()
+        );
+        assert!(err.contains("hunter2"), "{err}");
+
+        let mut secret = crate::wit::Config::new();
+        secret.insert("url", crate::plugin::SecretValue::new(url));
+        let err = format!(
+            "{:#}",
+            PostgresProvider.check_egress(&secret, &policy).unwrap_err()
+        );
+        assert!(!err.contains("hunter2"), "{err}");
+    }
+
+    /// A permitted name is judged by what it resolves to.
+    #[tokio::test]
+    async fn a_name_resolving_to_loopback_is_refused() {
+        let policy = PluginEgressPolicy::allowing(&["postgres://localhost:5432"]);
+        let config: crate::wit::Config =
+            [("url", "postgres://localhost/app")].into_iter().collect();
+        PostgresProvider
+            .check_resolved_egress(&config, &policy)
+            .await
+            .unwrap_err();
     }
 }

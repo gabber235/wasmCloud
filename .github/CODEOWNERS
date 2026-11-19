@@ -31,6 +31,7 @@
 /.github/               @wasmCloud/ci-maintainers
 /install.sh             @wasmCloud/ci-maintainers
 /install.ps1            @wasmCloud/ci-maintainers
+/vex/                   @wasmCloud/ci-maintainers
 /Dockerfile             @wasmCloud/ci-maintainers
 /.dockerignore          @wasmCloud/ci-maintainers
 /RELEASE_RUNBOOK.md     @wasmCloud/ci-maintainers
@@ -40,6 +41,7 @@
 # jointly so wash maintainers retain context on the bench code itself
 # while ci maintainers gate the runner + pipeline.
 /scripts/bench/                         @wasmCloud/ci-maintainers
+/scripts/k6bench/                       @wasmCloud/ci-maintainers
 /crates/bench-tools/                    @wasmCloud/ci-maintainers @wasmCloud/wash-maintainers
 /crates/wash-runtime/benches/           @wasmCloud/ci-maintainers @wasmCloud/wash-maintainers
 

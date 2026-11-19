@@ -13,11 +13,25 @@ on:
           - gungraun
           - wasmtime_baseline
           - wasmtime_serve
+          - ids
           - gungraun_plugin
+          - scale_density
+          - memory_pressure
+          # scale_density with the argument in BENCH_VARIANTS below.
+          - max_scale
+          - million_warm
       ref:
         description: "git ref to bench (branch, tag, sha, or #PR; default = the workflow ref)"
         type: string
         default: ""
+      args:
+        description: "memory_pressure: extra runner flags (e.g. --memory-mib 384 2048 --repeats 3); scale_density: a preset (max-scale)"
+        type: string
+        default: ""
+      host:
+        description: "runner label of the bench host (hetzner = the dedicated host)"
+        type: string
+        default: hetzner
   # Auto-populate the releases timeline: when a tag is published, run the
   # subset of benches that actually track wash-runtime regressions against
   # that exact tag. The site filters rows by `ref` to render the
@@ -32,19 +46,12 @@ defaults:
   run:
     shell: bash
 
-# Only one bench workflow can run on the host at a time. Queue rather than
-# cancel so an in-flight bench is never interrupted partway through criterion
-# sampling. Matrix jobs within a single run also serialize naturally because
-# the host has exactly one self-hosted runner.
-concurrency:
-  group: bench-host
-  cancel-in-progress: false
-
 permissions: {}
 
 jobs:
   # Compute the matrix shape from the trigger:
-  #   - workflow_dispatch: a one-element matrix (just inputs.bench)
+  #   - workflow_dispatch: a one-element matrix (just inputs.bench, or the
+  #                        bench and argument a BENCH_VARIANTS name stands for)
   #   - release:           a matrix of $RELEASE_BENCHES (the reference
   #                        subset we track on the releases timeline)
   # The dispatch path keeps the one-bench UX so a maintainer can compare
@@ -55,37 +62,131 @@ jobs:
     if: github.repository == 'wasmCloud/wasmCloud'
     name: build matrix
     runs-on: ubuntu-latest
-    timeout-minutes: 1
+    timeout-minutes: 5
+    permissions:
+      contents: read
     outputs:
-      benches: ${{ steps.set.outputs.benches }}
-      # `ref` is the label recorded on each data row; `checkout_ref` is what
-      # actions/checkout is given. They differ only for a pull-request ref,
-      # where the row says `pull/123` but the checkout needs the full
-      # refs/pull/123/head.
+      # One entry per bench job: {name, bench, env, args, publish, group}.
+      runs: ${{ steps.runs.outputs.runs }}
+      # `ref` labels each data row; the matrix checkout resolves the commit.
+      # Pull-request labels use `pull/123`, while checkout uses the full ref.
       ref: ${{ steps.set.outputs.ref }}
-      checkout_ref: ${{ steps.set.outputs.checkout_ref }}
+      sha: ${{ steps.commit.outputs.sha }}
+      host: ${{ steps.set.outputs.host }}
     env:
       # Subset of inputs.bench.options to run automatically on `release:
       # published`. wasmtime_* are reference baselines for wasmtime itself
       # and don't shift with our changes — run them on demand via
       # workflow_dispatch when wasmtime is upgraded.
-      RELEASE_BENCHES: '["http_invoke","service_http","gungraun"]'
+      RELEASE_BENCHES: '["http_invoke","service_http","gungraun","max_scale"]'
+      # Named runs of an existing bench with a preset, either a preset the
+      # bench defines (`args`) or environment variables it reads (`env`):
+      #
+      # - `bench` is the bench that runs. `args` names a preset the bench
+      #   versions with its code; a ref that does not know the name fails.
+      #   `env` sets variables the bench reads from its environment.
+      # - Available to both dispatch and the release subset. A dispatch of
+      #   `bench` with `args` set to a variant's preset runs that variant.
+      # - Not published unless the preset names a `publish_group`: its rows
+      #   then enter history under that group instead of the bench's own
+      #   (`density` for scale_density), so they never mix with the bench's
+      #   default series. Only density benches take a group. An `env`
+      #   preset without one stays unpublished: on a ref whose bench
+      #   ignores the variables, its rows would be indistinguishable from
+      #   the bench's.
+      # - A preset with a `publish_host` publishes only from that host; run
+      #   elsewhere it stays unpublished, so another machine's numbers never
+      #   enter its series. It also stays unpublished on a ref whose
+      #   bench-tools predates `jsonl --group`, since those rows would land
+      #   in the default group. Both are decided here, before the bench host
+      #   is taken.
+      #
+      # max_scale: scale_density's max-scale preset, warm and scale-to-zero
+      # in growth mode with each guest memory's reservation and guard
+      # shrunk, past the ~16,000 warm instances the address space holds at
+      # wasmtime's 4 GiB + 32 MiB. Published as group density-max-scale.
+      #
+      # million_warm: the densest settings measured on aws-c9g-16xlarge
+      # (64 cores, 123 GiB, arm64's 256 TiB address space), for that host
+      # only: about 1.4M warm workloads. Process memory raised from the
+      # bench's 2 GiB default to 100 GiB, a 64 MiB + 64 KiB layout, a pool of
+      # 1.6M memories, and growth mode with the uncharged-initial-memory cap
+      # raised past 4x the guest budget. 100 GiB, not more, because the guard
+      # leaves out page tables (~9 KiB a warm workload here) until the
+      # footprint counts VmPTE; past it the kernel OOM-kills the bench. Needs
+      # vm.max_map_count >= ~10M (provision.yml -e vm_max_map_count=16777216).
+      # Published as group density-max, the record the density page shows.
+      BENCH_VARIANTS: >-
+        {"max_scale": {"bench": "scale_density", "args": "max-scale",
+                       "publish_group": "density-max-scale"},
+         "million_warm": {"bench": "scale_density",
+                          "env": {"WASH_SCALE_MEMORY_RESERVATION": "64MiB",
+                                  "WASH_SCALE_MEMORY_GUARD": "64KiB",
+                                  "WASH_SCALE_GUEST_MEMORY_MODE": "growth",
+                                  "WASH_SCALE_INITIAL_GUEST_MEMORY": "4TiB",
+                                  "WASH_SCALE_MEMORY_LIMIT": "100GiB",
+                                  "WASH_SCALE_MAX_MEMORIES": "1600000",
+                                  "WASH_SCALE_STEP": "10000",
+                                  "WASH_SCALE_MAX_SECS": "1800"},
+                          "publish_group": "density-max",
+                          "publish_host": "aws-c9g-16xlarge"}}
+      # Dispatch-only diagnostics whose results never enter the public
+      # history. memory_pressure checks pass/fail outcomes; it has no trend.
+      DIAGNOSTIC_BENCHES: '["memory_pressure"]'
     steps:
       - id: set
         env:
           EVENT: ${{ github.event_name }}
           INPUT_BENCH: ${{ inputs.bench }}
           INPUT_REF: ${{ inputs.ref }}
+          INPUT_ARGS: ${{ inputs.args }}
+          INPUT_HOST: ${{ inputs.host }}
           DEFAULT_REF: ${{ github.ref }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
+          # memory_pressure's runner takes flags, and scale_density one of
+          # the presets BENCH_VARIANTS names. Refuse anything else here,
+          # before the job queues on the bench host, rather than drop it.
+          args="${INPUT_ARGS:-}"
+          if [ -n "$args" ]; then
+            case "$INPUT_BENCH" in
+              memory_pressure)
+                # Flags and values only; the runner validates the rest.
+                if ! [[ "$args" =~ ^[A-Za-z0-9\ ._=-]+$ ]]; then
+                  echo "args may contain only letters, digits, spaces, and . _ = -" >&2
+                  exit 1
+                fi
+                ;;
+              scale_density)
+                if ! jq -e --arg args "$args" \
+                  'any(.[]; .bench == "scale_density" and .args == $args)' \
+                  <<< "$BENCH_VARIANTS" > /dev/null; then
+                  presets="$(jq -r '[.[] | select(.bench == "scale_density" and .args != null) | .args] | join(", ")' <<< "$BENCH_VARIANTS")"
+                  echo "scale_density args must be one preset: ${presets}" >&2
+                  exit 1
+                fi
+                ;;
+              *)
+                echo "args are only accepted for memory_pressure and scale_density, not ${INPUT_BENCH}" >&2
+                exit 1
+                ;;
+            esac
+          fi
+          # Release runs measure the dedicated host. Same shape as
+          # bench-host.mjs's parseHostLabel.
+          host="hetzner"
+          [ "$EVENT" = "release" ] || host="${INPUT_HOST:-hetzner}"
+          if ! [[ "$host" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]; then
+            echo "invalid host label '${host}'" >&2
+            exit 1
+          fi
           if [ "$EVENT" = "release" ]; then
-            benches="${RELEASE_BENCHES}"
+            benches="$RELEASE_BENCHES"
             ref="${RELEASE_TAG}"
             checkout_ref="${RELEASE_TAG}"
           else
-            benches="[\"${INPUT_BENCH}\"]"
+            benches="$(jq -cn --arg name "$INPUT_BENCH" '[$name]')"
             ref="${INPUT_REF:-${DEFAULT_REF}}"
             # Normalize to the short name (main, v2.5.2) so it matches
             # GITHUB_REF_NAME's style and, when it's a tag, passes the
@@ -98,8 +199,7 @@ jobs:
                 # `#123` means the same thing in both bench workflows.
                 #
                 # GitHub publishes refs/pull/N/head on the base repo for fork
-                # PRs too, so actions/checkout fetches it directly — no API
-                # call, which keeps this job checkout-free at `permissions: {}`.
+                # PRs too, so actions/checkout fetches it directly.
                 num="${ref#\#}"; num="${num#pull/}"; num="${num#pr/}"
                 if ! [[ "$num" =~ ^[0-9]+$ ]]; then
                   echo "invalid pull-request ref '${ref}' (expected #N, pull/N, or pr/N)" >&2
@@ -115,105 +215,95 @@ jobs:
           fi
           {
             echo "benches=${benches}"
+            echo "args=${args}"
             echo "ref=${ref}"
             echo "checkout_ref=${checkout_ref}"
+            echo "host=${host}"
           } >> "$GITHUB_OUTPUT"
+
+      - name: resolve commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.set.outputs.checkout_ref }}
+          persist-credentials: false
+
+      - id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # After the checkout, so a preset's publish group can be checked
+      # against the bench-tools of the ref it will run.
+      - id: runs
+        env:
+          BENCHES: ${{ steps.set.outputs.benches }}
+          ARGS: ${{ steps.set.outputs.args }}
+          HOST: ${{ steps.set.outputs.host }}
+        run: |
+          set -euo pipefail
+          # bench-tools learned `jsonl --group` alongside publish groups; an
+          # older ref would ignore the group and emit default-group rows.
+          groups=false
+          if grep -q WASMCLOUD_BENCH_GROUP crates/bench-tools/src/commands/jsonl.rs 2>/dev/null; then
+            groups=true
+          fi
+          runs="$(jq -cn --argjson benches "$BENCHES" --argjson variants "$BENCH_VARIANTS" \
+            --argjson diagnostics "$DIAGNOSTIC_BENCHES" --arg args "$ARGS" \
+            --arg host "$HOST" --argjson groups "$groups" '
+            # A bench dispatched with the preset of a variant as its args
+            # runs as that variant, so its rows go to the same group.
+            [$benches[] as $name |
+              (if $variants[$name] then $name
+               else [$variants | to_entries[]
+                     | select(.value.bench == $name and .value.args == $args)
+                     | .key][0]
+               end) as $variant |
+              if $variant then
+                $variants[$variant] as $v |
+                ($v.publish_group != null and $groups and
+                 ($v.publish_host == null or $v.publish_host == $host)) as $publish |
+                {name: $variant, bench: $v.bench,
+                 env: ($v.env // {}), args: ($v.args // ""),
+                 publish: $publish,
+                 group: (if $publish then $v.publish_group else "" end),
+                 note: (if $v.publish_group == null or $publish then null
+                        elif ($groups | not) then
+                          "bench-tools at the benched ref has no jsonl --group"
+                        else
+                          "it publishes \($v.publish_group) from \($v.publish_host) only, not \($host)"
+                        end)}
+              else
+                {name: $name, bench: $name, env: {}, args: $args,
+                 publish: ($diagnostics | any(. == $name) | not), group: "",
+                 note: null}
+              end]')"
+          # Say why a preset that names a group will not publish.
+          jq -r '.[] | select(.note) | "::warning::\(.name) stays unpublished: \(.note)"' <<< "$runs"
+          runs="$(jq -c 'map(del(.note))' <<< "$runs")"
+          echo "runs=${runs}" >> "$GITHUB_OUTPUT"
 
   bench:
     if: github.repository == 'wasmCloud/wasmCloud'
     needs: matrix
-    name: ${{ matrix.bench }}
-    runs-on: [self-hosted, bench, hetzner]
-    timeout-minutes: 60
-    permissions:
-      contents: read
-      id-token: write   # OIDC token for AWS role assumption
     strategy:
       fail-fast: false
-      # Redundant with the single-runner serialization, but documents intent.
-      max-parallel: 1
       matrix:
-        bench: ${{ fromJSON(needs.matrix.outputs.benches) }}
-    env:
-      WASMCLOUD_BENCH_NAME: ${{ matrix.bench }}
-      # Persist the cargo build cache outside $GITHUB_WORKSPACE so
-      # actions/checkout's clean step doesn't blow it away every run.
-      CARGO_TARGET_DIR: /var/lib/bench/target
-      CARGO_INCREMENTAL: "0"
-      # The ref recorded on each data row — bench-tools/meta.rs reads this as
-      # the single source of truth for what was benched. It's the resolved,
-      # normalized matrix ref (the tag for `release`, the checked-out ref for a
-      # dispatch). meta.rs deliberately ignores GITHUB_REF_NAME, which is the
-      # *dispatch* ref (e.g. `main` even when the `ref` input is v2.5.2) and
-      # would hide tag runs from the semver-filtered releases view.
-      WASMCLOUD_BENCH_REF: ${{ needs.matrix.outputs.ref }}
-    steps:
-      - name: checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.matrix.outputs.checkout_ref }}
-          fetch-depth: 0
-          # Don't leave the GITHUB_TOKEN in .git/config; the bench host
-          # then runs untrusted user code (the bench under test) and we
-          # don't want it to be able to read or use the token.
-          persist-credentials: false
-
-      - name: pre-flight host checks
-        env:
-          # Expected hostname of the dedicated bench host. Set as a repo
-          # variable (Settings → Secrets and variables → Actions → Variables).
-          # Kept out of the repo so the box's identity isn't broadcast.
-          WASMCLOUD_BENCH_HOSTNAME: ${{ vars.WASMCLOUD_BENCH_HOSTNAME }}
-        run: node .github/scripts/bench-preflight.mjs
-
-      - name: run cargo bench
-        id: run
-        run: ./scripts/bench/run-bench.sh "${WASMCLOUD_BENCH_NAME}"
-
-      # Subsequent steps inherit the implicit `if: success()` — they only
-      # run when every preceding step succeeded.
-      - name: render markdown summary
-        run: |
-          # Each `run:` step gets a fresh shell — PATH from previous steps
-          # doesn't persist — so re-source rustup's env shim before cargo.
-          # shellcheck disable=SC1091
-          . "$HOME/.cargo/env"
-          cargo run -p bench-tools --quiet -- summary --bench "${WASMCLOUD_BENCH_NAME}" \
-            >> "${GITHUB_STEP_SUMMARY}"
-
-      - name: upload bench artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: bench-${{ matrix.bench }}-${{ github.run_id }}
-          # criterion benches write to target/criterion/, gungraun benches
-          # (gungraun) write to target/gungraun/. A genuinely-empty run is
-          # a bug worth flagging loudly — fail rather than warn.
-          path: |
-            ${{ env.CARGO_TARGET_DIR }}/criterion/
-            ${{ env.CARGO_TARGET_DIR }}/gungraun/
-          retention-days: 90
-          if-no-files-found: error
-
-      # A pull-request ref is benched for its step summary and artifact only —
-      # it never reaches S3. Two reasons, both of which apply equally to the
-      # raw-head-sha spelling that has always been possible here:
-      #
-      #   - The trends timeline tracks merged history. A PR row would sit in
-      #     it labelled `pull/N` forever, describing code that may never land.
-      #   - `cargo bench` has by this point run the ref's build scripts and
-      #     proc macros on a persistent self-hosted host. Not assuming the AWS
-      #     role afterwards keeps that code and these credentials in disjoint
-      #     runs, rather than relying on it to have been well-behaved.
-      - name: configure aws credentials
-        if: ${{ success() && !startsWith(needs.matrix.outputs.ref, 'pull/') }}
-        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ secrets.WASMCLOUD_BENCH_AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.WASMCLOUD_BENCH_S3_REGION }}
-
-      - name: push results to s3 + invalidate CloudFront
-        if: ${{ success() && !startsWith(needs.matrix.outputs.ref, 'pull/') }}
-        env:
-          WASMCLOUD_BENCH_S3_BUCKET: ${{ secrets.WASMCLOUD_BENCH_S3_BUCKET }}
-          WASMCLOUD_BENCH_CF_DISTRIBUTION_ID: ${{ secrets.WASMCLOUD_BENCH_CF_DISTRIBUTION_ID }}
-        run: node .github/scripts/bench-push-results.mjs
+        run: ${{ fromJSON(needs.matrix.outputs.runs) }}
+    uses: $/.github/workflows/bench-run.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      bench: ${{ matrix.run.bench }}
+      name: ${{ matrix.run.name }}
+      env: ${{ toJSON(matrix.run.env) }}
+      publish: ${{ matrix.run.publish }}
+      group: ${{ matrix.run.group }}
+      host: ${{ needs.matrix.outputs.host }}
+      ref: ${{ needs.matrix.outputs.ref }}
+      commit_sha: ${{ needs.matrix.outputs.sha }}
+      args: ${{ matrix.run.args }}
+      artifact_id: ${{ format('{0}', strategy.job-index) }}
+    secrets:
+      aws_role_arn: ${{ secrets.WASMCLOUD_BENCH_AWS_ROLE_ARN }}
+      aws_region: ${{ secrets.WASMCLOUD_BENCH_S3_REGION }}
+      s3_bucket: ${{ secrets.WASMCLOUD_BENCH_S3_BUCKET }}
+      cf_distribution_id: ${{ secrets.WASMCLOUD_BENCH_CF_DISTRIBUTION_ID }}

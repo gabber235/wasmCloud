@@ -21,9 +21,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail, ensure};
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 
-use crate::oci::{OciConfig, OciPullPolicy, pull_component};
+use crate::oci::{OciConfig, OciPullPolicy, pull_component_bytes};
 
 /// Where a component's wasm bytes come from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,11 +165,11 @@ impl ComponentSource {
     pub async fn load(&self, oci_config: OciConfig) -> Result<LoadedComponent> {
         match self {
             Self::Oci { image, pull_policy } => {
-                // `pull_component` already names the reference it failed on.
+                // `pull_component_bytes` already names the reference it failed on.
                 let (bytes, digest) =
-                    pull_component(image, oci_config, pull_policy.clone()).await?;
+                    pull_component_bytes(image, oci_config, pull_policy.clone()).await?;
                 Ok(LoadedComponent {
-                    bytes: bytes.into(),
+                    bytes,
                     digest: Some(digest),
                 })
             }
@@ -183,11 +182,10 @@ impl ComponentSource {
                 // long enough to stall whatever else that worker thread was
                 // driving (e.g. draining a NATS connection).
                 let for_hash = bytes.clone();
-                let digest = tokio::task::spawn_blocking(move || {
-                    format!("sha256:{:x}", Sha256::digest(&for_hash))
-                })
-                .await
-                .context("digest hashing task panicked")?;
+                let digest =
+                    tokio::task::spawn_blocking(move || crate::engine::content_digest(&for_hash))
+                        .await
+                        .context("digest hashing task panicked")?;
                 Ok(LoadedComponent {
                     bytes,
                     digest: Some(digest),
@@ -222,6 +220,7 @@ impl std::fmt::Display for ComponentSource {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

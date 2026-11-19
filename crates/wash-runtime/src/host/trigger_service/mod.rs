@@ -48,8 +48,11 @@ use wasmtime::error::Context as _;
 use wasmtime_wasi::p3::bindings::Command;
 use wasmtime_wasi_http::p3::bindings::Service;
 
+#[cfg(feature = "host-component-plugins")]
+use crate::engine::ctx::CallerIdentity;
 use crate::engine::ctx::SharedCtx;
 use crate::engine::dispatch::{GuestJob, GuestTask, Placement};
+use crate::engine::lent_reply::LentReplies;
 use crate::host::http::ServiceHttpJob;
 #[cfg(feature = "host-component-plugins")]
 use crate::host::job_registry::JobRegistry;
@@ -58,9 +61,14 @@ use crate::host::job_registry::JobRegistry;
 mod capability;
 mod http;
 mod messaging;
+#[cfg(test)]
+mod tests;
 
 #[cfg(feature = "host-component-plugins")]
-pub use capability::{CapabilityCall, CapabilityFunc, CapabilityJob, LifecycleReplay};
+pub use capability::{
+    CapabilityCall, CapabilityFunc, CapabilityJob, LifecycleReplay, SecretSourceCall,
+    SecretSourceReply,
+};
 pub use messaging::{BrokerMessage, MessagingJob};
 // The pooled path binds and drives the same handler the service ingress does.
 pub(crate) use messaging::{AsyncMessaging, MessagingTask};
@@ -69,7 +77,10 @@ pub(crate) use messaging::{AsyncMessaging, MessagingTask};
 pub(crate) use capability::decode_bind_reply;
 
 #[cfg(feature = "host-component-plugins")]
-use capability::{admit_and_spawn_call, drain_plugin_resources, flush_pending_resource_drops};
+use capability::{
+    admit_and_spawn_call, admit_and_spawn_secret_source, drain_plugin_resources,
+    flush_pending_resource_drops,
+};
 pub(crate) use http::HttpTask;
 
 /// A host-invoked handler export the TriggerService serves, carrying the receiver end
@@ -93,13 +104,15 @@ pub enum Ingress {
     /// every exported function to resolve up front; `rx` delivers the calls;
     /// `registry` tracks each served call as a cancellable job; `replay` holds
     /// the lifecycle binds this incarnation must complete before serving `rx`
-    /// (the per-workload state rebuild after a restart).
+    /// (the per-workload state rebuild after a restart); `secret_source`
+    /// names the plugin's `wasmcloud:host/secret-source` export, if any.
     #[cfg(feature = "host-component-plugins")]
     Capability {
         funcs: Vec<CapabilityFunc>,
         rx: tokio::sync::mpsc::Receiver<CapabilityJob>,
         registry: Arc<JobRegistry>,
         replay: Vec<LifecycleReplay>,
+        secret_source: Option<Arc<str>>,
     },
 }
 
@@ -136,6 +149,7 @@ impl Ingress {
                 instance: *instance,
                 rx,
                 in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                replies: Arc::default(),
             }),
             #[cfg(feature = "host-component-plugins")]
             Ingress::Capability {
@@ -143,6 +157,7 @@ impl Ingress {
                 rx,
                 registry,
                 replay,
+                secret_source,
             } => {
                 // Resolve every exported capability function to a call index up
                 // front (mirroring the messaging arm), so serving a call is a
@@ -165,13 +180,24 @@ impl Ingress {
                         .or_default()
                         .insert(func, func_idx);
                 }
+                // Registration already checked the shape against the published
+                // WIT, so this only fails if that check and wasmtime disagree.
+                let secret_source = secret_source
+                    .map(|interface| {
+                        crate::plugin::component_host::secret_source_resolve(
+                            store, instance, &interface,
+                        )
+                    })
+                    .transpose()?;
                 Ok(PreparedIngress::Capability {
                     instance: *instance,
                     func_map,
+                    secret_source,
                     rx,
                     registry,
                     replay,
                     in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    replies: Arc::default(),
                 })
             }
         }
@@ -196,17 +222,24 @@ enum PreparedIngress {
         /// [`MAX_INFLIGHT_GUEST_CALLS`]. Fresh per incarnation, like the
         /// channel beside it.
         in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        /// Replies of the calls in flight, answered with the fault if the
+        /// instance traps.
+        replies: Arc<LentReplies>,
     },
     #[cfg(feature = "host-component-plugins")]
     Capability {
         instance: Instance,
         func_map: BTreeMap<Arc<str>, BTreeMap<Arc<str>, ComponentExportIndex>>,
+        secret_source: Option<crate::plugin::component_host::SecretSourceResolve>,
         rx: tokio::sync::mpsc::Receiver<CapabilityJob>,
         registry: Arc<JobRegistry>,
         /// Lifecycle binds to complete before serving `rx`; drained on the
         /// first `serve` entry (empty on re-entry after a drop flush).
         replay: Vec<LifecycleReplay>,
         in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        /// Replies of the calls in flight, answered with the fault if the
+        /// plugin traps.
+        replies: Arc<LentReplies>,
     },
 }
 
@@ -220,7 +253,60 @@ enum ServeOutcome {
     FlushDrops,
 }
 
+/// What a call to a service hears when its store faults.
+const SERVICE_FAULTED: &str = "the workload's service faulted";
+
 impl PreparedIngress {
+    /// Answer the calls this ingress has in flight or queued on a store that
+    /// faulted. The channel closes first, so a call made on hearing the fault
+    /// is refused rather than queued on an incarnation that is gone. HTTP and
+    /// messaging calls in flight already answer a dropped reply.
+    fn fault(&mut self, err: &wasmtime::Error) {
+        match self {
+            PreparedIngress::Http { rx, .. } => {
+                rx.close();
+                while let Ok(job) = rx.try_recv() {
+                    let _ = job
+                        .resp_tx
+                        .send(Err(anyhow::anyhow!("{SERVICE_FAULTED}: {err:#}")));
+                }
+            }
+            PreparedIngress::Messaging { rx, .. } => {
+                rx.close();
+                while let Ok(job) = rx.try_recv() {
+                    let _ = job
+                        .result_tx
+                        .send(Err(format!("{SERVICE_FAULTED}: {err:#}")));
+                }
+            }
+            PreparedIngress::Guest { rx, replies, .. } => {
+                rx.close();
+                replies.fault(err);
+                while let Ok(job) = rx.try_recv() {
+                    job.refuse(anyhow::anyhow!("{SERVICE_FAULTED}: {err:#}"));
+                }
+            }
+            #[cfg(feature = "host-component-plugins")]
+            PreparedIngress::Capability { rx, replies, .. } => {
+                rx.close();
+                replies.fault(err);
+                while let Ok(job) = rx.try_recv() {
+                    match job {
+                        CapabilityJob::Call(call) => {
+                            let _ = call.reply.send(Err(capability::plugin_faulted()));
+                        }
+                        CapabilityJob::SecretSource(call) => {
+                            let _ = call.reply.send(Err(capability::plugin_faulted()));
+                        }
+                        CapabilityJob::DropResource { reply, .. } => {
+                            let _ = reply.send(Err(capability::plugin_faulted()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Serve inbound invocations, spawning one concurrent task per invocation on
     /// the shared instance, until the delivery channel closes ([`Shutdown`]) or a
     /// resource drop needs flushing ([`FlushDrops`]). Takes `&mut self` so the
@@ -276,6 +362,7 @@ impl PreparedIngress {
                 instance,
                 rx,
                 in_flight,
+                replies,
             } => {
                 while let Some(job) = rx.recv().await {
                     // Taking a job off the channel and spawning it is what the
@@ -298,11 +385,13 @@ impl PreparedIngress {
                     }
                     // Services are not pooled and cannot be retired.
                     let spawned = accessor.spawn(GuestServeTask {
-                        task: GuestTask {
-                            instance: *instance,
+                        task: GuestTask::new(
+                            *instance,
                             job,
-                            placement: Placement::Service,
-                        },
+                            Placement::Service,
+                            replies,
+                            SERVICE_FAULTED,
+                        ),
                         in_flight: InFlightGuard::new(Arc::clone(in_flight)),
                     });
                     if let Err(e) = spawned {
@@ -315,10 +404,12 @@ impl PreparedIngress {
             PreparedIngress::Capability {
                 instance,
                 func_map,
+                secret_source,
                 rx,
                 registry,
                 replay,
                 in_flight,
+                replies,
             } => {
                 // Replay lifecycle binds before serving capability calls, and
                 // await each one's COMPLETION: a queued call from a rebound
@@ -340,10 +431,21 @@ impl PreparedIngress {
                     let LifecycleReplay {
                         interface,
                         func,
-                        caller,
+                        mut caller,
                         args,
                         result_tys,
+                        redact_errors,
                     } = replay;
+                    if caller
+                        .bind_generation
+                        .as_ref()
+                        .is_some_and(|generation| !generation.is_active())
+                    {
+                        continue;
+                    }
+                    caller.bind_generation = caller.bind_generation.map(|generation| {
+                        generation.for_call(crate::timeouts::plugin_lifecycle_call())
+                    });
                     let workload_id = Arc::clone(&caller.workload_id);
                     registry.replay_begin(caller.clone());
                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -363,17 +465,18 @@ impl PreparedIngress {
                         func_map,
                         registry,
                         in_flight,
+                        replies,
                         CapabilityCall {
                             interface,
                             func,
-                            caller,
+                            caller: CallerIdentity::Workload(caller),
                             args,
                             result_tys,
                             reply: reply_tx,
                             abandoned,
                         },
                     );
-                    await_replay_outcome(workload_id, reply_rx).await;
+                    await_replay_outcome(workload_id, reply_rx, redact_errors).await;
                     registry.replay_finish();
                 }
                 registry.replay_complete();
@@ -395,7 +498,16 @@ impl PreparedIngress {
                         }
                         CapabilityJob::Call(call) => {
                             admit_and_spawn_call(
-                                accessor, *instance, func_map, registry, in_flight, call,
+                                accessor, *instance, func_map, registry, in_flight, replies, call,
+                            );
+                        }
+                        CapabilityJob::SecretSource(call) => {
+                            admit_and_spawn_secret_source(
+                                accessor,
+                                *secret_source,
+                                registry,
+                                in_flight,
+                                call,
                             );
                         }
                     }
@@ -419,25 +531,29 @@ async fn await_replay_outcome(
     reply_rx: tokio::sync::oneshot::Receiver<
         wasmtime::Result<Vec<crate::engine::store::relocate::Relocated>>,
     >,
+    redact_errors: bool,
 ) {
+    // Only what the guest wrote, or what its trap carries, can quote a
+    // revealed secret; the rest is the host's own.
+    const WITHHELD: &str = "withheld because the bind carried secrets";
     let reply = tokio::time::timeout(crate::timeouts::plugin_lifecycle_call(), reply_rx).await;
     match reply {
         Ok(Ok(Ok(results))) => match decode_bind_reply(&results) {
             Ok(Ok(())) => {}
             Ok(Err(msg)) => tracing::warn!(
                 %workload_id,
-                msg,
+                msg = if redact_errors { WITHHELD } else { msg.as_str() },
                 "plugin rejected a replayed workload bind"
             ),
             Err(e) => tracing::warn!(
                 %workload_id,
-                err = %e,
+                err = %if redact_errors { WITHHELD.to_string() } else { e.to_string() },
                 "replayed workload bind returned a malformed reply"
             ),
         },
         Ok(Ok(Err(e))) => tracing::warn!(
             %workload_id,
-            err = %e,
+            err = %if redact_errors { WITHHELD.to_string() } else { e.to_string() },
             "replayed workload bind failed"
         ),
         Ok(Err(_)) => tracing::warn!(
@@ -485,86 +601,116 @@ impl TriggerService {
 /// Drive a trigger service on `store` to completion: instantiate `pre`, then
 /// co-drive `cli/run` (optional) with every ingress under `run_concurrent`,
 /// serving until each ingress channel closes (clean exit, `Ok`) or the store
-/// faults (`Err`, e.g. a guest trap). Reusable across restarts — a supervisor
-/// re-instantiates into the same store and re-runs this.
+/// faults (`Err`, e.g. a guest trap). Each incarnation needs a fresh store.
 pub(crate) async fn run_trigger_driver(
     store: &mut Store<SharedCtx>,
     pre: &InstancePre<SharedCtx>,
     ingresses: Vec<Ingress>,
     cli_run_error: CliRunError,
 ) -> anyhow::Result<()> {
-    let instance = pre
-        .instantiate_async(&mut *store)
+    PreparedTriggerDriver::instantiate(store, pre, ingresses)
+        .await?
+        .run(store, cli_run_error)
         .await
-        .context("failed to instantiate trigger service")?;
-    // `cli/run` is optional: a service exports it (its long-running work), but a
-    // pure capability host component plugin need not — in which case there is
-    // simply no run loop to co-drive.
-    let mut command = match Command::new(&mut *store, &instance) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            tracing::debug!(err = %e, "no wasi:cli/run export to co-drive");
+}
+
+/// Bound exports and ingresses for one service incarnation.
+pub(crate) struct PreparedTriggerDriver {
+    command: Option<Command>,
+    ingresses: Vec<PreparedIngress>,
+}
+
+impl PreparedTriggerDriver {
+    pub(crate) async fn instantiate(
+        store: &mut Store<SharedCtx>,
+        pre: &InstancePre<SharedCtx>,
+        ingresses: Vec<Ingress>,
+    ) -> anyhow::Result<Self> {
+        let instance = pre
+            .instantiate_async(&mut *store)
+            .await
+            .map_err(|e| crate::engine::pool_usage::explain_instantiate_failure(store.data(), e))
+            .context("failed to instantiate trigger service")?;
+        let command = if instance
+            .get_export_index(&mut *store, None, "wasi:cli/run@0.3.0")
+            .is_some()
+        {
+            Some(
+                Command::new(&mut *store, &instance)
+                    .context("failed to bind the service's wasi:cli/run export")?,
+            )
+        } else {
             None
+        };
+        // Build each ingress's binding view before entering run_concurrent.
+        let mut prepared = Vec::with_capacity(ingresses.len());
+        for ingress in ingresses {
+            prepared.push(
+                ingress
+                    .prepare(&mut *store, &instance)
+                    .map_err(|e| e.context("failed to prepare trigger service ingress"))?,
+            );
         }
-    };
-    // Build each ingress's binding view before entering run_concurrent.
-    let mut prepared = Vec::with_capacity(ingresses.len());
-    for ingress in ingresses {
-        prepared.push(
-            ingress
-                .prepare(&mut *store, &instance)
-                .map_err(|e| e.context("failed to prepare trigger service ingress"))?,
-        );
+
+        Ok(Self {
+            command,
+            ingresses: prepared,
+        })
     }
 
-    // Drive serving in a loop. A proxied-resource drop needs top-level store
-    // access (`resource_drop_async`), which is unavailable inside
-    // `run_concurrent`; when one is pending, a serve loop returns `FlushDrops`,
-    // we step out here to free it, and re-enter. In-flight tasks are preserved
-    // across `run_concurrent` calls (the concurrent state lives on the store), so
-    // re-entering resumes them. Without host component plugins there are no
-    // proxied resources, so serving runs to channel-close in a single pass.
-    let mut serve_again = true;
-    while serve_again {
-        let outcomes = store
-            .run_concurrent(async |accessor| {
-                // Spawn the cli/run co-driver once (first entry only).
-                if let Some(command) = command.take()
-                    && let Err(e) = accessor.spawn(RunTask {
-                        command,
-                        on_error: cli_run_error,
-                    })
-                {
-                    tracing::error!(err = %e, "failed to spawn cli/run co-driver task");
-                }
-                // `join_all` steps out only once EVERY ingress serve returns, so a
-                // `FlushDrops` is prompt only when the Capability ingress is served
-                // alone. That holds today: a plugin store carries exactly one
-                // Capability ingress and no Http/Messaging ingress, and service
-                // stores (which carry those) have no resource registry and never
-                // flush.
-                futures::future::join_all(prepared.iter_mut().map(|p| p.serve(accessor))).await
-            })
-            .await
-            .context("trigger service driver exited")?;
-        // Every channel closed → clean stop, unless an ingress asked to flush a
-        // proxied-resource drop (which needs top-level store access), in which
-        // case free it and re-serve to resume the preserved in-flight tasks.
+    pub(crate) async fn run(
+        self,
+        store: &mut Store<SharedCtx>,
+        cli_run_error: CliRunError,
+    ) -> anyhow::Result<()> {
+        let Self {
+            mut command,
+            ingresses: mut prepared,
+        } = self;
+        // Proxy drops need top-level store access. Re-enter after flushing them;
+        // in-flight guest tasks stay on the store.
+        let mut serve_again = true;
+        while serve_again {
+            let outcomes = store
+                .run_concurrent(async |accessor| {
+                    // Spawn the cli/run co-driver once (first entry only).
+                    if let Some(command) = command.take()
+                        && let Err(e) = accessor.spawn(RunTask {
+                            command,
+                            on_error: cli_run_error,
+                        })
+                    {
+                        tracing::error!(err = %e, "failed to spawn cli/run co-driver task");
+                    }
+                    // Capability stores have one ingress, so proxy drops can flush
+                    // without waiting for other ingress channels to close.
+                    futures::future::join_all(prepared.iter_mut().map(|p| p.serve(accessor))).await
+                })
+                .await
+                .inspect_err(|e| {
+                    crate::engine::trap_remediation::note_guest_fault(store.data(), e);
+                    for ingress in &mut prepared {
+                        ingress.fault(e);
+                    }
+                })
+                .context("trigger service driver exited")?;
+            // Closed channels end the driver; proxy drops only pause it.
+            #[cfg(feature = "host-component-plugins")]
+            {
+                flush_pending_resource_drops(&mut *store).await;
+                serve_again = outcomes.contains(&ServeOutcome::FlushDrops);
+            }
+            #[cfg(not(feature = "host-component-plugins"))]
+            {
+                let _ = outcomes;
+                serve_again = false;
+            }
+        }
+        // Teardown: drop every resource the plugin still owns.
         #[cfg(feature = "host-component-plugins")]
-        {
-            flush_pending_resource_drops(&mut *store).await;
-            serve_again = outcomes.contains(&ServeOutcome::FlushDrops);
-        }
-        #[cfg(not(feature = "host-component-plugins"))]
-        {
-            let _ = outcomes;
-            serve_again = false;
-        }
+        drain_plugin_resources(&mut *store).await;
+        Ok(())
     }
-    // Teardown: drop every resource the plugin still owns.
-    #[cfg(feature = "host-component-plugins")]
-    drain_plugin_resources(&mut *store).await;
-    Ok(())
 }
 
 /// What a `wasi:cli/run` that returns an error does to the incarnation running

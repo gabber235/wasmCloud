@@ -21,6 +21,29 @@ use wasmtime_wasi_tls::{WasiTlsCtx, WasiTlsCtxBuilder, WasiTlsCtxView, WasiTlsVi
 use crate::host::allowed_hosts::AllowedHost;
 use crate::plugin::HostPlugin;
 
+/// The plugins a store can reach, keyed by id. They all implement
+/// [`HostPlugin`], but are held as `Arc<dyn Any + Send + Sync>` so
+/// [`Ctx::get_plugin`] can downcast to the concrete plugin type.
+///
+/// Shared: a component's map is cast once and every store built for it holds
+/// the same one (see [`CtxBuilder::with_store_plugins`]).
+pub(crate) type StorePlugins = HashMap<&'static str, Arc<dyn Any + Send + Sync>>;
+
+/// Cast `plugins` into the map a store reaches them through.
+pub(crate) fn store_plugins(
+    plugins: &HashMap<&'static str, Arc<dyn HostPlugin + Send + Sync>>,
+) -> Arc<StorePlugins> {
+    Arc::new(
+        plugins
+            .iter()
+            .map(|(id, plugin)| (*id, Arc::clone(plugin) as Arc<dyn Any + Send + Sync>))
+            .collect(),
+    )
+}
+
+/// The map of a store with no plugins, shared so such a store allocates none.
+static NO_PLUGINS: std::sync::LazyLock<Arc<StorePlugins>> = std::sync::LazyLock::new(Arc::default);
+
 /// A shareable, cloneable `wasi:tls` provider. Wraps an `Arc<dyn TlsProvider>`
 /// so the same provider can back many per-component contexts without
 /// re-creating it, and implements `TlsProvider` directly so it can be boxed
@@ -62,6 +85,8 @@ impl wasmtime_wasi_tls::TlsProvider for SharedTlsProvider {
 /// Shared context for linked components
 pub struct SharedCtx {
     pub(crate) guest_traces: super::guest_trace::GuestTraces,
+    /// Typed adapters used when this store exchanges stream/future payloads.
+    pub stream_payloads: Arc<super::stream_payload::StreamPayloads>,
     /// Current active context
     pub active_ctx: Ctx,
     /// The resource table used to manage resources in the Wasmtime store.
@@ -89,6 +114,9 @@ pub struct SharedCtx {
     /// here is what makes the release exact: dropping the store drops this and
     /// hands the bytes back.
     pub memory_limiter: crate::engine::guest_memory::StoreMemoryLimiter,
+    /// What [`crate::engine::store_settings::configure_store`] set this store
+    /// up with, for the remediation hints to name.
+    pub(crate) store_settings: crate::engine::store_settings::StoreSettings,
     /// Notifies waiters after all other store data is dropped.
     ///
     /// Wasmtime disposes guest fibers and host tasks before dropping store data.
@@ -116,8 +144,80 @@ impl Drop for StoreDropped {
     }
 }
 
-/// The identity of whoever is invoking a host component plugin, used to
+/// Whom a call into a host component plugin is on behalf of, used to
 /// partition state per caller.
+#[derive(Clone, Debug)]
+pub enum CallerIdentity {
+    /// The host itself, on no workload's behalf: a
+    /// `wasmcloud:host/secret-source` resolve.
+    Host,
+    /// A workload: one of its capability calls, or a lifecycle hook about it.
+    Workload(WorkloadCaller),
+}
+
+impl CallerIdentity {
+    /// The workload behind the call, or `None` for the host.
+    pub fn workload(&self) -> Option<&WorkloadCaller> {
+        match self {
+            Self::Host => None,
+            Self::Workload(caller) => Some(caller),
+        }
+    }
+
+    /// Whether `self` and `other` act for the same workload. Never for the
+    /// host: each host call resolves for a different consumer's bind, so one
+    /// must not cancel another.
+    pub fn same_principal(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Workload(a), Self::Workload(b)) => a.workload_id == b.workload_id,
+            _ => false,
+        }
+    }
+}
+
+/// Revocable authority for one workload bind, shared with its replays.
+#[derive(Clone, Debug)]
+pub struct BindGeneration {
+    id: ulid::Ulid,
+    revoked: tokio_util::sync::CancellationToken,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl Default for BindGeneration {
+    fn default() -> Self {
+        Self {
+            id: ulid::Ulid::new(),
+            revoked: tokio_util::sync::CancellationToken::new(),
+            deadline: None,
+        }
+    }
+}
+
+impl BindGeneration {
+    pub fn revoke(&self) {
+        self.revoked.cancel();
+    }
+
+    pub fn is_active(&self) -> bool {
+        !self.revoked.is_cancelled()
+            && self
+                .deadline
+                .is_none_or(|deadline| tokio::time::Instant::now() < deadline)
+    }
+
+    pub fn for_call(&self, timeout: std::time::Duration) -> Self {
+        Self {
+            deadline: Some(tokio::time::Instant::now() + timeout),
+            ..self.clone()
+        }
+    }
+
+    pub fn authorizes(&self, current: &Self) -> bool {
+        self.is_active() && current.is_active() && self.id == current.id
+    }
+}
+
+/// The workload a call into a host component plugin is on behalf of.
 ///
 /// `component_id` is `None` when there is no component behind the call: a
 /// `wasmcloud:host/workload-lifecycle` hook is delivered by the host about a
@@ -125,7 +225,9 @@ impl Drop for StoreDropped {
 /// real id — an empty string, say — would make the host invent a component that
 /// does not exist, and would collide with a genuinely unresolvable caller.
 #[derive(Clone, Debug)]
-pub struct CallerIdentity {
+pub struct WorkloadCaller {
+    /// Present only for an on-workload-bind call or its replay.
+    pub bind_generation: Option<BindGeneration>,
     pub workload_id: Arc<str>,
     pub component_id: Option<Arc<str>>,
     /// The binding the call arrived on: the `(implements ..)` label the caller
@@ -144,6 +246,7 @@ impl SharedCtx {
         Self {
             guest_traces: Default::default(),
             active_ctx: context,
+            stream_payloads: Arc::default(),
             table: ResourceTable::new(),
             contexts: Default::default(),
             exporter_instances: Default::default(),
@@ -151,6 +254,7 @@ impl SharedCtx {
             abandoned: Arc::default(),
             executed: Arc::default(),
             memory_limiter: Default::default(),
+            store_settings: Default::default(),
             dropped: StoreDropped::default(),
         }
     }
@@ -308,7 +412,7 @@ impl<'a> DerefMut for ActiveCtx<'a> {
 /// - wasi@0.2 interfaces
 /// - wasi:http@0.2 interfaces
 pub struct Ctx {
-    /// Unique identifier for this component context. This is a [uuid::Uuid::now_v7] string.
+    /// Unique UUIDv7 string for this component context.
     pub id: Arc<str>,
     /// Unique identifier shared by all component contexts in the same store.
     pub store_id: Arc<str>,
@@ -318,6 +422,8 @@ pub struct Ctx {
     pub workload_id: Arc<str>,
     /// The WASI context used to provide WASI functionality to the components using this context.
     pub ctx: WasiCtx,
+    /// Directory handles retained from workload validation.
+    pub(crate) volume_mounts: Vec<super::volumes::ResolvedVolumeMount>,
     /// The HTTP context used to provide HTTP functionality to the component.
     pub http: WasiHttpCtx,
     /// The sockets context used to provide socket functionality (with loopback support).
@@ -328,9 +434,15 @@ pub struct Ctx {
     /// Plugin instances stored by string ID for access during component execution.
     /// These all implement the [`HostPlugin`] trait, but they are cast as `Arc<dyn Any + Send + Sync>`
     /// to support downcasting to the specific plugin type in [`Ctx::get_plugin`]
-    plugins: HashMap<&'static str, Arc<dyn Any + Send + Sync>>,
+    plugins: Arc<StorePlugins>,
     /// The HTTP hooks for outgoing HTTP requests.
     http_hooks: CtxHttpHooks,
+    /// The remediation hints this workload deploy has already logged. Shared
+    /// by every component of one deploy (see [`crate::engine::trap_remediation`]).
+    pub(crate) trap_hints: Arc<crate::engine::trap_remediation::TrapHints>,
+    /// The cumulative metric totals this guest instance has reported.
+    #[cfg(feature = "wasi-otel")]
+    pub(crate) cumulative_totals: crate::plugin::wasi_otel::CumulativeTotals,
 }
 
 impl Ctx {
@@ -517,12 +629,17 @@ impl WasiHttpHooks for CtxHttpHooks {
 /// Helper struct to build a [`Ctx`] with a builder pattern
 pub struct CtxBuilder {
     id: Arc<str>,
-    store_id: Arc<str>,
+    /// `None` until set: a fresh id is minted at build only for a store that
+    /// was not given one, rather than minted here and thrown away.
+    store_id: Option<Arc<str>>,
     workload_id: Arc<str>,
     component_id: Arc<str>,
     ctx: Option<WasiCtx>,
     sockets: Option<crate::sockets::WasiSocketsCtx>,
     plugins: HashMap<&'static str, Arc<dyn HostPlugin + Send + Sync>>,
+    /// Plugins cast once and shared with other stores; see
+    /// [`Self::with_store_plugins`].
+    store_plugins: Option<Arc<StorePlugins>>,
     http_handler: Option<crate::host::HostRef>,
     allowed_hosts: Arc<[AllowedHost]>,
     /// TLS provider override for `wasi:tls` client connections.
@@ -533,14 +650,15 @@ pub struct CtxBuilder {
 impl CtxBuilder {
     pub fn new(workload_id: impl Into<Arc<str>>, component_id: impl Into<Arc<str>>) -> Self {
         Self {
-            id: uuid::Uuid::now_v7().to_string().into(),
-            store_id: uuid::Uuid::now_v7().to_string().into(),
+            id: crate::ids::now_v7().to_string().into(),
+            store_id: None,
             component_id: component_id.into(),
             workload_id: workload_id.into(),
             ctx: None,
             sockets: None,
             http_handler: None,
             plugins: HashMap::new(),
+            store_plugins: None,
             allowed_hosts: Default::default(),
             #[cfg(feature = "wasi-tls")]
             tls_provider: None,
@@ -555,6 +673,12 @@ impl CtxBuilder {
     #[cfg(feature = "wasi-tls")]
     pub fn with_tls_provider(mut self, provider: SharedTlsProvider) -> Self {
         self.tls_provider = Some(provider);
+        self
+    }
+
+    /// Share `store_id` with the other component contexts in the same store.
+    pub(crate) fn with_store_id(mut self, store_id: Arc<str>) -> Self {
+        self.store_id = Some(store_id);
         self
     }
 
@@ -592,17 +716,33 @@ impl CtxBuilder {
         self
     }
 
+    /// Reach the plugins in `plugins`, a map shared with other stores rather
+    /// than copied into this one. Plugins added with [`Self::with_plugins`]
+    /// as well are layered over it, in a map of this store's own.
+    pub(crate) fn with_store_plugins(mut self, plugins: Arc<StorePlugins>) -> Self {
+        self.store_plugins = Some(plugins);
+        self
+    }
+
     pub fn with_allowed_hosts(mut self, allowed_hosts: Arc<[AllowedHost]>) -> Self {
         self.allowed_hosts = allowed_hosts;
         self
     }
 
     pub fn build(self) -> Ctx {
-        let plugins = self
-            .plugins
-            .into_iter()
-            .map(|(k, v)| (k, v as Arc<dyn Any + Send + Sync>))
-            .collect();
+        let plugins = match (self.store_plugins, self.plugins.is_empty()) {
+            (Some(shared), true) => shared,
+            (None, true) => Arc::clone(&NO_PLUGINS),
+            (shared, false) => {
+                let mut plugins = shared.map(|shared| (*shared).clone()).unwrap_or_default();
+                plugins.extend(
+                    self.plugins
+                        .into_iter()
+                        .map(|(k, v)| (k, v as Arc<dyn Any + Send + Sync>)),
+                );
+                Arc::new(plugins)
+            }
+        };
 
         let http_hooks = CtxHttpHooks {
             host: HostLink(self.http_handler),
@@ -613,7 +753,9 @@ impl CtxBuilder {
 
         Ctx {
             id: self.id,
-            store_id: self.store_id,
+            store_id: self
+                .store_id
+                .unwrap_or_else(|| crate::ids::now_v7().to_string().into()),
             ctx: self.ctx.unwrap_or_else(|| {
                 WasiCtxBuilder::new()
                     .args(&["main.wasm"])
@@ -622,6 +764,7 @@ impl CtxBuilder {
             }),
             workload_id: self.workload_id,
             component_id: self.component_id,
+            volume_mounts: Vec::new(),
             http: WasiHttpCtx::new(),
             sockets: self.sockets.unwrap_or_default(),
             #[cfg(feature = "wasi-tls")]
@@ -637,11 +780,15 @@ impl CtxBuilder {
             },
             plugins,
             http_hooks,
+            trap_hints: Arc::default(),
+            #[cfg(feature = "wasi-otel")]
+            cumulative_totals: Default::default(),
         }
     }
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

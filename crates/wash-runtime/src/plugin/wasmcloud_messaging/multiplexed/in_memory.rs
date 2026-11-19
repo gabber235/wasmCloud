@@ -5,11 +5,11 @@
 //! prove routing and for tests; each instance is isolated, so two named imports
 //! backed by two `InMemoryMsgBackend`s do not share published messages.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use crate::plugin::PluginEgressPolicy;
 use crate::plugin::multiplex::BackendProvider;
 
 use super::{BrokerMessage, MsgBackend, MsgError, MsgId};
@@ -70,12 +70,26 @@ impl BackendProvider<MsgId> for InMemoryMsgProvider {
         super::DEFAULT_BACKEND
     }
 
-    async fn instantiate(&self, _config: &HashMap<String, String>) -> anyhow::Result<MsgId> {
+    async fn instantiate(
+        &self,
+        _config: &crate::wit::Config,
+        _egress: Option<&PluginEgressPolicy>,
+    ) -> anyhow::Result<MsgId> {
         Ok(Arc::new(InMemoryMsgBackend::new()))
+    }
+
+    /// Does not connect out.
+    fn check_egress(
+        &self,
+        _config: &crate::wit::Config,
+        _policy: &PluginEgressPolicy,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 

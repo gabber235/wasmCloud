@@ -39,25 +39,21 @@
 //! guest on the host would make the number a host-wide cap wearing a
 //! per-guest name.
 
+use core::hash::BuildHasher;
 use core::time::Duration;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::hash::RandomState;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::sockets::DenyReason;
 
-/// How long a per-guest quota is kept after its last use.
-///
-/// Outliving the guest matters: connections opened by a replaced client keep
-/// their slots until they close, and those slots have to keep counting against
-/// the guest that opened them.
-const QUOTA_IDLE: Duration = Duration::from_secs(300);
-
 /// Default for [`QuotaRegistry::with_http_wait`]. Kept well below the
 /// request-timeout defaults (600s) so saturation surfaces as a prompt,
 /// classifiable connect timeout instead of a long hang.
-const DEFAULT_HTTP_WAIT: Duration = Duration::from_secs(5);
+pub(crate) const DEFAULT_HTTP_WAIT: Duration = Duration::from_secs(5);
 
 /// What the host-wide ceiling falls back to on a platform with no descriptor
 /// limit to read — Windows. Half of the 1024 soft limit common on Linux.
@@ -256,13 +252,118 @@ impl Default for QuotaLimits {
 /// how tearing a guest down reclaims capacity immediately rather than waiting
 /// out an idle timeout.
 #[derive(Debug, Clone)]
-pub struct GuestConnectionQuota {
-    outbound_http: Arc<Semaphore>,
-    outbound_sockets: Arc<Semaphore>,
-    inbound_sockets: Arc<Semaphore>,
+pub struct GuestConnectionQuota(Arc<QuotaState>);
+
+#[derive(Debug)]
+struct QuotaState {
+    // Held inline rather than behind `Arc`s of their own: a slot keeps the
+    // whole state alive anyway, so minting a quota costs one allocation. That
+    // matters because a guest holding nothing between invocations gets a
+    // fresh quota per invocation.
+    outbound_http: Semaphore,
+    outbound_sockets: Semaphore,
+    inbound_sockets: Semaphore,
     /// Host-wide ceiling every surface rolls up into, when one is configured.
     global: Option<Arc<Semaphore>>,
-    stats: Arc<QuotaStats>,
+    stats: QuotaStats,
+    _registration: Option<QuotaRegistration>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Surface {
+    OutboundHttp,
+    OutboundSockets,
+    InboundSockets,
+}
+
+impl QuotaState {
+    fn semaphore(&self, surface: Surface) -> &Semaphore {
+        match surface {
+            Surface::OutboundHttp => &self.outbound_http,
+            Surface::OutboundSockets => &self.outbound_sockets,
+            Surface::InboundSockets => &self.inbound_sockets,
+        }
+    }
+
+    /// `(granted, refused)` for `surface`.
+    fn counters(&self, surface: Surface) -> (&AtomicU64, &AtomicU64) {
+        let stats = &self.stats;
+        match surface {
+            Surface::OutboundHttp => (&stats.outbound_http_granted, &stats.outbound_http_refused),
+            Surface::OutboundSockets => (
+                &stats.outbound_sockets_granted,
+                &stats.outbound_sockets_refused,
+            ),
+            Surface::InboundSockets => (
+                &stats.inbound_sockets_granted,
+                &stats.inbound_sockets_refused,
+            ),
+        }
+    }
+}
+
+/// How many lock shards a [`QuotaRegistry`] spreads its guests over, so that
+/// lookups and teardowns for different guests rarely contend.
+const REGISTRY_SHARDS: usize = 16;
+
+/// A shard whose capacity has grown past this is shrunk once it falls to a
+/// quarter full, so a burst of short-lived guests does not pin its peak size.
+const SHARD_SHRINK_FLOOR: usize = 64;
+
+type Shard = Mutex<HashMap<Arc<str>, Weak<QuotaState>>>;
+
+#[derive(Debug, Default)]
+struct GuestQuotas {
+    hasher: RandomState,
+    shards: [Shard; REGISTRY_SHARDS],
+}
+
+impl GuestQuotas {
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the index is reduced modulo the array length"
+    )]
+    fn shard(&self, guest_id: &str) -> MutexGuard<'_, HashMap<Arc<str>, Weak<QuotaState>>> {
+        // The remainder is below `REGISTRY_SHARDS`, so the cast cannot truncate.
+        let index = (self.hasher.hash_one(guest_id) % REGISTRY_SHARDS as u64) as usize;
+        self.shards[index]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.lock().unwrap_or_else(PoisonError::into_inner).len())
+            .sum()
+    }
+}
+
+#[derive(Debug)]
+struct QuotaRegistration {
+    registry: Weak<GuestQuotas>,
+    guest_id: Arc<str>,
+}
+
+impl Drop for QuotaRegistration {
+    fn drop(&mut self) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let mut guests = registry.shard(&self.guest_id);
+        // A racing lookup can already have replaced this generation.
+        if guests
+            .get(&self.guest_id)
+            .is_some_and(|quota| quota.strong_count() == 0)
+        {
+            guests.remove(&self.guest_id);
+            if guests.capacity() > SHARD_SHRINK_FLOOR && guests.len() * 4 < guests.capacity() {
+                let target = guests.len() * 2;
+                guests.shrink_to(target);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -278,22 +379,40 @@ struct QuotaStats {
 /// A held connection slot. Returns its capacity on drop.
 ///
 /// Carries the per-guest permit and, when the host is capped, the host-wide one
-/// too; both are released together.
+/// too; both are released together. It also keeps the guest's quota alive, so
+/// a connection outliving its client or its workload stays charged to it.
 #[derive(Debug)]
 pub struct ConnectionSlot {
-    _guest: OwnedSemaphorePermit,
+    quota: GuestConnectionQuota,
+    surface: Surface,
     _global: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        // The per-guest permit was forgotten when the slot was granted.
+        self.quota.0.semaphore(self.surface).add_permits(1);
+    }
 }
 
 impl GuestConnectionQuota {
     pub fn new(limits: QuotaLimits, global: Option<Arc<Semaphore>>) -> Self {
-        Self {
-            outbound_http: Arc::new(Semaphore::new(limits.outbound_http.max(1))),
-            outbound_sockets: Arc::new(Semaphore::new(limits.outbound_sockets.max(1))),
-            inbound_sockets: Arc::new(Semaphore::new(limits.inbound_sockets.max(1))),
+        Self::with_registration(limits, global, None)
+    }
+
+    fn with_registration(
+        limits: QuotaLimits,
+        global: Option<Arc<Semaphore>>,
+        registration: Option<QuotaRegistration>,
+    ) -> Self {
+        Self(Arc::new(QuotaState {
+            outbound_http: Semaphore::new(limits.outbound_http.max(1)),
+            outbound_sockets: Semaphore::new(limits.outbound_sockets.max(1)),
+            inbound_sockets: Semaphore::new(limits.inbound_sockets.max(1)),
             global,
-            stats: Arc::default(),
-        }
+            stats: QuotaStats::default(),
+            _registration: registration,
+        }))
     }
 
     /// Take a slot for a raw socket connection, or `None` if the guest is at
@@ -301,11 +420,7 @@ impl GuestConnectionQuota {
     ///
     /// Never waits — see the module docs.
     pub fn try_acquire_outbound_socket(&self) -> Option<ConnectionSlot> {
-        self.try_acquire(
-            &self.outbound_sockets,
-            &self.stats.outbound_sockets_granted,
-            &self.stats.outbound_sockets_refused,
-        )
+        self.try_acquire(Surface::OutboundSockets)
     }
 
     /// Take a slot for an outbound HTTP call the host serves without opening a
@@ -317,35 +432,24 @@ impl GuestConnectionQuota {
     /// deadlock against itself. A pooled network request *does* wait, because
     /// there an idle connection returning to the pool can satisfy it.
     pub fn try_acquire_outbound_http(&self) -> Option<ConnectionSlot> {
-        self.try_acquire(
-            &self.outbound_http,
-            &self.stats.outbound_http_granted,
-            &self.stats.outbound_http_refused,
-        )
+        self.try_acquire(Surface::OutboundHttp)
     }
 
     /// Take a slot for a published-port splice.
     pub fn try_acquire_inbound_socket(&self) -> Option<ConnectionSlot> {
-        self.try_acquire(
-            &self.inbound_sockets,
-            &self.stats.inbound_sockets_granted,
-            &self.stats.inbound_sockets_refused,
-        )
+        self.try_acquire(Surface::InboundSockets)
     }
 
-    fn try_acquire(
-        &self,
-        surface: &Arc<Semaphore>,
-        granted: &AtomicU64,
-        refused: &AtomicU64,
-    ) -> Option<ConnectionSlot> {
+    fn try_acquire(&self, surface: Surface) -> Option<ConnectionSlot> {
+        let state = &*self.0;
+        let (granted, refused) = state.counters(surface);
         // The guest's own surface first, so a guest at its ceiling does not
         // take host-wide capacity it will immediately hand back.
-        let Ok(guest) = Arc::clone(surface).try_acquire_owned() else {
+        let Ok(guest) = state.semaphore(surface).try_acquire() else {
             refused.fetch_add(1, Ordering::Relaxed);
             return None;
         };
-        let global = match &self.global {
+        let global = match &state.global {
             Some(global) => match Arc::clone(global).try_acquire_owned() {
                 Ok(permit) => Some(permit),
                 Err(_) => {
@@ -355,48 +459,97 @@ impl GuestConnectionQuota {
             },
             None => None,
         };
+        guest.forget();
         granted.fetch_add(1, Ordering::Relaxed);
-        Some(ConnectionSlot {
-            _guest: guest,
-            _global: global,
-        })
+        Some(self.slot(surface, global))
     }
 
-    /// The HTTP surface's permits, for the pooled client to draw on directly.
+    /// Wait up to `wait` for a connection slot for the pooled HTTP client, or
+    /// `None` if the guest's allowance or the host-wide ceiling stayed full.
     ///
-    /// Handed out as a raw semaphore rather than through `try_acquire` because
-    /// the pool needs to *wait* on it, racing the wait against an idle
-    /// connection freeing — behavior `try_acquire` deliberately does not have.
-    pub fn outbound_http_permits(&self) -> Arc<Semaphore> {
-        Arc::clone(&self.outbound_http)
+    /// Counted as a grant or a refusal like the non-waiting surfaces. The slot
+    /// keeps the workload's quota registered until the connection closes,
+    /// including when the client is replaced or the workload stops.
+    pub async fn acquire_outbound_http(&self, wait: Duration) -> Option<ConnectionSlot> {
+        let state = &*self.0;
+        let (granted, refused) = state.counters(Surface::OutboundHttp);
+        // Acquire order (guest, then host-wide) is fixed everywhere, and
+        // waiters hold no resource another waiter needs, so waiting on both
+        // cannot deadlock. Acquiring only fails on a closed semaphore, and
+        // these are private and never closed.
+        let acquire = async {
+            let guest = state.outbound_http.acquire().await.ok()?;
+            let global = match &state.global {
+                Some(global) => Some(Arc::clone(global).acquire_owned().await.ok()?),
+                None => None,
+            };
+            guest.forget();
+            Some(global)
+        };
+        match tokio::time::timeout(wait, acquire).await {
+            Ok(Some(global)) => {
+                granted.fetch_add(1, Ordering::Relaxed);
+                Some(self.slot(Surface::OutboundHttp, global))
+            }
+            Ok(None) | Err(_) => {
+                refused.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
     }
 
-    /// The host-wide ceiling, for the same reason.
+    fn slot(&self, surface: Surface, global: Option<OwnedSemaphorePermit>) -> ConnectionSlot {
+        ConnectionSlot {
+            quota: self.clone(),
+            surface,
+            _global: global,
+        }
+    }
+
+    /// The host-wide ceiling, when one is configured. Exposed for diagnostics
+    /// such as the pooled client's exhaustion warning; slots are taken through
+    /// the `acquire` methods, never from this directly.
     pub fn global_permits(&self) -> Option<Arc<Semaphore>> {
-        self.global.clone()
+        self.0.global.clone()
     }
 
     pub fn outbound_sockets_available(&self) -> usize {
-        self.outbound_sockets.available_permits()
+        self.0.outbound_sockets.available_permits()
     }
 
     pub fn inbound_sockets_available(&self) -> usize {
-        self.inbound_sockets.available_permits()
+        self.0.inbound_sockets.available_permits()
     }
 
     pub fn outbound_http_available(&self) -> usize {
-        self.outbound_http.available_permits()
+        self.0.outbound_http.available_permits()
     }
 
     /// Grants and refusals per surface, for reporting.
+    ///
+    /// The counts cover this quota's current lifetime. Once a guest holds no
+    /// slot and every handle to its quota is dropped, the registry forgets it,
+    /// and the next [`QuotaRegistry::for_guest`] starts again from zero. A
+    /// reporter that wants a guest's full history should hold a handle for as
+    /// long as it samples.
     pub fn counts(&self) -> QuotaCounts {
+        let load = |surface| {
+            let (granted, refused) = self.0.counters(surface);
+            (
+                granted.load(Ordering::Relaxed),
+                refused.load(Ordering::Relaxed),
+            )
+        };
+        let (outbound_http_granted, outbound_http_refused) = load(Surface::OutboundHttp);
+        let (outbound_sockets_granted, outbound_sockets_refused) = load(Surface::OutboundSockets);
+        let (inbound_sockets_granted, inbound_sockets_refused) = load(Surface::InboundSockets);
         QuotaCounts {
-            outbound_http_granted: self.stats.outbound_http_granted.load(Ordering::Relaxed),
-            outbound_http_refused: self.stats.outbound_http_refused.load(Ordering::Relaxed),
-            outbound_sockets_granted: self.stats.outbound_sockets_granted.load(Ordering::Relaxed),
-            outbound_sockets_refused: self.stats.outbound_sockets_refused.load(Ordering::Relaxed),
-            inbound_sockets_granted: self.stats.inbound_sockets_granted.load(Ordering::Relaxed),
-            inbound_sockets_refused: self.stats.inbound_sockets_refused.load(Ordering::Relaxed),
+            outbound_http_granted,
+            outbound_http_refused,
+            outbound_sockets_granted,
+            outbound_sockets_refused,
+            inbound_sockets_granted,
+            inbound_sockets_refused,
         }
     }
 }
@@ -422,7 +575,7 @@ pub struct QuotaRegistry {
     limits: QuotaLimits,
     global: Option<Arc<Semaphore>>,
     http_wait: Duration,
-    quotas: moka::sync::Cache<String, GuestConnectionQuota>,
+    quotas: Arc<GuestQuotas>,
 }
 
 /// The registry a policy built without one draws on.
@@ -447,9 +600,7 @@ impl QuotaRegistry {
             limits,
             global: host_wide.map(|total| Arc::new(Semaphore::new(total.max(1)))),
             http_wait: DEFAULT_HTTP_WAIT,
-            quotas: moka::sync::Cache::builder()
-                .time_to_idle(QUOTA_IDLE)
-                .build(),
+            quotas: Arc::default(),
         })
     }
 
@@ -482,9 +633,21 @@ impl QuotaRegistry {
     /// plugin id — never anything a guest can choose, or two guests could
     /// collapse into one allowance.
     pub fn for_guest(&self, guest_id: &str) -> GuestConnectionQuota {
-        self.quotas.get_with_by_ref(guest_id, || {
-            GuestConnectionQuota::new(self.limits, self.global.clone())
-        })
+        let mut guests = self.quotas.shard(guest_id);
+        if let Some(quota) = guests.get(guest_id).and_then(Weak::upgrade) {
+            return GuestConnectionQuota(quota);
+        }
+        let guest_id: Arc<str> = Arc::from(guest_id);
+        let quota = GuestConnectionQuota::with_registration(
+            self.limits,
+            self.global.clone(),
+            Some(QuotaRegistration {
+                registry: Arc::downgrade(&self.quotas),
+                guest_id: Arc::clone(&guest_id),
+            }),
+        );
+        guests.insert(guest_id, Arc::downgrade(&quota.0));
+        quota
     }
 
     pub fn limits(&self) -> QuotaLimits {
@@ -492,16 +655,16 @@ impl QuotaRegistry {
     }
 }
 
-/// Counters for what the socket policy decided.
+/// Counters for what the socket policy and the `hostPath` volume gate decided.
 ///
-/// `would_deny` is the migration signal: while the host runs in count mode it
+/// `would_deny` is the count-mode signal: while the host runs in count mode it
 /// records every refusal enforcement *would* have made, so an operator can see
-/// the blast radius before turning it on. If these are non-zero, enforcing
-/// breaks someone.
+/// the blast radius. If these are non-zero, enforcing breaks someone.
 #[derive(Debug, Default)]
 pub struct PolicyMeters {
     denied: [AtomicU64; DENY_REASONS],
     would_deny: [AtomicU64; DENY_REASONS],
+    host_path_denied: AtomicU64,
 }
 
 const DENY_REASONS: usize = 6;
@@ -542,24 +705,163 @@ impl PolicyMeters {
             .map_or(0, |c| c.load(Ordering::Relaxed))
     }
 
+    /// Record a refused `hostPath` volume: one outside the host's allowed host
+    /// paths, or one exposing a reserved path, a kernel filesystem, or the
+    /// `emptyDir` scratch root.
+    pub fn record_host_path_denied(&self) {
+        self.host_path_denied.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `hostPath` volumes the host refused.
+    pub fn host_path_denied(&self) -> u64 {
+        self.host_path_denied.load(Ordering::Relaxed)
+    }
+
     /// Every reason with a non-zero count, for a status line or a metric sweep.
     pub fn nonzero(&self) -> Vec<(DenyReason, u64, u64)> {
-        [
-            DenyReason::NotPermitted,
-            DenyReason::BindNotPermitted,
-            DenyReason::HostLoopbackNotPermitted,
-            DenyReason::HostOwnedPort,
-            DenyReason::BlockedRange,
-            DenyReason::NoCapacity,
-        ]
-        .into_iter()
-        .map(|r| (r, self.denied(r), self.would_deny(r)))
-        .filter(|(_, d, w)| *d > 0 || *w > 0)
-        .collect()
+        ALL_REASONS
+            .into_iter()
+            .map(|r| (r, self.denied(r), self.would_deny(r)))
+            .filter(|(_, d, w)| *d > 0 || *w > 0)
+            .collect()
+    }
+
+    /// These counters, published as metrics on the process-wide meter: the
+    /// would-deny figures are what an operator watches before switching the
+    /// socket policy to enforce. With no OTel exporter configured the global
+    /// meter is a no-op and nothing is ever read.
+    pub fn into_metered(self) -> Arc<Self> {
+        let meters = Arc::new(self);
+        meters.register_metrics(&opentelemetry::global::meter("wash-runtime"));
+        meters
+    }
+
+    fn register_metrics(self: &Arc<Self>, meter: &opentelemetry::metrics::Meter) {
+        // Weak, so the meter provider does not keep a dropped host's counters
+        // alive; a callback that cannot upgrade reports nothing.
+        let observe = |name: &'static str, doc: &'static str, read: fn(&Self) -> u64| {
+            let meters = Arc::downgrade(self);
+            let _ = meter
+                .u64_observable_counter(name)
+                .with_description(doc)
+                .with_unit("{volume}")
+                .with_callback(move |observer| {
+                    if let Some(meters) = meters.upgrade() {
+                        observer.observe(read(&meters), &[]);
+                    }
+                })
+                .build();
+        };
+        observe(
+            "host_path.denied",
+            "hostPath volumes refused: outside the allowlist, or exposing a reserved path, a \
+             kernel filesystem, or the emptyDir scratch root",
+            Self::host_path_denied,
+        );
+        let by_reason =
+            |name: &'static str, doc: &'static str, read: fn(&Self, DenyReason) -> u64| {
+                let meters = Arc::downgrade(self);
+                let _ = meter
+                    .u64_observable_counter(name)
+                    .with_description(doc)
+                    .with_unit("{connection}")
+                    .with_callback(move |observer| {
+                        if let Some(meters) = meters.upgrade() {
+                            for reason in ALL_REASONS {
+                                observer.observe(
+                                    read(&meters, reason),
+                                    &[opentelemetry::KeyValue::new("reason", reason.as_str())],
+                                );
+                            }
+                        }
+                    })
+                    .build();
+            };
+        by_reason(
+            "socket_policy.denied",
+            "Socket operations the socket policy refused, by reason",
+            Self::denied,
+        );
+        by_reason(
+            "socket_policy.would_deny",
+            "Socket operations counted in count mode that enforcement would refuse, by reason",
+            Self::would_deny,
+        );
+    }
+}
+
+const ALL_REASONS: [DenyReason; DENY_REASONS] = [
+    DenyReason::NotPermitted,
+    DenyReason::BindNotPermitted,
+    DenyReason::HostLoopbackNotPermitted,
+    DenyReason::HostOwnedPort,
+    DenyReason::BlockedRange,
+    DenyReason::NoCapacity,
+];
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod policy_meter_tests {
+    use super::*;
+
+    /// The would-deny counters an operator is told to watch reach an exporter,
+    /// through a real SDK pipeline with a reader of its own.
+    #[test]
+    fn policy_counters_are_published_as_metrics() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+            data::{AggregatedMetrics, MetricData},
+        };
+
+        let meters = Arc::new(PolicyMeters::default());
+        meters.record_host_path_denied();
+        meters.record_would_deny(DenyReason::BlockedRange);
+
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .build();
+        meters.register_metrics(&provider.meter("test"));
+        provider.force_flush().expect("flush");
+
+        let mut seen = std::collections::BTreeMap::new();
+        for resource in exporter.get_finished_metrics().expect("finished metrics") {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics() {
+                    let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+                        continue;
+                    };
+                    for point in sum.data_points() {
+                        let reason = point
+                            .attributes()
+                            .find(|kv| kv.key.as_str() == "reason")
+                            .map(|kv| kv.value.to_string());
+                        seen.insert((metric.name().to_string(), reason), point.value());
+                    }
+                }
+            }
+        }
+        assert_eq!(seen[&("host_path.denied".to_string(), None)], 1);
+        assert_eq!(
+            seen[&(
+                "socket_policy.would_deny".to_string(),
+                Some("blocked_range".to_string())
+            )],
+            1
+        );
+        assert_eq!(
+            seen[&(
+                "socket_policy.denied".to_string(),
+                Some("not_permitted".to_string())
+            )],
+            0
+        );
     }
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod outbound_http_tests {
     use super::*;
 
@@ -617,6 +919,7 @@ mod outbound_http_tests {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     /// The ceiling tracks the descriptor budget the process actually has: a
     /// container started with 1024 and one started with a million want very
@@ -875,6 +1178,124 @@ mod tests {
                 .try_acquire_outbound_socket()
                 .is_none(),
             "the same guest must see the same allowance"
+        );
+    }
+
+    #[test]
+    fn guest_quota_is_removed_when_its_last_slot_closes() {
+        let registry = QuotaRegistry::new(QuotaLimits::default(), None);
+        let slot = registry
+            .for_guest("guest")
+            .try_acquire_outbound_socket()
+            .expect("connection slot");
+        assert_eq!(registry.quotas.len(), 1);
+        drop(slot);
+        assert!(registry.quotas.len() == 0);
+        assert_eq!(
+            registry
+                .for_guest("guest")
+                .counts()
+                .outbound_sockets_granted,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn http_connection_slot_keeps_the_same_guest_quota_registered() {
+        let registry = QuotaRegistry::new(
+            QuotaLimits {
+                outbound_http: 1,
+                ..QuotaLimits::default()
+            },
+            None,
+        );
+        let slot = registry
+            .for_guest("guest")
+            .acquire_outbound_http(Duration::from_secs(1))
+            .await
+            .expect("connection slot");
+        assert!(
+            registry
+                .for_guest("guest")
+                .try_acquire_outbound_http()
+                .is_none()
+        );
+        drop(slot);
+        assert!(registry.quotas.len() == 0);
+        assert!(
+            registry
+                .for_guest("guest")
+                .try_acquire_outbound_http()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn pooled_http_acquire_counts_grants_and_timeouts() {
+        let quota = GuestConnectionQuota::new(
+            QuotaLimits {
+                outbound_http: 1,
+                ..QuotaLimits::default()
+            },
+            None,
+        );
+        let held = quota
+            .acquire_outbound_http(Duration::from_millis(10))
+            .await
+            .expect("first slot");
+        assert!(
+            quota
+                .acquire_outbound_http(Duration::from_millis(10))
+                .await
+                .is_none(),
+            "a full allowance times out"
+        );
+        let counts = quota.counts();
+        assert_eq!(counts.outbound_http_granted, 1);
+        assert_eq!(counts.outbound_http_refused, 1);
+        drop(held);
+        assert_eq!(quota.outbound_http_available(), 1);
+    }
+
+    #[tokio::test]
+    async fn pooled_http_wait_returns_the_guest_permit_when_host_wide_times_out() {
+        let registry = QuotaRegistry::new(QuotaLimits::default(), Some(1));
+        let other = registry.for_guest("other");
+        let _host = other.try_acquire_outbound_socket().expect("host slot");
+        let quota = registry.for_guest("guest");
+        let before = quota.outbound_http_available();
+        assert!(
+            quota
+                .acquire_outbound_http(Duration::from_millis(10))
+                .await
+                .is_none()
+        );
+        assert_eq!(quota.outbound_http_available(), before);
+    }
+
+    #[test]
+    fn registry_shards_shrink_after_a_burst_of_guests() {
+        let registry = QuotaRegistry::new(QuotaLimits::default(), None);
+        let slots: Vec<_> = (0..4096)
+            .map(|i| {
+                registry
+                    .for_guest(&format!("guest-{i}"))
+                    .try_acquire_outbound_socket()
+                    .expect("slot")
+            })
+            .collect();
+        assert_eq!(registry.quotas.len(), 4096);
+        drop(slots);
+        assert_eq!(registry.quotas.len(), 0);
+        let capacity: usize = registry
+            .quotas
+            .shards
+            .iter()
+            .map(|shard| shard.lock().unwrap().capacity())
+            .sum();
+        assert!(
+            capacity <= REGISTRY_SHARDS * SHARD_SHRINK_FLOOR * 2,
+            "shards kept {capacity} slots after emptying"
         );
     }
 

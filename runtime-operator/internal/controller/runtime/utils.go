@@ -2,21 +2,33 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"hash/fnv"
 	"strings"
 
 	"github.com/distribution/reference"
 	"github.com/docker/cli/cli/config/configfile"
+	"github.com/docker/cli/cli/config/credentials"
+	"go.wasmcloud.dev/runtime-operator/v2/api/condition"
 	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/v2/api/runtime/v1alpha1"
 	runtimev2 "go.wasmcloud.dev/runtime-operator/v2/pkg/rpc/wasmcloud/runtime/v2"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+// deleteObservedChild refuses to delete a replacement with the same name or
+// a child whose state changed after the controller decided to remove it.
+func deleteObservedChild(ctx context.Context, c client.Client, child client.Object) error {
+	uid, version := child.GetUID(), child.GetResourceVersion()
+	return client.IgnoreNotFound(c.Delete(ctx, child, client.Preconditions{UID: &uid, ResourceVersion: &version}))
+}
 
 func translatePullPolicy(policy corev1.PullPolicy) runtimev2.ImagePullPolicy {
 	switch policy {
@@ -32,24 +44,70 @@ func translatePullPolicy(policy corev1.PullPolicy) runtimev2.ImagePullPolicy {
 }
 
 func randHash() string {
+	return shortHash(string(uuid.NewUUID()))
+}
+
+// shortHash is an 8-10 character, name-safe hash of s.
+func shortHash(s string) string {
 	h := fnv.New32a()
-	uuid := uuid.NewUUID()
-	_, _ = h.Write([]byte(uuid))
+	_, _ = h.Write([]byte(s))
 	return rand.SafeEncodeString(fmt.Sprint(h.Sum32()))
 }
 
-func isOwnedByController(rawObj client.Object, gvk schema.GroupVersionKind) (string, bool) {
+// ownerLabelValue fits an object name into a label value. Names over 63
+// characters keep a prefix plus a hash of the full name.
+func ownerLabelValue(name string) string {
+	const maxLabelValue = 63
+	if len(name) <= maxLabelValue {
+		return name
+	}
+	hash := shortHash(name)
+	return name[:maxLabelValue-len(hash)-1] + "-" + hash
+}
+
+// controllerUID returns the UID of rawObj's controller if it is a gvk.
+// Owner indexes key on the UID because a delete and re-apply reuses the name:
+// what the old object controlled is still there until the garbage collector
+// reaches it, and none of it belongs to the new one.
+func controllerUID(rawObj client.Object, gvk schema.GroupVersionKind) (string, bool) {
 	for _, ref := range rawObj.GetOwnerReferences() {
 		if ref.Controller != nil && *ref.Controller {
 			if ref.APIVersion == gvk.GroupVersion().String() {
 				if ref.Kind == gvk.Kind {
-					return ref.Name, true
+					return string(ref.UID), true
 				}
 			}
 		}
 	}
 
 	return "", false
+}
+
+// isRefused reports whether the API server turned a write away, as admission
+// (a webhook, a ValidatingAdmissionPolicy, a ResourceQuota) or validation does,
+// rather than failing it in a way that a retry may get past.
+func isRefused(err error) bool {
+	return apierrors.IsForbidden(err) || apierrors.IsInvalid(err)
+}
+
+// recordRefused records a Warning on regarding for a write the API server
+// refused; related names the object the refused write was for, if any.
+func recordRefused(recorder events.EventRecorder, regarding, related runtime.Object, action, note string, err error) {
+	if recorder == nil {
+		return
+	}
+	recorder.Eventf(regarding, related, corev1.EventTypeWarning, "Failed"+action, action, "%s: %v", note, err)
+}
+
+// firstFailed returns the first of condTypes that is False, so a parent can
+// say why a child is stuck rather than only that it is not ready yet.
+func firstFailed(status *condition.ConditionedStatus, condTypes ...condition.ConditionType) (condition.Condition, bool) {
+	for _, ct := range condTypes {
+		if c := status.GetCondition(ct); c.Status == condition.ConditionFalse {
+			return c, true
+		}
+	}
+	return condition.Condition{}, false
 }
 
 func gvkForType(obj client.Object, scheme *runtime.Scheme) (schema.GroupVersionKind, error) {
@@ -135,12 +193,13 @@ func MaterializeImagePullSecret(ctx context.Context,
 	// extract the domain from the normalized reference
 	// assume the default docker registry if none is specified
 	configKey := getAuthConfigKey(reference.Domain(registryRef))
-	authConfig, err := cfg.GetAuthConfig(configKey)
+	// Only the secret's own auths. Its credsStore and credHelpers name programs
+	// on the operator's PATH, and DOCKER_AUTH_CONFIG holds the operator's own
+	// credentials: a Workload's secret must reach neither.
+	authConfig, err := credentials.NewFileStore(cfg).Get(configKey)
 	if err != nil {
 		return nil, fmt.Errorf("getting auth config for image %q: %w", image, err)
 	}
-
-	// NOTE(lxf): here we have the opportunity to run credential helpers if needed
 
 	return &runtimev2.ImagePullSecret{
 		Username: authConfig.Username,
@@ -178,4 +237,13 @@ func MaterializeConfigLayer(ctx context.Context,
 	ret = MergeMaps(ret, secrets)
 
 	return ret, nil
+}
+
+func rolloutChildName(parent, key string) string {
+	revision := sha256.Sum256([]byte(key))
+	const maxPrefix = 253 - 11
+	if len(parent) > maxPrefix {
+		parent = strings.TrimRight(parent[:maxPrefix], "-.")
+	}
+	return fmt.Sprintf("%s-%x", parent, revision[:5])
 }

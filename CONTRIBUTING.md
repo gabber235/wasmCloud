@@ -7,6 +7,30 @@ Thank you for your interest in contributing to wash! This document provides guid
 If you have feature suggestions, find bugs, or have questions, please submit an issue [here][0].
 Pull requests are welcome! The [good first issue][1] label is a great way to find a starting point for new contributors.
 
+## Reporting Bugs
+
+Report bugs as [GitHub issues][2] using the **Bug report** template. Search the [open issues][3] first, and add to an existing report if one matches.
+
+A useful report includes:
+
+- What you ran and what happened, with the full error message or logs.
+- What you expected to happen instead.
+- The smallest set of steps or commands that reproduces it. If it needs files, link a public
+  repository with a minimal reproduction instead of attaching zip files or other archives.
+- Your versions: the output of `wash --version`, and for Kubernetes deployments the runtime-operator chart version.
+- Your operating system and architecture, and your Kubernetes version if one is involved.
+
+Don't report security vulnerabilities as issues. Follow [SECURITY.md](SECURITY.md) to report them privately.
+
+## Escalating to the CRA Steward
+
+The security team escalates two kinds of event to the Linux Foundation, wasmCloud's CRA steward, at steward@linuxfoundation.org:
+
+- **Actively exploited vulnerabilities:** a vulnerability in wasmCloud for which the security team has reliable evidence that a malicious actor has exploited it.
+- **Severe incidents:** a security compromise of the project's own infrastructure, such as its GitHub organization, release pipeline, signing identities, or published artifacts.
+
+A vulnerability with no evidence of exploitation is not an escalation event and follows the normal process in [SECURITY.md](SECURITY.md#security-vulnerability-response). Remediation never waits on the escalation decision.
+
 ## Development Environment
 
 ### Prerequisites
@@ -44,6 +68,143 @@ cargo test
 cargo test --lib
 cargo test --bin wash
 ```
+
+### Rust coverage
+
+Install the pinned coverage tool and the coverage-only nightly toolchain:
+
+```bash
+source .github/tool-versions.env
+cargo install cargo-llvm-cov --locked --version "$CARGO_LLVM_COV_VERSION"
+cargo xtask coverage setup
+cargo xtask coverage
+```
+
+`cargo xtask coverage` builds the Wasm fixtures without coverage instrumentation,
+then runs the native Rust workspace tests with the same optional features as
+`wash.yml`, including the ignored Docker/registry tests. Docker must be running;
+registry access and the usual fixture build prerequisites are required. Coverage
+builds use a separate Cargo target directory, managed by cargo-llvm-cov. Only
+coverage uses the dated nightly pinned in `xtask/coverage-toolchain`; fixture
+builds and ordinary builds/tests continue to use `rust-toolchain.toml`.
+
+Reports are written to `target/coverage/`: `html/index.html`, `coverage.json`,
+`summary.txt`, test/threshold logs, and `provenance.txt`. The provenance
+records the commit, working tree status, toolchain, features, test scope, and CI
+run URL. `cargo xtask coverage report` regenerates reports after a failed run;
+partial reports are diagnostic only. `cargo xtask coverage check` requires a
+successful full test run and at least **80% line coverage**, set by `THRESHOLD`
+in `xtask/src/coverage.rs` and recorded in the provenance. Compiler-region and
+branch coverage are informational and have no minimum threshold. Branch coverage
+uses nightly instrumentation.
+Neither failed tests nor percentages below the target are treated as passing evidence.
+
+The [coverage workflow](https://github.com/wasmCloud/wasmCloud/actions/workflows/coverage.yml)
+runs on Rust pull requests, merge groups, and main pushes, and can be started
+manually. Its summary records the measured percentages and test/threshold status.
+The `rust-coverage` artifact retains the reports for 90 days, including when the
+threshold fails. This workflow is separate from the release gate.
+
+#### OpenSSF Best Practices evidence
+
+The Silver badge's
+[`test_statement_coverage80`](https://www.bestpractices.dev/en/criteria/1#test_statement_coverage80)
+criterion requires 80% **statement coverage**. cargo-llvm-cov reports LLVM source
+regions and lines, not a statement count. Using region coverage as a proxy needs
+justification in the badge assessment; line coverage must not be labeled as
+statement coverage.
+
+The report includes native workspace code except the `xtask` developer tooling
+crate, and uses cargo-llvm-cov's default exclusions for test files, examples,
+benchmarks, dependencies, and build output. Generated protobuf bindings under
+`washlet/generated/` are also excluded. The `xtask` tests still run, but its code
+is excluded from every report format and the coverage threshold. Inline
+unit-test modules and test-only helper functions use conditional `coverage(off)`
+attributes so their bodies do not count toward the percentage. These attributes
+are active only during nightly coverage builds. Platform-specific code is measured
+only where compiled on Linux.
+Guest Wasm components, the Go operator/gateway, and Kubernetes E2E execution are
+outside this Rust report's scope. The Rust report alone does not establish
+project-wide compliance; see the separate Go reports below. These scope limits
+need review in the badge justification.
+
+For evidence, link a successful run for the assessed commit and preserve its
+`rust-coverage` artifact before it expires. Include the commit, test results,
+metrics, and exclusions with the justification. Installing the tool or setting
+an 80% threshold does not demonstrate that the criterion is met.
+
+### Go coverage
+
+The [coverage workflow](https://github.com/wasmCloud/wasmCloud/actions/workflows/coverage.yml)
+measures `runtime-operator` and `runtime-gateway` separately on Go pull requests,
+merge groups, main pushes, and manual runs. Each job requires successful tests
+and complete reports. The Gold targets of **90% statements** and **80% branch
+outcomes** are informational; coverage percentages do not affect CI status.
+Coverage runs separately from the release gate.
+
+To reproduce a report from the repository root, install the pinned branch tool
+and run the module's collector (Node.js and Go are required):
+
+```bash
+source .github/tool-versions.env
+go install "github.com/rillig/gobco@v${GOBCO_VERSION}"
+export PATH="$(go env GOPATH)/bin:$PATH"
+node .github/scripts/go-coverage.mjs runtime-gateway
+
+# The operator also requires Kubernetes envtest assets.
+GOWORK=off make -C runtime-operator manifests generate envtest LOCALBIN=/tmp/wasmcloud-coverage-tools
+export KUBEBUILDER_ASSETS="$(/tmp/wasmcloud-coverage-tools/setup-envtest use 1.31.0 --bin-dir /tmp/wasmcloud-coverage-tools -p path)"
+node .github/scripts/go-coverage.mjs runtime-operator
+```
+
+`GOBCO` can override the branch tool's executable path. The collector sets
+`GOWORK=off` for both modules, so the gateway uses the operator dependency
+declared in its `go.mod`. Statement collection uses `go test -count=1
+-covermode=atomic -coverpkg=<measured packages>` across the module's unit
+and integration tests. The denominator includes packages without tests. Test
+code is not measured: packages under a `test/` directory and helpers named
+after their parent package, such as `wasmbus/wasmbustest`. Their tests still
+run, except the operator's `test/e2e` package, which requires a running
+cluster. Generated bindings, generated deepcopy code, and entry points are
+included. Test files and external dependencies are excluded by the tools.
+Platform-specific code is measured only where compiled on the runner.
+
+Reports live in `target/go-coverage/<module>/`: `statements.out`,
+`statements.html`, function percentages in `statements.txt`, raw gobco JSON and
+logs per package, `coverage.json`, `summary.md`, and `provenance.json`. Provenance
+records the commit, working tree changes, tool versions, package scope,
+platform, informational targets, and CI run URL. `coverage.json` records whether
+the targets are met in `targetsMet`; `passed` reflects test and collection success.
+Statement percentages sum unique profile
+blocks weighted by statement count, merging repeated blocks from package test
+runs. `statements.txt` provides Go's per-function view. Branch outcomes are summed across
+packages by count, rather than averaging package percentages. Empty totals,
+failed tests, and missing or invalid report data cannot pass the checks.
+CI retains each `<module>-coverage` artifact for 90 days, including when tests
+or collection fail. Preserve the artifact for the assessed commit before expiry.
+
+#### Gold evidence limits
+
+Gold requires
+[`test_statement_coverage90`](https://www.bestpractices.dev/en/criteria#test_statement_coverage90)
+and
+[`test_branch_coverage80`](https://www.bestpractices.dev/en/criteria#test_branch_coverage80).
+Go's atomic profile measures statements; it supplies no branch counts. Branch
+measurement uses FLOSS [gobco](https://github.com/rillig/gobco) with `-branch`
+in a separate test run for each package. Gobco instruments temporary module
+copies and leaves the source files unchanged. A package's branch report counts
+only execution by that package's tests; cross-package integration execution
+does not contribute. Packages containing only test files have no branch
+counters and skip the second test run; their tests run during statement
+collection. Gobco does not instrument `select` statements or `range`
+loop outcomes, and its counters are not atomic. Its branch percentage therefore
+needs scope and concurrency review in the badge justification; meeting the
+numeric target alone does not establish full branch coverage compliance.
+
+Link successful runs and retain both Go artifacts along with the Rust evidence.
+The Rust report still measures lines and compiler regions, and this addition
+does not supply Rust branch coverage or guest Wasm/Kubernetes E2E coverage.
+Document all exclusions and tool limitations in the project-wide assessment.
 
 ## Project Structure
 
@@ -88,6 +249,29 @@ crates/
         ├── types.rs        # Shared runtime types
         └── wit.rs          # WIT interface bindings
 ```
+
+## Dependencies
+
+### Selecting
+
+Before adding a dependency, check whether a crate already in the workspace, or the standard library, does the job. A new dependency must be actively maintained, with recent releases and a maintainer who answers issues. Prefer projects hosted by an open source foundation, such as the Bytecode Alliance (`wasmtime`, `wit-bindgen`, `wasm-tools`), over alternatives.
+
+Every dependency must use a license on the allowlist in [`deny.toml`](deny.toml). A crate outside it needs a per-crate exception in `deny.toml`, agreed in review. Changes to the root `Cargo.toml` and `Cargo.lock` need approval from `@wasmCloud/wash-maintainers`, as set in [`CODEOWNERS`](.github/CODEOWNERS).
+
+### Obtaining
+
+- **Rust** crates come from crates.io. Shared versions are declared once under `[workspace.dependencies]` in the root `Cargo.toml`, and `Cargo.lock` is committed.
+- **Go** modules for `runtime-operator` and `runtime-gateway` come from the Go module proxy, and are pinned in each module's `go.sum`.
+- **GitHub Actions** are pinned to a full commit SHA, with the version in a trailing comment. `zizmor` lints the workflows.
+
+### Tracking
+
+- **Dependabot** opens weekly grouped update PRs for Cargo, Go modules, GitHub Actions and Docker images. It waits a week after a release before proposing it. For Cargo and Go, the wait is 3 days for a patch release and 14 for a major one. Security updates arrive as their own group, without waiting.
+- **`cargo audit`** checks `Cargo.lock` against the RustSec advisory database daily, on every push to `main`, and on pull requests that change a manifest, the lockfile, `deny.toml` or `.cargo/audit.toml`. An advisory that doesn't affect wasmCloud can be ignored in [`.cargo/audit.toml`](.cargo/audit.toml), with a comment saying why it doesn't apply.
+- **`cargo deny check licenses`** runs on the same triggers and fails on any license outside the allowlist. It checks every Rust workspace, including standalone examples and templates, against the root license policy and its per-crate exceptions. Standalone workspaces are also checked for WebAssembly targets. First-party crates need license metadata unless they set `publish = false`.
+- **Dependency review** checks newly introduced dependencies on pull requests to `main` and merge groups that change Rust or Go dependency files, GitHub Actions, `deny.toml` or its policy in [`.github/dependency-review-config.yml`](.github/dependency-review-config.yml). It blocks known vulnerabilities of any severity in runtime, development, and unknown scopes, and checks licenses against the same allowlist as `deny.toml`. Each crate excepted in `deny.toml` is exempted there too, while `cargo deny` enforces its approved license. When GitHub flags an advisory that `.cargo/audit.toml` ignores, its GHSA ID goes in `allow-ghsas`. GitHub reports missing license data as a warning.
+
+How quickly findings must be fixed is in [SECURITY.md](SECURITY.md#dependency-and-code-scanning).
 
 ## Code Style and Conventions
 
@@ -181,7 +365,33 @@ Types:
 
 ### Code Review
 
-All submissions require review. We use GitHub pull requests for this process.
+All submissions require review through a GitHub pull request. GitHub automatically requests
+reviewers based on [CODEOWNERS](.github/CODEOWNERS). At least one approval from a code owner
+of the affected files is required before merging. New pushes dismiss existing approvals;
+the updated changes must be reviewed and approved again.
+
+Reviewers check:
+
+- **Correctness:** the change meets its stated purpose, handles errors and edge cases, and
+  follows the project's code style.
+- **Tests:** new functionality has automated tests, and behavior changes and bug fixes meet
+  the [test policy](#test-policy).
+- **Security:** the change preserves the [trust boundaries in THREAT_MODEL.md](THREAT_MODEL.md#trust-boundaries),
+  including component isolation, workload and plugin identity, and network access controls.
+- **Compatibility:** WIT interfaces and public APIs remain compatible, or breaking changes
+  are identified and include migration guidance.
+- **Documentation:** user-facing behavior, public APIs, and CLI help are documented as needed.
+- **Commits:** commit messages follow [Conventional Commits](#commit-message-format), and
+  every commit includes a DCO `Signed-off-by:` trailer (use `git commit -s`).
+
+A pull request is acceptable for merge only when:
+
+- CI is green, including the required `gate` and `gate-audit` checks and all other applicable
+  checks described in [Tests in CI](#tests-in-ci).
+- All review threads are resolved and the required code-owner approval is current.
+- Every use of `unsafe` has a `SAFETY:` comment explaining why its safety requirements hold.
+- New dependencies use licenses on the [deny.toml allowlist](deny.toml), or have an approved
+  per-crate exception recorded there, as required by the [dependency policy](#selecting).
 
 ### When does my change ship?
 
@@ -191,10 +401,43 @@ that release. See [RELEASE_RUNBOOK.md](./RELEASE_RUNBOOK.md#release-cadence) for
 
 ## Testing
 
+### Test policy
+
+- A change that adds or changes behavior must add or update automated tests that run in CI.
+- A bug fix must include a regression test, unless one isn't feasible. If it isn't, the PR
+  description says why.
+- A change that needs no new tests says why in the PR description. Examples are documentation,
+  CI-only changes, and refactors that existing tests already cover.
+- Reviewers don't approve a PR until its tests meet this policy.
+
+### Writing tests
+
 - Write unit tests for new functionality
 - Include integration tests for CLI commands when appropriate
 - Test error cases and edge conditions
 - Ensure tests are deterministic and don't depend on external services
+
+### Tests in CI
+
+Every pull request and merge queue run starts the workflows in
+[`.github/workflows`](.github/workflows). Each one runs only the jobs that the changed files
+affect, and reports a single gate check that passes only when those jobs pass:
+
+- `gate` (`wash.yml`): `cargo test` for the workspace on Linux, macOS and Windows, the ignored
+  tests, rustfmt and clippy, and the `runtime-operator` end-to-end tests against the `wash` image.
+- `gate-audit` (`audit.yml`): `cargo audit`, `cargo deny check licenses`, `osv-scanner` over
+  every lockfile, and dependency review of newly added dependencies.
+- CodeQL (`codeql.yml`): Rust and Go analysis. The `main` ruleset blocks a merge that adds a
+  high or critical alert. See [Code scanning](SECURITY.md#code-scanning).
+- `gate-runtime-operator` and `gate-runtime-gateway`: the Go tests for each module.
+- `gate-wit`, `gate-charts`, `gate-templates`, `gate-examples`, `gate-proto`,
+  `gate-test-install-scripts` and `gate-lint-workflows`: WIT package validation, Helm chart lint,
+  template and example builds, generated protobuf code, the install scripts, and workflow lint.
+
+`gate` and `gate-audit` are required checks on `main`. Maintainers don't merge a PR while any
+other gate check is failing.
+
+To run the tests locally, see [Running Tests](#running-tests).
 
 ## Documentation
 
@@ -210,3 +453,5 @@ that release. See [RELEASE_RUNBOOK.md](./RELEASE_RUNBOOK.md#release-cadence) for
 
 [0]: https://github.com/wasmcloud/wasmCloud/issues/new/choose
 [1]: https://github.com/wasmcloud/wasmCloud/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22
+[2]: https://github.com/wasmCloud/wasmCloud/issues/new?template=bug_report.yml
+[3]: https://github.com/wasmCloud/wasmCloud/issues?q=is%3Aissue+is%3Aopen

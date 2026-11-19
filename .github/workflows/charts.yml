@@ -50,7 +50,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-go
+      - uses: $/.github/actions/setup-go
       - name: Check bundled CRDs
         run: make helm-crds-check
       - name: Render
@@ -78,13 +78,13 @@ jobs:
       - name: Set up chart-testing
         id: chart-testing
         continue-on-error: true
-        uses: helm/chart-testing-action@6ec842c01de15ebb84c8627d2744a0c2f2755c9f # v2.8.0
+        uses: helm/chart-testing-action@720270857a28afd41e2426521a7801db09e9b510 # v2.9.0
       # The action downloads ct and its verification assets from GitHub
       # Releases. Retry once when that transient setup step fails; the actual
       # chart lint below remains a single, blocking run.
       - name: Retry chart-testing setup
         if: steps.chart-testing.outcome == 'failure'
-        uses: helm/chart-testing-action@6ec842c01de15ebb84c8627d2744a0c2f2755c9f # v2.8.0
+        uses: helm/chart-testing-action@720270857a28afd41e2426521a7801db09e9b510 # v2.9.0
       - name: Lint charts
         run: ct lint --config .github/ct.yaml
 
@@ -101,7 +101,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-go
+      - uses: $/.github/actions/setup-go
       - name: Install kubeconform
         run: go install github.com/yannh/kubeconform/cmd/kubeconform@v0.6.7
       - name: Validate rendered manifests
@@ -126,6 +126,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Installs Trivy from its GitHub release, not the action's installer,
+      # which downloads from get.trivy.dev. Bump both values together from the
+      # release's checksums.txt.
+      - name: Install Trivy
+        env:
+          TRIVY_VERSION: 0.70.0
+          TRIVY_SHA256: 8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9
+        run: |
+          archive="${RUNNER_TEMP}/trivy.tar.gz"
+          curl -fsSL --retry 3 -o "${archive}" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "${RUNNER_TEMP}/trivy-bin"
+          tar -xzf "${archive}" -C "${RUNNER_TEMP}/trivy-bin" trivy
+          echo "${RUNNER_TEMP}/trivy-bin" >> "${GITHUB_PATH}"
       - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: config
@@ -133,6 +148,7 @@ jobs:
           severity: HIGH,CRITICAL
           trivyignores: charts/runtime-operator/.trivyignore
           exit-code: '1'
+          skip-setup-trivy: true
 
   checkov:
     needs:
@@ -146,7 +162,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: bridgecrewio/checkov-action@444c9db6fa75e2d9c19ebf1fde7322089be9009e # v12.3125.0
+      - uses: bridgecrewio/checkov-action@45edc9d8856b664db2ec251f5f8632361f0a67aa # v12.3139.0
         with:
           directory: charts/runtime-operator
           framework: helm
@@ -194,7 +210,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/helm-publish
+      - uses: $/.github/actions/helm-publish
         with:
           chart-name: runtime-operator
           chart-version: v2-canary
@@ -220,7 +236,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/helm-publish
+      - uses: $/.github/actions/helm-publish
         with:
           chart-name: runtime-operator
           registry: ghcr.io

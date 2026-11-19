@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"time"
 
 	ctrl "sigs.k8s.io/controller-runtime"
+
+	"go.wasmcloud.dev/runtime-operator/v2/pkg/logging"
 )
 
 // How long the gateway lets the requests already in flight finish once it is
@@ -44,6 +47,7 @@ func (h *HTTPGateway) Start(ctx context.Context) error {
 		},
 		Addr:              h.BindAddr,
 		Handler:           h.Proxy,
+		ErrorLog:          logging.ErrorLog(slog.Default().With("logger", "http-gateway")),
 		IdleTimeout:       0,
 		ReadTimeout:       0,
 		WriteTimeout:      0,

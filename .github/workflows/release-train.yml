@@ -82,12 +82,26 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      # The wait steps poll the release PR's checks with GITHUB_TOKEN.
+      checks: read
+      statuses: read
+      # Exchanged with octo-sts for the release-train token.
+      id-token: write
     steps:
+      # An app token (not GITHUB_TOKEN) so the pushed branch and the PR
+      # trigger required CI. It expires after an hour, so only the push
+      # and the PR steps use it; the long waits below use GITHUB_TOKEN.
+      - name: Get a release-train token from octo-sts
+        id: octo-sts
+        uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05 # v1.1.1
+        with:
+          scope: ${{ github.repository }}
+          identity: release-train
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # PAT (not GITHUB_TOKEN) so the resulting PR triggers required CI.
-          token: ${{ secrets.WASMCLOUD_BOT_PAT }}
+          token: ${{ steps.octo-sts.outputs.token }}
           persist-credentials: true
           fetch-depth: 0
 
@@ -187,7 +201,7 @@ jobs:
           fi
 
       - name: Setup Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
 
       - name: Bump versions
         env:
@@ -255,8 +269,14 @@ jobs:
             echo "investigate before continuing — the train should not bump transitive deps" >&2
             exit 1
           fi
+          # Carry the VEX assessments to the new version. The guard above keeps
+          # every dependency they name unchanged; a dependency that moved
+          # since the last release fails here for a maintainer to reassess.
+          node .github/scripts/release-vex.mjs --from "${CURRENT}" --to "${NEW}" \
+            --summary "${RUNNER_TEMP}/vex-summary.md"
+          node .github/scripts/check-vex.mjs --release
           echo "--- diff ---"
-          git --no-pager diff --stat -- Cargo.toml Cargo.lock charts/runtime-operator/Chart.yaml
+          git --no-pager diff --stat -- Cargo.toml Cargo.lock charts/runtime-operator/Chart.yaml vex/wasmcloud.openvex.json
 
       - name: Create release branch and commit
         env:
@@ -266,7 +286,7 @@ jobs:
           set -euo pipefail
           echo "STAGE=create-branch" >> "${GITHUB_ENV}"
           git checkout -b "${BRANCH}"
-          git add Cargo.toml Cargo.lock charts/runtime-operator/Chart.yaml
+          git add Cargo.toml Cargo.lock charts/runtime-operator/Chart.yaml vex/wasmcloud.openvex.json
           if git diff --cached --quiet; then
             echo "no changes staged — version may already be ${NEW}" >&2
             exit 1
@@ -280,7 +300,7 @@ jobs:
       - name: Open release PR and enable auto-merge
         id: pr
         env:
-          GH_TOKEN: ${{ secrets.WASMCLOUD_BOT_PAT }}
+          GH_TOKEN: ${{ steps.octo-sts.outputs.token }}
           BRANCH: ${{ steps.bump.outputs.branch }}
           NEW: ${{ steps.bump.outputs.version }}
         run: |
@@ -294,6 +314,10 @@ jobs:
             printf 'Automated release-train PR for **v%s**.\n\n' "${NEW}"
             printf '**Action required:** a maintainer needs to approve this PR. Once required checks pass and approval is recorded, auto-merge fires. After merge, `release-tag.yml` waits for canary builds on `main` to pass and then pushes the immutable `v%s` tag, which the existing tag-triggered workflows pick up.\n\n' "${NEW}"
             printf 'If CI fails: fix forward and push to this branch, or close this PR. The train does not skip — patch releases out-of-cycle can be triggered via `workflow_dispatch` on `release-train.yml`.\n'
+            if [[ -s "${RUNNER_TEMP}/vex-summary.md" ]]; then
+              printf '\n'
+              cat "${RUNNER_TEMP}/vex-summary.md"
+            fi
           } > "${BODY_FILE}"
           PR_URL=$(gh pr create \
             --base main \
@@ -326,7 +350,7 @@ jobs:
       - name: Wait for required checks on release PR
         if: steps.pr.outputs.pr_url != ''
         env:
-          GH_TOKEN: ${{ secrets.WASMCLOUD_BOT_PAT }}
+          GH_TOKEN: ${{ github.token }}
           PR_URL: ${{ steps.pr.outputs.pr_url }}
         run: |
           set -euo pipefail
@@ -358,9 +382,10 @@ jobs:
           gh pr checks "${PR_URL}" --watch --fail-fast --interval 30 --required
 
       - name: Wait for PR auto-merge to complete
+        id: merge
         if: steps.pr.outputs.pr_url != ''
         env:
-          GH_TOKEN: ${{ secrets.WASMCLOUD_BOT_PAT }}
+          GH_TOKEN: ${{ github.token }}
           PR_URL: ${{ steps.pr.outputs.pr_url }}
         run: |
           set -euo pipefail
@@ -375,7 +400,12 @@ jobs:
             case "${STATE}" in
               MERGED)
                 echo "PR merged"
-                exit 0
+                if SHA=$(gh pr view "${PR_URL}" --json mergeCommit --jq '.mergeCommit.oid') && [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
+                echo "::error::Could not resolve the merged release SHA; dispatch release-tag with sha=<merge-sha>"
+                exit 1
                 ;;
               CLOSED)
                 echo "PR was closed without merging" >&2
@@ -386,6 +416,44 @@ jobs:
           done
           echo "timed out waiting for PR auto-merge — likely awaiting review approval" >&2
           exit 1
+
+      # release-tag.yml promotes this exact commit, not whatever main is
+      # by the time it runs.
+      - name: Record the merged release commit
+        if: steps.merge.outputs.sha != ''
+        env:
+          RELEASE_SHA: ${{ steps.merge.outputs.sha }}
+        run: echo "${RELEASE_SHA}" > "${RUNNER_TEMP}/release-sha"
+      # release-tag refuses to promote without this, so a failed upload fails
+      # the train and pages Slack.
+      - name: Upload the merged release commit
+        if: steps.merge.outputs.sha != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-sha
+          path: ${{ runner.temp }}/release-sha
+          if-no-files-found: error
+          retention-days: 7
+
+      # The action revokes the token in its post step.
+      - name: Get a private fuzzing token from octo-sts
+        id: fuzz-token
+        if: github.repository == 'wasmCloud/wasmCloud' && github.ref == 'refs/heads/main' && steps.merge.outputs.sha != ''
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05 # v1.1.1
+        with:
+          scope: wasmCloud/security-fuzz
+          identity: release-fuzz
+
+      - name: Request private parser fuzzing
+        if: steps.fuzz-token.outputs.token != ''
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          RELEASE_SHA: ${{ steps.merge.outputs.sha }}
+          FUZZ_TOKEN: ${{ steps.fuzz-token.outputs.token }}
+        run: node .github/scripts/release-fuzz.mjs
 
       - name: Notify Slack — train failed
         if: failure()

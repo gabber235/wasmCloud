@@ -142,6 +142,55 @@ type ConditionedReconciler[T ConditionedType] struct {
 	conditions    []conditionPair[T]
 	finalizerFunc func(context.Context, T) error
 	finalizerName string
+	// trackGeneration stamps each condition with the generation it was
+	// computed for. See TrackGeneration.
+	trackGeneration        bool
+	batchStatusUpdates     bool
+	readyRequeueInterval   time.Duration
+	optimisticStatusWrites bool
+}
+
+// restampOnly reports whether next differs from current in its generation
+// alone.
+func restampOnly(current, next Condition) bool {
+	if current.ObservedGeneration == next.ObservedGeneration {
+		return false
+	}
+	next.ObservedGeneration = current.ObservedGeneration
+	return current.Equal(next)
+}
+
+// TrackGeneration stamps every condition this reconciler sets with the
+// object's generation. A pass stops at the first condition that changes, so
+// the ones after it can describe an older spec; the stamp lets a reader tell.
+//
+// A condition whose function returns ErrNoop is not set, so it keeps its old
+// stamp for as long as it does, and a reader waiting for the current one waits
+// that long. Conditions of a reconciler that tracks generations should not
+// return ErrNoop.
+func (r *ConditionedReconciler[T]) TrackGeneration() {
+	r.trackGeneration = true
+}
+
+// BatchStatusUpdates lets later conditions read earlier changes in the same
+// pass. Use it only when condition functions do not require those earlier
+// changes to have been persisted first. Hard errors and explicit skips
+// still stop a pass at the existing boundary.
+func (r *ConditionedReconciler[T]) BatchStatusUpdates() {
+	r.batchStatusUpdates = true
+}
+
+// ReadyRequeueInterval overrides periodic reconciliation for healthy objects.
+// Events and condition transitions still queue the object immediately.
+// A nonpositive interval retains the existing periodic schedule.
+func (r *ConditionedReconciler[T]) ReadyRequeueInterval(interval time.Duration) {
+	r.readyRequeueInterval = interval
+}
+
+// OptimisticStatusWrites prevents a stale cached object from publishing
+// status after another write advanced its resource version.
+func (r *ConditionedReconciler[T]) OptimisticStatusWrites() {
+	r.optimisticStatusWrites = true
 }
 
 // AddPreHook adds a function to be called before the conditions are evaluated.
@@ -240,6 +289,7 @@ func (r *ConditionedReconciler[T]) Reconcile(ctx context.Context, req reconcile.
 
 	reconcilerCtx := &ReconcilerContext{
 		ReconcileInterval: r.interval,
+		OptimisticLock:    r.optimisticStatusWrites,
 	}
 	condCtx := context.WithValue(ctx, ctxKeyReconcilerContext, reconcilerCtx)
 
@@ -259,44 +309,68 @@ func (r *ConditionedReconciler[T]) Reconcile(ctx context.Context, req reconcile.
 	for _, condEntry := range r.conditions {
 		currentCondition := conditions.GetCondition(condEntry.condition)
 
+		stamp := func(c Condition) Condition {
+			if !r.trackGeneration {
+				return c
+			}
+			c.ObservedGeneration = obj.GetGeneration()
+			// A restamp is not a transition.
+			if restampOnly(currentCondition, c) {
+				c.LastTransitionTime = currentCondition.LastTransitionTime
+			}
+			return c
+		}
+
+		batch := r.batchStatusUpdates
 		condErr := condEntry.fn(condCtx, obj)
 		if condErr != nil {
 			if errors.Is(condErr, errStatusUnknown) {
-				conditions.SetConditions(UnknownCondition(condEntry.condition, "Reconcile", condErr.Error()))
+				conditions.SetConditions(stamp(UnknownCondition(condEntry.condition, "Reconcile", condErr.Error())))
 			} else if errors.Is(condErr, errNoop) {
 				// NOTE(lxf): if the condition function returns ErrNoop, we skip the condition.
 				// This is useful for cases where we need to wait for a resource to be ready.
 				continue
 			} else if errors.Is(condErr, errStatusSkip) {
 				// If the condition function returns ErrSkipReconciliation, we cut the reconciliation short.
-				conditions.SetConditions(ReadyCondition(condEntry.condition))
+				conditions.SetConditions(stamp(ReadyCondition(condEntry.condition)))
 				break
 			} else {
-				conditions.SetConditions(ErrorCondition(condEntry.condition, "Reconcile", condErr))
+				conditions.SetConditions(stamp(ErrorCondition(condEntry.condition, "Reconcile", condErr)))
+				batch = false
 			}
 		} else {
-			conditions.SetConditions(ReadyCondition(condEntry.condition))
+			conditions.SetConditions(stamp(ReadyCondition(condEntry.condition)))
+		}
+
+		// A condition that only took the new generation still needs writing,
+		// but it has not changed state, so the pass goes on and every condition
+		// takes the new generation in one reconcile rather than one each.
+		if next := conditions.GetCondition(condEntry.condition); r.trackGeneration && restampOnly(currentCondition, next) {
+			reconcilerCtx.ForceUpdate = true
+			continue
 		}
 
 		// NOTE(lxf): we only update the status if the condition has changed.
 		if !currentCondition.Equal(conditions.GetCondition(condEntry.condition)) {
-			// NOTE(lxf): we always bail out of the loop to avoid partial updates.
-			// This also ensures conditions are updated in the correct order.
 			reconcilerCtx.ForceRequeue = true
 			reconcilerCtx.ForceUpdate = true
-			break
+			if !batch {
+				break
+			}
 		}
 	}
 
 	if reconcilerCtx.ForceUpdate {
-		patch := client.MergeFrom(originalObject)
-		if reconcilerCtx.OptimisticLock {
-			patch = client.MergeFromWithOptions(originalObject, client.MergeFromWithOptimisticLock{})
-		}
-		if err := r.client.Status().Patch(ctx, obj, patch); err != nil {
+		if err := r.patchStatus(ctx, originalObject, obj, reconcilerCtx.OptimisticLock); err != nil {
 			if apierrors.IsConflict(err) {
 				log.FromContext(ctx).V(1).Info("status patch built from a stale read was rejected; requeueing")
 				return reconcile.Result{RequeueAfter: time.Second}, nil
+			}
+			// A deleting object can finish going during this pass. On any other
+			// object NotFound is a real failure, such as a CRD with no status
+			// subresource.
+			if apierrors.IsNotFound(err) && !obj.GetDeletionTimestamp().IsZero() {
+				return reconcile.Result{}, nil
 			}
 			return reconcile.Result{}, err
 		}
@@ -317,5 +391,33 @@ func (r *ConditionedReconciler[T]) Reconcile(ctx context.Context, req reconcile.
 		return reconcile.Result{RequeueAfter: time.Second}, nil
 	}
 
-	return reconcile.Result{RequeueAfter: reconcilerCtx.ReconcileInterval}, nil
+	return reconcile.Result{RequeueAfter: r.periodicInterval(obj, reconcilerCtx.ReconcileInterval)}, nil
+}
+
+func (r *ConditionedReconciler[T]) periodicInterval(obj T, fallback time.Duration) time.Duration {
+	if r.readyRequeueInterval > 0 && obj.GetDeletionTimestamp().IsZero() {
+		ready := obj.ConditionedStatus().GetCondition(TypeReady)
+		if ready.Status == ConditionTrue &&
+			(ready.ObservedGeneration == 0 || ready.ObservedGeneration == obj.GetGeneration()) {
+			return r.readyRequeueInterval
+		}
+	}
+	return fallback
+}
+
+func (r *ConditionedReconciler[T]) patchStatus(ctx context.Context, original, obj T, optimisticLock bool) error {
+	patch := client.MergeFrom(original)
+	data, err := patch.Data(obj)
+	if err != nil {
+		return err
+	}
+	// Scale counters are recomputed on every pass. Sending an empty
+	// status patch still consumes API capacity for each Ready workload.
+	if string(data) == "{}" {
+		return nil
+	}
+	if optimisticLock {
+		patch = client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{})
+	}
+	return r.client.Status().Patch(ctx, obj, patch)
 }

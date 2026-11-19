@@ -10,7 +10,7 @@
 //! Requires Docker (NATS); marked `#[ignore]`, so it runs only under
 //! `cargo test --include-ignored` (CI's Linux leg) and not a plain `cargo test`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,7 +35,7 @@ fn msg_iface(name: &str, url: &str) -> WitInterface {
             .into_iter()
             .collect(),
         version: None,
-        config: HashMap::from([
+        config: wash_runtime::wit::Config::from_iter([
             ("backend".to_string(), "nats".to_string()),
             ("url".to_string(), url.to_string()),
         ]),
@@ -50,7 +50,7 @@ fn err(e: impl std::fmt::Debug) -> anyhow::Error {
 /// Start a fresh single-node NATS cluster in a container, returning the guard
 /// (kept alive for the test's duration) and its `nats://` url.
 async fn start_nats() -> Result<(ContainerAsync<GenericImage>, String)> {
-    let container = GenericImage::new("nats", "2.12.8-alpine")
+    let container = GenericImage::new("nats", "2.12.15-alpine")
         .with_exposed_port(4222.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Server is ready"))
         .start()
@@ -106,7 +106,7 @@ async fn multiplexed_messaging_routes_each_import_to_its_cluster() -> Result<()>
     let (_nats_a, url_a) = start_nats().await?;
     let (_nats_b, url_b) = start_nats().await?;
 
-    let plugin = MultiplexedMessaging::new().with_provider(Arc::new(NatsMsgProvider));
+    let plugin = MultiplexedMessaging::new().with_provider(Arc::new(NatsMsgProvider::default()));
     let interfaces = HashSet::from([msg_iface("team-a", &url_a), msg_iface("team-b", &url_b)]);
     let registry = plugin.build_registry(&interfaces).await?;
     let team_a = registry.get("team-a").expect("team-a routed").clone();

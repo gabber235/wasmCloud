@@ -4,7 +4,16 @@
 #
 #   sudo WASMCLOUD_BENCH_RUNNER_TOKEN=<TOKEN> bash scripts/bench/install-runner.sh \
 #     [--repo  wasmCloud/wasmCloud] \
-#     [--version 2.337.0]
+#     [--version 2.337.0] \
+#     [--label hetzner] [--nproc N] [--isolated-cpu N] [--no-cpufreq]
+#
+# --label is the host label workflows target with their `host` input
+# (.github/scripts/bench-host.mjs); hetzner is the dedicated host. --nproc and
+# --isolated-cpu tell the pre-flight what this host's online CPU count (with
+# nosmt) and isolated CPU are, when they differ from the dedicated host's 6
+# and 5. --no-cpufreq is for a VM whose hypervisor sets the clock and exposes
+# no cpufreq driver (EC2 Graviton): the pre-flight then skips its governor
+# check instead of failing on the missing sysfs nodes.
 #
 # The registration token is one-shot. Get one from:
 #   GitHub Repo > Settings > Actions > Runners > New self-hosted runner
@@ -19,7 +28,8 @@
 #   - installs rustup for the bench user (toolchain auto-installs on first
 #     build via the repo's rust-toolchain.toml)
 #   - downloads + verifies + extracts actions-runner to /opt/actions-runner
-#   - configures the runner with labels: self-hosted,bench,hetzner
+#   - configures the runner with labels: self-hosted,bench,<--label>
+#   - writes --nproc / --isolated-cpu into the runner's .env
 #   - registers a systemd service `actions.runner.<owner>-<repo>.bench-host`
 #     that starts on boot
 #   - creates /var/lib/bench/target with bench: ownership for $CARGO_TARGET_DIR
@@ -34,15 +44,20 @@ RUNNER_VERSION="2.337.0"
 # Default to the actual hostname of the box (set by installimage). Override with
 # --name if needed. No hardcoded value here — the box's identity isn't in the repo.
 RUNNER_NAME="$(hostname)"
-LABELS="self-hosted,bench,hetzner"
+HOST_LABEL="hetzner"
+EXPECTED_NPROC=""
+ISOLATED_CPU=""
 RUNNER_DIR="/opt/actions-runner"
 WORK_DIR="/var/lib/bench/work"
 TARGET_DIR="/var/lib/bench/target"
 
-# SHA256 of actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz, copied from
+# SHA256 of actions-runner-linux-<arch>-${RUNNER_VERSION}.tar.gz for each
+# architecture, copied from
 # https://github.com/actions/runner/releases/tag/v${RUNNER_VERSION}. Bump
-# both `RUNNER_VERSION` and this constant together.
-RUNNER_SHA256="70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613"
+# `RUNNER_VERSION` and both constants together.
+RUNNER_SHA256_X64="70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613"
+RUNNER_SHA256_ARM64="9b1dc70626422526e3c94767cf024896beb15da5342a3f4819bf2feac13e0393"
+NO_CPUFREQ=""
 
 usage() {
   sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
@@ -54,10 +69,25 @@ while [ $# -gt 0 ]; do
     --repo)    REPO="$2"; shift 2 ;;
     --version) RUNNER_VERSION="$2"; shift 2 ;;
     --name)    RUNNER_NAME="$2"; shift 2 ;;
+    --label)   HOST_LABEL="$2"; shift 2 ;;
+    --nproc)   EXPECTED_NPROC="$2"; shift 2 ;;
+    --isolated-cpu) ISOLATED_CPU="$2"; shift 2 ;;
+    --no-cpufreq) NO_CPUFREQ=1; shift ;;
     -h|--help) usage 0 ;;
     *)         echo "unknown arg: $1" >&2; usage 2 ;;
   esac
 done
+
+# Same shape as bench-host.mjs's parseHostLabel.
+[[ "$HOST_LABEL" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "invalid --label '$HOST_LABEL'"; exit 2; }
+[ -z "$EXPECTED_NPROC" ] || [[ "$EXPECTED_NPROC" =~ ^[1-9][0-9]*$ ]] || { echo "invalid --nproc '$EXPECTED_NPROC'"; exit 2; }
+[ -z "$ISOLATED_CPU" ] || [[ "$ISOLATED_CPU" =~ ^[0-9]+$ ]] || { echo "invalid --isolated-cpu '$ISOLATED_CPU'"; exit 2; }
+LABELS="self-hosted,bench,${HOST_LABEL}"
+if [ "$HOST_LABEL" = hetzner ]; then
+  HOSTNAME_VAR="WASMCLOUD_BENCH_HOSTNAME"
+else
+  HOSTNAME_VAR="WASMCLOUD_BENCH_$(printf '%s' "$HOST_LABEL" | tr 'a-z-' 'A-Z_')_HOSTNAME"
+fi
 
 [ "$(id -u)" -eq 0 ]                     || { echo "must run as root"; exit 1; }
 [ -n "${WASMCLOUD_BENCH_RUNNER_TOKEN:-}" ]         || { echo "WASMCLOUD_BENCH_RUNNER_TOKEN env var required"; exit 1; }
@@ -71,6 +101,18 @@ if ! id bench >/dev/null 2>&1; then
 fi
 mkdir -p "$WORK_DIR" "$TARGET_DIR"
 chown -R bench:bench /var/lib/bench
+# scripts/k6bench runs kind through Docker. provision.yml installs docker.io,
+# which creates the group; without it the k6bench workflow can't run here.
+# The workflow stops the socket-activated daemon after each run, so the next
+# criterion or gungraun bench doesn't share the host with it; that one command
+# is all the sudo the bench user gets.
+if getent group docker >/dev/null; then
+  usermod -aG docker bench
+  printf 'bench ALL=(root) NOPASSWD: /usr/bin/systemctl stop docker.service\n' \
+    >/etc/sudoers.d/bench-docker
+  chmod 0440 /etc/sudoers.d/bench-docker
+  visudo -cf /etc/sudoers.d/bench-docker
+fi
 
 step "install AWS CLI v2 + zstd"
 export DEBIAN_FRONTEND=noninteractive
@@ -140,9 +182,14 @@ step "download + verify + extract actions-runner v${RUNNER_VERSION}"
 mkdir -p "$RUNNER_DIR"
 chown bench:bench "$RUNNER_DIR"
 tarball="$RUNNER_DIR/runner.tgz"
-url="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
+case "$(uname -m)" in
+  x86_64)  runner_arch=x64;   runner_sha256="$RUNNER_SHA256_X64" ;;
+  aarch64) runner_arch=arm64; runner_sha256="$RUNNER_SHA256_ARM64" ;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+url="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${runner_arch}-${RUNNER_VERSION}.tar.gz"
 sudo -u bench bash -c "curl -fL -o '$tarball' '$url'"
-echo "${RUNNER_SHA256}  ${tarball}" | sha256sum -c -
+echo "${runner_sha256}  ${tarball}" | sha256sum -c -
 sudo -u bench bash -c "cd '$RUNNER_DIR' && tar xzf runner.tgz && rm runner.tgz"
 
 step "configure runner (registers with GitHub)"
@@ -168,6 +215,17 @@ sudo --preserve-env=WASMCLOUD_BENCH_RUNNER_TOKEN,WASMCLOUD_BENCH_REPO,WASMCLOUD_
     --work "${WASMCLOUD_BENCH_WORK}"
 '
 
+# The runner loads .env (written by config.sh) into every job.
+if [ -n "$EXPECTED_NPROC" ]; then
+  echo "WASMCLOUD_BENCH_EXPECTED_NPROC=${EXPECTED_NPROC}" >> "$RUNNER_DIR/.env"
+fi
+if [ -n "$ISOLATED_CPU" ]; then
+  echo "WASMCLOUD_BENCH_ISOLATED_CPU=${ISOLATED_CPU}" >> "$RUNNER_DIR/.env"
+fi
+if [ -n "$NO_CPUFREQ" ]; then
+  echo "WASMCLOUD_BENCH_NO_CPUFREQ=1" >> "$RUNNER_DIR/.env"
+fi
+
 step "install + start systemd service"
 cd "$RUNNER_DIR"
 ./svc.sh install bench
@@ -186,5 +244,9 @@ Runner registered:
 Confirm in GitHub: Settings > Actions > Runners (the new runner should
 appear as Idle within a few seconds).
 
-Trigger a run from: Actions > bench > Run workflow.
+Set the repo variable the pre-flight checks this host against
+(Settings > Secrets and variables > Actions > Variables):
+  ${HOSTNAME_VAR}=$(hostname)
+
+Trigger a run from: Actions > bench > Run workflow (host: ${HOST_LABEL}).
 EOM

@@ -7,14 +7,16 @@
 //! bodies are buffered in memory — the host layers already buffer guest streams
 //! before handing them off, so the backend reads/writes whole `Vec<u8>`s.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_nats::jetstream::object_store::{self, ObjectStore};
 use futures::StreamExt;
 use tokio::io::AsyncReadExt;
 
-use crate::plugin::multiplex::BackendProvider;
+use crate::plugin::PluginEgressPolicy;
+use crate::plugin::multiplex::{
+    BackendProvider, check_nats_url, check_nats_url_resolved, connect_nats,
+};
 
 use super::{
     BlobBackend, BlobBackendError, BlobId, BlobResult, ContainerInfo, ObjectInfo, clamp_range,
@@ -205,26 +207,56 @@ impl BlobBackend for NatsBlobBackend {
 /// Requires `config.url` (e.g. `nats://127.0.0.1:4222`). Pooled by url, so
 /// interfaces sharing a server share one connection.
 #[derive(Default)]
-pub struct NatsBlobProvider;
+pub struct NatsBlobProvider {
+    ignore_discovered_servers: bool,
+}
+
+impl NatsBlobProvider {
+    /// Restrict connections to their configured URL even without an egress policy.
+    pub fn with_ignore_discovered_servers(mut self, ignore: bool) -> Self {
+        self.ignore_discovered_servers = ignore;
+        self
+    }
+}
 
 #[async_trait::async_trait]
 impl BackendProvider<BlobId> for NatsBlobProvider {
-    fn pool_key(&self, config: &HashMap<String, String>) -> Option<String> {
-        config.get("url").cloned()
+    fn pool_key(&self, config: &crate::wit::Config) -> Option<String> {
+        config.expose("url").map(str::to_string)
     }
 
     fn backend_type(&self) -> &'static str {
         "nats"
     }
 
-    async fn instantiate(&self, config: &HashMap<String, String>) -> anyhow::Result<BlobId> {
+    async fn instantiate(
+        &self,
+        config: &crate::wit::Config,
+        egress: Option<&PluginEgressPolicy>,
+    ) -> anyhow::Result<BlobId> {
         let url = config
-            .get("url")
+            .value("url")
             .ok_or_else(|| anyhow::anyhow!("nats blobstore backend requires a 'url' config"))?;
-        let client = async_nats::connect(url).await?;
+        let client = connect_nats(url, egress, self.ignore_discovered_servers).await?;
         let context = async_nats::jetstream::new(client);
         Ok(Arc::new(NatsBlobBackend {
             context: Arc::new(context),
         }))
+    }
+
+    fn check_egress(
+        &self,
+        config: &crate::wit::Config,
+        policy: &PluginEgressPolicy,
+    ) -> anyhow::Result<()> {
+        check_nats_url(config, policy)
+    }
+
+    async fn check_resolved_egress(
+        &self,
+        config: &crate::wit::Config,
+        policy: &PluginEgressPolicy,
+    ) -> anyhow::Result<()> {
+        check_nats_url_resolved(config, policy).await
     }
 }

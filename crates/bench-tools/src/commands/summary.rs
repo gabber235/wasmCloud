@@ -43,6 +43,12 @@ pub fn run(args: Args) -> Result<()> {
     if crate::callgrind::is_instruction_bench(&args.bench) {
         return render_gungraun_stub(&mut out, &args.bench, &meta, &target_dir, &run_id);
     }
+    if let Some(reports) = crate::commands::jsonl::pressure_reports(&target_dir, &args.bench)? {
+        return render_pressure(&mut out, &args.bench, &meta, &reports);
+    }
+    if let Some(reports) = crate::commands::jsonl::density_reports(&target_dir, &args.bench)? {
+        return render_density(&mut out, &args.bench, &meta, &reports);
+    }
 
     let crit_dir = criterion::dir_from_target(&target_dir);
     let marker = target_dir.join(format!(".bench-start-{}", args.bench));
@@ -145,6 +151,126 @@ fn render_gungraun_stub<W: Write>(
                 markdown::fmt_thousands(row.ir),
             )?;
         }
+    }
+    Ok(())
+}
+
+fn render_density<W: Write>(
+    out: &mut W,
+    bench: &str,
+    meta: &Meta,
+    reports: &[bench_tools::density::Report],
+) -> Result<()> {
+    writeln!(out, "## bench: `{bench}` (density)")?;
+    writeln!(out)?;
+    let memory_limit_name = if bench == "scale_density" {
+        "max-process-memory"
+    } else {
+        "memory limit"
+    };
+    let limits: std::collections::BTreeSet<_> = reports
+        .iter()
+        .map(|report| report.memory_limit_bytes)
+        .collect();
+    let limits = limits
+        .into_iter()
+        .map(|bytes| {
+            if bytes == 0 {
+                "-".into()
+            } else {
+                format!("{:.2} GiB", bytes as f64 / (1_u64 << 30) as f64)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(
+        out,
+        "_commit_ `{}` &middot; _ref_ `{}` &middot; _host_ `{}` &middot; _cpus_ {} &middot; _{memory_limit_name}_ {limits}",
+        meta.short_sha, meta.ref_name, meta.host, meta.cpus_online,
+    )?;
+    writeln!(out)?;
+    writeln!(out, "| flavour | {memory_limit_name} |")?;
+    writeln!(out, "|---|---:|")?;
+    for report in reports {
+        let limit = if report.memory_limit_bytes == 0 {
+            "-".into()
+        } else {
+            bench_tools::density::render_bytes(report.memory_limit_bytes)
+        };
+        writeln!(out, "| {} | {limit} |", report.label)?;
+    }
+    writeln!(out)?;
+    writeln!(
+        out,
+        "| flavour | metric | value | unit | better | stopped by |"
+    )?;
+    writeln!(out, "|---|---|---:|---|---|---|")?;
+    for report in reports {
+        for metric in report.metrics() {
+            writeln!(
+                out,
+                "| {} | {} | {:.2} | {} | {} | {} |",
+                report.label,
+                metric.name,
+                metric.value,
+                metric.unit,
+                metric.better.as_str(),
+                report.stop,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn render_pressure<W: Write>(
+    out: &mut W,
+    bench: &str,
+    meta: &Meta,
+    reports: &[bench_tools::pressure::Report],
+) -> Result<()> {
+    use bench_tools::density::render_bytes;
+    use bench_tools::pressure::Phase;
+    let bytes = |n: Option<u64>| n.map_or_else(|| "-".into(), render_bytes);
+    writeln!(out, "## bench: `{bench}` (pressure)")?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "_commit_ `{}` &middot; _ref_ `{}` &middot; _host_ `{}` &middot; _cpus_ {}",
+        meta.short_sha, meta.ref_name, meta.host, meta.cpus_online,
+    )?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "| case | outcome | admitted / budget | completed | charged | uncharged | cgroup peak | THP (anon / shmem) | stopped by |"
+    )?;
+    writeln!(out, "|---|---|---:|---:|---:|---:|---:|---|---|")?;
+    for report in reports {
+        let ready = report.sample(Phase::Ready);
+        // THP for anonymous memories (CoW off), then for image mappings (CoW on).
+        let thp = report.host.as_ref().map_or_else(
+            || "-".to_owned(),
+            |h| {
+                format!(
+                    "{} / {}",
+                    h.transparent_hugepage.as_deref().unwrap_or("-"),
+                    h.shmem_hugepage.as_deref().unwrap_or("-")
+                )
+            },
+        );
+        writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            report.case.label(),
+            report.outcome.map_or("-", |o| o.name()),
+            report.admissions(),
+            report.completed(),
+            bytes(ready.map(|s| s.guest_memory_bytes)),
+            bytes(ready.map(|s| s.initial_memory_bytes)),
+            bytes(report.cgroup_peak()),
+            thp,
+            // One table row: escape cell separators and fold line breaks.
+            report.stop.replace('|', "\\|").replace(['\r', '\n'], " "),
+        )?;
     }
     Ok(())
 }

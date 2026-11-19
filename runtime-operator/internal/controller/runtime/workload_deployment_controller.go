@@ -7,9 +7,12 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -21,7 +24,7 @@ import (
 
 const (
 	workloadDeploymentReconcileInterval = 1 * time.Minute
-	workloadDeploymentNameIndex         = "workload.deployment.name"
+	workloadDeploymentOwnerIndex        = "workload.deployment.owner"
 	// workloadDeploymentNameLabel is stamped onto the ReplicaSets a deployment
 	// owns and exposed via the /scale subresource's selector so HPA/KEDA can
 	// identify the deployment's workloads.
@@ -31,8 +34,11 @@ const (
 // WorkloadDeploymentReconciler reconciles a WorkloadReplicaSet object
 type WorkloadDeploymentReconciler struct {
 	client.Client
-	Scheme     *runtime.Scheme
-	reconciler condition.AnyConditionedReconciler
+	ReadyRequeueInterval time.Duration
+	APIReader            client.Reader
+	Scheme               *runtime.Scheme
+	Recorder             events.EventRecorder
+	reconciler           condition.AnyConditionedReconciler
 }
 
 func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -40,9 +46,15 @@ func (r *WorkloadDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.R
 }
 
 func (r *WorkloadDeploymentReconciler) reconcileArtifacts(ctx context.Context, deployment *runtimev1alpha1.WorkloadDeployment) error {
-	for _, configArtifact := range deployment.Spec.Artifacts {
+	return checkArtifactsPublished(ctx, r.Client, deployment.Namespace, deployment.Spec.Artifacts)
+}
+
+// checkArtifactsPublished returns a status-unknown error until every
+// referenced Artifact exists and is published.
+func checkArtifactsPublished(ctx context.Context, kubeClient client.Client, namespace string, artifactsFrom []runtimev1alpha1.WorkloadDeploymentArtifact) error {
+	for _, configArtifact := range artifactsFrom {
 		artifact := &runtimev1alpha1.Artifact{}
-		if err := r.Get(ctx, client.ObjectKey{Name: configArtifact.ArtifactFrom.Name, Namespace: deployment.Namespace}, artifact); err != nil {
+		if err := kubeClient.Get(ctx, client.ObjectKey{Name: configArtifact.ArtifactFrom.Name, Namespace: namespace}, artifact); err != nil {
 			if client.IgnoreNotFound(err) == nil {
 				return condition.ErrStatusUnknown(fmt.Errorf("artifact %s not found", configArtifact.ArtifactFrom.Name))
 			}
@@ -67,11 +79,21 @@ func (r *WorkloadDeploymentReconciler) reconcileSync(ctx context.Context, deploy
 
 	currentReplica := &runtimev1alpha1.WorkloadReplicaSet{}
 
-	if err := r.Get(ctx, client.ObjectKey{Name: deployment.Status.CurrentReplicaSet.Name, Namespace: deployment.Namespace}, currentReplica); err != nil {
-		if client.IgnoreNotFound(err) == nil {
+	key := client.ObjectKey{Name: deployment.Status.CurrentReplicaSet.Name, Namespace: deployment.Namespace}
+	err := r.Get(ctx, key, currentReplica)
+	// A newly created ReplicaSet may not have reached the cache. Treating
+	// that lag as deletion causes Deploy to create a replacement every pass.
+	if apierrors.IsNotFound(err) && r.APIReader != nil {
+		err = r.APIReader.Get(ctx, key, currentReplica)
+	}
+	if err != nil {
+		if apierrors.IsNotFound(err) {
 			return condition.ErrStatusUnknown(fmt.Errorf("current ReplicaSet not found"))
 		}
 		return err
+	}
+	if !metav1.IsControlledBy(currentReplica, deployment) {
+		return condition.ErrStatusUnknown(fmt.Errorf("current ReplicaSet %s belongs to another owner", currentReplica.Name))
 	}
 
 	templateCopy := deployment.Spec.Template.DeepCopy()
@@ -90,6 +112,11 @@ func (r *WorkloadDeploymentReconciler) reconcileSync(ctx context.Context, deploy
 }
 
 func (r *WorkloadDeploymentReconciler) reconcileDeploy(ctx context.Context, deployment *runtimev1alpha1.WorkloadDeployment) error {
+	// The garbage collector is removing or orphaning this Deployment's ReplicaSets.
+	if !deployment.DeletionTimestamp.IsZero() {
+		return condition.ErrNoop()
+	}
+
 	// Nothing to do if deployment is synced
 	if deployment.Status.AllTrue(
 		runtimev1alpha1.WorkloadDeploymentConditionArtifact,
@@ -113,7 +140,8 @@ func (r *WorkloadDeploymentReconciler) reconcileDeploy(ctx context.Context, depl
 		replicaSetTemplate.Template.Spec.Kubernetes = deployment.Spec.Kubernetes.DeepCopy()
 	}
 
-	replicaSetName := fmt.Sprintf("%s-%s", deployment.Name, randHash())
+	replicaSetName := rolloutChildName(deployment.Name, fmt.Sprintf("%s:%d:%s",
+		deployment.UID, deployment.Generation, replicaSetTemplate.Template.Hash()))
 
 	// Copy the deployment's labels and stamp the managed selector label so the
 	// /scale subresource's selector actually matches this deployment's
@@ -137,10 +165,30 @@ func (r *WorkloadDeploymentReconciler) reconcileDeploy(ctx context.Context, depl
 		return err
 	}
 	if err := r.Create(ctx, newReplicaSet); err != nil {
-		return err
+		if !apierrors.IsAlreadyExists(err) {
+			if isRefused(err) {
+				recordRefused(r.Recorder, deployment, nil, "Create", "WorkloadReplicaSet create refused", err)
+			}
+			return fmt.Errorf("creating WorkloadReplicaSet: %w", err)
+		}
+		// A successful Create can precede a failed status write or a stale
+		// Deployment cache read. Reuse only this rollout's owned child.
+		reader := r.APIReader
+		if reader == nil {
+			reader = r.Client
+		}
+		existing := &runtimev1alpha1.WorkloadReplicaSet{}
+		if err := reader.Get(ctx, client.ObjectKeyFromObject(newReplicaSet), existing); err != nil {
+			return err
+		}
+		if !existing.DeletionTimestamp.IsZero() || !metav1.IsControlledBy(existing, deployment) ||
+			!apiequality.Semantic.DeepDerivative(newReplicaSet.Spec, existing.Spec) {
+			return fmt.Errorf("WorkloadReplicaSet %s exists with different ownership or spec, or is terminating", replicaSetName)
+		}
 	}
 
-	if deployment.Spec.DeployPolicy != runtimev1alpha1.WorkloadDeployPolicyRecreate {
+	if deployment.Spec.DeployPolicy != runtimev1alpha1.WorkloadDeployPolicyRecreate &&
+		(deployment.Status.CurrentReplicaSet == nil || deployment.Status.CurrentReplicaSet.Name != replicaSetName) {
 		// the default policy is rolling
 		deployment.Status.PreviousReplicaSet = deployment.Status.CurrentReplicaSet
 	}
@@ -152,6 +200,15 @@ func (r *WorkloadDeploymentReconciler) reconcileDeploy(ctx context.Context, depl
 }
 
 func (r *WorkloadDeploymentReconciler) reconcileScale(ctx context.Context, deployment *runtimev1alpha1.WorkloadDeployment) error {
+	if !deployment.DeletionTimestamp.IsZero() {
+		replicaSets, err := r.ownedReplicaSets(ctx, deployment)
+		if err != nil {
+			return err
+		}
+		r.setScaleStatus(ctx, deployment, replicaSets)
+		return condition.ErrNoop()
+	}
+
 	if !deployment.Status.AllTrue(runtimev1alpha1.WorkloadDeploymentConditionSync, runtimev1alpha1.WorkloadDeploymentConditionDeploy) {
 		return condition.ErrStatusUnknown(fmt.Errorf("deployment is not synced or not deployed"))
 	}
@@ -173,57 +230,76 @@ func (r *WorkloadDeploymentReconciler) reconcileScale(ctx context.Context, deplo
 	}, currentReplica); err != nil {
 		return err
 	}
+	if !metav1.IsControlledBy(currentReplica, deployment) {
+		return condition.ErrStatusUnknown(fmt.Errorf("current ReplicaSet %s belongs to another owner", currentReplica.Name))
+	}
 
 	// If all we touched was the replica-count, update-it
-	if deployment.Spec.Replicas != nil {
-		currentReplica.Spec.Replicas = deployment.Spec.Replicas
-		if err := r.Update(ctx, currentReplica); err != nil {
+	if deployment.Spec.Replicas != nil &&
+		(currentReplica.Spec.Replicas == nil || *currentReplica.Spec.Replicas != *deployment.Spec.Replicas) {
+		if err := r.confirmDeploymentForScale(ctx, deployment); err != nil {
 			return err
 		}
+		currentReplica.Spec.Replicas = deployment.Spec.Replicas
+		if err := r.Update(ctx, currentReplica); err != nil {
+			if isRefused(err) {
+				recordRefused(r.Recorder, deployment, currentReplica, "Update", "WorkloadReplicaSet update refused", err)
+			}
+			return fmt.Errorf("updating WorkloadReplicaSet %s: %w", curSetName, err)
+		}
 	}
-
-	expectedReplicas := int32(0)
-	if deployment.Spec.Replicas != nil {
-		expectedReplicas = *deployment.Spec.Replicas
-	}
-	currentReplicas := int32(0)
-	readyReplicas := int32(0)
-	unavailableReplicas := int32(0)
 
 	// Delete any ReplicaSet except current & previous
-	replicaSets := &runtimev1alpha1.WorkloadReplicaSetList{}
-	if err := r.List(ctx, replicaSets, client.InNamespace(deployment.Namespace), client.MatchingFields{workloadDeploymentNameIndex: deployment.Name}); err != nil {
+	replicaSets, err := r.ownedReplicaSets(ctx, deployment)
+	if err != nil {
 		return err
 	}
-	for _, rs := range replicaSets.Items {
-		if rsStatus := rs.Status.Replicas; rsStatus != nil {
-			currentReplicas += rsStatus.Current
-			readyReplicas += rsStatus.Ready
-			unavailableReplicas += rsStatus.Unavailable
-		}
+	for i := range replicaSets {
+		rs := &replicaSets[i]
 		if rs.Name == curSetName || rs.Name == prevSetName {
 			continue
 		}
-		if err := r.Delete(ctx, &rs); err != nil {
+		if err := r.confirmDeploymentForScale(ctx, deployment); err != nil {
+			return err
+		}
+		if err := deleteObservedChild(ctx, r.Client, rs); err != nil {
 			return err
 		}
 	}
 
-	condition.ForceStatusUpdate(ctx)
-	deploymentStatus := &runtimev1alpha1.ReplicaSetStatus{
-		Expected:    expectedReplicas,
-		Current:     currentReplicas,
-		Ready:       readyReplicas,
-		Unavailable: unavailableReplicas,
-	}
-	deployment.Status.Replicas = deploymentStatus
+	replicas := r.setScaleStatus(ctx, deployment, replicaSets)
 
-	// Populate the flat /scale subresource fields (statusReplicasPath +
-	// selectorpath) so HPA/KEDA can read the current replica count and a
-	// non-empty selector. Set even on the not-available path below so status
-	// reflects what the operator observed.
-	deployment.Status.CurrentReplicas = currentReplicas
-	deployment.Status.Selector = labels.Set{workloadDeploymentNameLabel: deployment.Name}.String()
+	// A ReplicaSet that cannot scale will not become available on its own,
+	// so its reason is surfaced here rather than left on a generated name.
+	// Only a failure computed for its current spec counts: a refusal of a
+	// replica count since lowered describes nothing now. This comes before
+	// the wait below, because a failing condition can be what keeps the ones
+	// after it from catching up.
+	for _, ct := range []condition.ConditionType{
+		runtimev1alpha1.WorkloadReplicaSetConditionScaleUp,
+		runtimev1alpha1.WorkloadReplicaSetConditionScaleDown,
+	} {
+		c := currentReplica.Status.GetCondition(ct)
+		if c.Status == condition.ConditionFalse && c.ObservedGeneration == currentReplica.Generation {
+			return fmt.Errorf("WorkloadReplicaSet %s %s: %s", curSetName, c.Type, c.Message)
+		}
+	}
+
+	// Until the ReplicaSet has caught up with its spec, which is one
+	// reconcile, Scale keeps saying what it said, so a replica change does not
+	// flicker it. A ReplicaSet with no conditions yet has never been
+	// reconciled, and falls through to the gate below.
+	if len(currentReplica.Status.Conditions) > 0 {
+		for _, ct := range []condition.ConditionType{
+			runtimev1alpha1.WorkloadReplicaSetConditionScaleUp,
+			runtimev1alpha1.WorkloadReplicaSetConditionScaleDown,
+			condition.TypeReady,
+		} {
+			if currentReplica.Status.GetCondition(ct).ObservedGeneration != currentReplica.Generation {
+				return condition.ErrNoop()
+			}
+		}
+	}
 
 	// Gate Scale on the active ReplicaSet actually being available, so
 	// WorkloadDeployment.Ready==True implies the underlying Workload is
@@ -232,17 +308,12 @@ func (r *WorkloadDeploymentReconciler) reconcileScale(ctx context.Context, deplo
 	if !currentReplica.Status.IsAvailable() {
 		return condition.ErrStatusUnknown(fmt.Errorf(
 			"current ReplicaSet not available yet: ready=%d unavailable=%d expected=%d",
-			readyReplicas, unavailableReplicas, expectedReplicas))
+			replicas.Ready, replicas.Unavailable, replicas.Expected))
 	}
 
 	if prevSetName != "" {
-		if err := r.Delete(ctx, &runtimev1alpha1.WorkloadReplicaSet{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      prevSetName,
-				Namespace: deployment.Namespace,
-			},
-		}); err != nil {
-			if client.IgnoreNotFound(err) != nil {
+		if prevSetName != curSetName {
+			if err := r.deletePreviousReplicaSet(ctx, deployment, prevSetName); err != nil {
 				return err
 			}
 		}
@@ -254,12 +325,102 @@ func (r *WorkloadDeploymentReconciler) reconcileScale(ctx context.Context, deplo
 	return nil
 }
 
+func (r *WorkloadDeploymentReconciler) deletePreviousReplicaSet(
+	ctx context.Context, deployment *runtimev1alpha1.WorkloadDeployment, name string,
+) error {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
+	}
+	previous := &runtimev1alpha1.WorkloadReplicaSet{}
+	err := reader.Get(ctx, client.ObjectKey{Namespace: deployment.Namespace, Name: name}, previous)
+	if client.IgnoreNotFound(err) != nil {
+		return err
+	}
+	if err == nil && metav1.IsControlledBy(previous, deployment) {
+		if err := r.confirmDeploymentForScale(ctx, deployment); err != nil {
+			return err
+		}
+		if err := deleteObservedChild(ctx, r.Client, previous); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// A deployment's status patch is optimistic, but scaling and retiring children
+// already have side effects by the time that patch runs. Check the parent
+// before those writes, since a stale current/previous pair can retire the new set.
+func (r *WorkloadDeploymentReconciler) confirmDeploymentForScale(ctx context.Context, deployment *runtimev1alpha1.WorkloadDeployment) error {
+	if r.APIReader == nil {
+		return nil
+	}
+	current := &runtimev1alpha1.WorkloadDeployment{}
+	err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(deployment), current)
+	if client.IgnoreNotFound(err) != nil {
+		return err
+	}
+	if err != nil || current.UID != deployment.UID || current.ResourceVersion != deployment.ResourceVersion {
+		condition.ForceRequeue(ctx)
+		return condition.ErrNoop()
+	}
+	return nil
+}
+
+func (r *WorkloadDeploymentReconciler) ownedReplicaSets(ctx context.Context, deployment *runtimev1alpha1.WorkloadDeployment) ([]runtimev1alpha1.WorkloadReplicaSet, error) {
+	replicaSets := &runtimev1alpha1.WorkloadReplicaSetList{}
+	if err := r.List(ctx, replicaSets, client.InNamespace(deployment.Namespace), client.MatchingFields{workloadDeploymentOwnerIndex: string(deployment.UID)}); err != nil {
+		return nil, err
+	}
+	return replicaSets.Items, nil
+}
+
+// setScaleStatus reports the replicas of replicaSets on the Deployment.
+func (r *WorkloadDeploymentReconciler) setScaleStatus(
+	ctx context.Context,
+	deployment *runtimev1alpha1.WorkloadDeployment,
+	replicaSets []runtimev1alpha1.WorkloadReplicaSet,
+) *runtimev1alpha1.ReplicaSetStatus {
+	replicas := &runtimev1alpha1.ReplicaSetStatus{}
+	if deployment.Spec.Replicas != nil {
+		replicas.Expected = *deployment.Spec.Replicas
+	}
+	for i := range replicaSets {
+		if rsStatus := replicaSets[i].Status.Replicas; rsStatus != nil {
+			replicas.Current += rsStatus.Current
+			replicas.Ready += rsStatus.Ready
+			replicas.Unavailable += rsStatus.Unavailable
+		}
+	}
+
+	condition.ForceStatusUpdate(ctx)
+	deployment.Status.Replicas = replicas
+
+	// Populate the flat /scale subresource fields (statusReplicasPath +
+	// selectorpath) so HPA/KEDA can read the current replica count and a
+	// non-empty selector, even while the current ReplicaSet isn't available, so
+	// status reflects what the operator observed.
+	deployment.Status.CurrentReplicas = replicas.Current
+	deployment.Status.Selector = labels.Set{workloadDeploymentNameLabel: deployment.Name}.String()
+	return replicas
+}
+
 func (r *WorkloadDeploymentReconciler) reconcileReady(_ context.Context, deployment *runtimev1alpha1.WorkloadDeployment) error {
-	if !deployment.Status.AllTrue(
+	if !deployment.DeletionTimestamp.IsZero() {
+		return condition.ErrStatusUnknown(fmt.Errorf("deployment is being deleted"))
+	}
+	conditions := []condition.ConditionType{
 		runtimev1alpha1.WorkloadDeploymentConditionArtifact,
 		runtimev1alpha1.WorkloadDeploymentConditionSync,
 		runtimev1alpha1.WorkloadDeploymentConditionDeploy,
-		runtimev1alpha1.WorkloadDeploymentConditionScale) {
+		runtimev1alpha1.WorkloadDeploymentConditionScale,
+	}
+	// Unknown either way: Sync fails on every rollout until the new
+	// ReplicaSet exists, which is progress rather than failure.
+	if failed, ok := firstFailed(&deployment.Status.ConditionedStatus, conditions...); ok {
+		return condition.ErrStatusUnknown(fmt.Errorf("%s: %s", failed.Type, failed.Message))
+	}
+	if !deployment.Status.AllTrue(conditions...) {
 		return condition.ErrStatusUnknown(fmt.Errorf("deployment is not synced, deployed or scaled"))
 	}
 	return nil
@@ -271,11 +432,15 @@ func (r *WorkloadDeploymentReconciler) reconcileReady(_ context.Context, deploym
 // +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=workloaddeployments/finalizers,verbs=update
 
 func (r *WorkloadDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.APIReader = mgr.GetAPIReader()
 	reconciler := condition.NewConditionedReconciler(
 		r.Client,
 		r.Scheme,
 		&runtimev1alpha1.WorkloadDeployment{},
 		workloadDeploymentReconcileInterval)
+	reconciler.ReadyRequeueInterval(r.ReadyRequeueInterval)
+	reconciler.OptimisticStatusWrites()
+	reconciler.BatchStatusUpdates()
 
 	reconciler.SetCondition(runtimev1alpha1.WorkloadDeploymentConditionArtifact, r.reconcileArtifacts)
 	reconciler.SetCondition(runtimev1alpha1.WorkloadDeploymentConditionSync, r.reconcileSync)
@@ -291,9 +456,9 @@ func (r *WorkloadDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		return err
 	}
 
-	err = mgr.GetFieldIndexer().IndexField(context.Background(), &runtimev1alpha1.WorkloadReplicaSet{}, workloadDeploymentNameIndex, func(rawObj client.Object) []string {
-		if ownerName, ok := isOwnedByController(rawObj, deploymentGvk); ok {
-			return []string{ownerName}
+	err = mgr.GetFieldIndexer().IndexField(context.Background(), &runtimev1alpha1.WorkloadReplicaSet{}, workloadDeploymentOwnerIndex, func(rawObj client.Object) []string {
+		if ownerUID, ok := controllerUID(rawObj, deploymentGvk); ok {
+			return []string{ownerUID}
 		}
 
 		return []string{}

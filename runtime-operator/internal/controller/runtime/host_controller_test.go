@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"golang.org/x/sync/semaphore"
 	"google.golang.org/protobuf/encoding/protojson"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -43,17 +45,16 @@ const (
 	testHostGroup       = "default"
 )
 
-// requiredHostStatusKeys are the status fields the Host CRD marks as required.
-// The heartbeat handler's status write is rejected unless every one of these
-// keys is present in the patched object.
-var requiredHostStatusKeys = []string{
+// hostStatusMeasuredKeys are the status fields reconcileReporting writes
+// from measured data. hostStatusPatch must never set them.
+var hostStatusMeasuredKeys = []string{
 	"version", "osName", "osArch", "osKernel",
 	"systemCPUUsage", "systemMemoryTotal", "systemMemoryFree",
 }
 
-func patchStatusKeys(t *testing.T, status *runtimev1alpha1.HostStatus) map[string]json.RawMessage {
+func patchStatusKeys(t *testing.T) map[string]json.RawMessage {
 	t.Helper()
-	raw, err := hostStatusPatch(status)
+	raw, err := hostStatusPatch("")
 	if err != nil {
 		t.Fatalf("hostStatusPatch: %v", err)
 	}
@@ -66,49 +67,18 @@ func patchStatusKeys(t *testing.T, status *runtimev1alpha1.HostStatus) map[strin
 	return p.Status
 }
 
-// TestHostStatusPatch_EmptyStatusInjectsRequiredKeys ensures that lastSeen is always
-// populated in the patch, even for an empty status. Other keys required are also tested
-// to ensure the patch is valid for the CRD.
-func TestHostStatusPatch_EmptyStatusInjectsRequiredKeys(t *testing.T) {
-	keys := patchStatusKeys(t, &runtimev1alpha1.HostStatus{})
+// TestHostStatusPatch_OnlyLastSeen ensures the heartbeat patch carries only
+// lastSeen, so it never clobbers fields owned by reconcileReporting or the
+// ConditionedReconciler.
+func TestHostStatusPatch_OnlyLastSeen(t *testing.T) {
+	keys := patchStatusKeys(t)
 
 	if _, ok := keys["lastSeen"]; !ok {
 		t.Errorf("lastSeen must always be present in the patch")
 	}
-	for _, k := range requiredHostStatusKeys {
-		if _, ok := keys[k]; !ok {
-			t.Errorf("required key %q missing from patch for empty status", k)
-		}
-	}
-	// Conditions and the optional counts must never be in this patch — they are
-	// owned by the ConditionedReconciler / reconcileReporting respectively.
-	for _, k := range []string{"conditions", "componentCount", "workloadCount"} {
+	for _, k := range append(hostStatusMeasuredKeys, "conditions", "componentCount", "workloadCount") {
 		if _, ok := keys[k]; ok {
 			t.Errorf("patch must not include %q", k)
-		}
-	}
-}
-
-// TestHostStatusPatch_ReportedFieldsPreserved ensures already-reported values
-// are omitted from the patch so the heartbeat handler never clobbers real data
-// written by reconcileReporting — only lastSeen is refreshed.
-func TestHostStatusPatch_ReportedFieldsPreserved(t *testing.T) {
-	keys := patchStatusKeys(t, &runtimev1alpha1.HostStatus{
-		Version:           testVersion,
-		OSName:            testOSName,
-		OSArch:            testOSArch,
-		OSKernel:          testOSKernel,
-		SystemCPUUsage:    testCPUUsage,
-		SystemMemoryTotal: 16000,
-		SystemMemoryFree:  8000,
-	})
-
-	if _, ok := keys["lastSeen"]; !ok {
-		t.Errorf("lastSeen must always be present in the patch")
-	}
-	for _, k := range requiredHostStatusKeys {
-		if _, ok := keys[k]; ok {
-			t.Errorf("reported field %q must be omitted to avoid clobbering its real value", k)
 		}
 	}
 }
@@ -172,13 +142,15 @@ func TestHostStatusPatch_SatisfiesCRDRequired(t *testing.T) {
 	}
 
 	// host.Status is empty here, exactly as it is the first time the heartbeat
-	// handler patches a host that reconcileReporting has not polled yet.
-	patch, err := hostStatusPatch(&host.Status)
+	// handler patches a host that reconcileReporting has not polled yet. The
+	// seven measured fields are optional now, so the API server must accept
+	// this patch leaving them unset.
+	patch, err := hostStatusPatch("")
 	if err != nil {
 		t.Fatalf("hostStatusPatch: %v", err)
 	}
 	if err := c.Status().Patch(ctx, host, client.RawPatch(types.MergePatchType, patch)); err != nil {
-		t.Fatalf("status patch rejected by API server (required-field regression?): %v", err)
+		t.Fatalf("status patch rejected by API server (optional-field regression?): %v", err)
 	}
 
 	got := &runtimev1alpha1.Host{}
@@ -188,8 +160,8 @@ func TestHostStatusPatch_SatisfiesCRDRequired(t *testing.T) {
 	if got.Status.LastSeen.IsZero() {
 		t.Errorf("expected lastSeen to be set after patch")
 	}
-	if got.Status.OSArch == "" || got.Status.Version == "" {
-		t.Errorf("expected required string fields to be defaulted, got %+v", got.Status)
+	if got.Status.OSArch != "" || got.Status.Version != "" {
+		t.Errorf("expected unmeasured fields to stay empty rather than be defaulted, got %+v", got.Status)
 	}
 
 	// A second patch after the host has reported real values must preserve them
@@ -199,7 +171,7 @@ func TestHostStatusPatch_SatisfiesCRDRequired(t *testing.T) {
 	if err := c.Status().Update(ctx, got); err != nil {
 		t.Fatalf("seed reported status: %v", err)
 	}
-	patch2, err := hostStatusPatch(&got.Status)
+	patch2, err := hostStatusPatch("")
 	if err != nil {
 		t.Fatalf("hostStatusPatch (reported): %v", err)
 	}
@@ -249,7 +221,7 @@ func TestHostApply_UpsertIsIdempotent(t *testing.T) {
 	const name = "ssa-host"
 
 	// First apply: object does not exist yet -> SSA creates it.
-	if err := applyHost(ctx, c, ns, name, testHeartbeatHostID, "node-a", 8080, "tenant-a",
+	if err := applyHost(ctx, c, ns, name, testHeartbeatHostID, "node-a", 8080, testTenant,
 		map[string]string{testHostGroupLabel: testHostGroup}); err != nil {
 		t.Fatalf("first apply (create) failed: %v", err)
 	}
@@ -264,7 +236,7 @@ func TestHostApply_UpsertIsIdempotent(t *testing.T) {
 
 	// Second apply with changed fields: object exists -> SSA updates in place,
 	// with no client-side Get and so no possibility of AlreadyExists.
-	if err := applyHost(ctx, c, ns, name, testHeartbeatHostID, "node-a-renamed", 9090, "tenant-a",
+	if err := applyHost(ctx, c, ns, name, testHeartbeatHostID, "node-a-renamed", 9090, testTenant,
 		map[string]string{testHostGroupLabel: testHostGroup}); err != nil {
 		t.Fatalf("second apply (update) failed: %v", err)
 	}
@@ -299,7 +271,7 @@ func hostWith(hostID, hostname string, httpPort uint32, env string, labels map[s
 // case that must not register as a change.
 func TestHostSpecChanged(t *testing.T) {
 	base := func() *runtimev1alpha1.Host {
-		return hostWith(testHeartbeatHostID, "node-a", 8080, "tenant-a", map[string]string{testHostGroupLabel: testHostGroup})
+		return hostWith(testHeartbeatHostID, "node-a", 8080, testTenant, map[string]string{testHostGroupLabel: testHostGroup})
 	}
 
 	tests := []struct {
@@ -308,13 +280,13 @@ func TestHostSpecChanged(t *testing.T) {
 		want bool
 	}{
 		{"identical", base(), false},
-		{"hostID changed", hostWith("host-id-2", "node-a", 8080, "tenant-a", map[string]string{testHostGroupLabel: testHostGroup}), true},
-		{"hostname changed", hostWith(testHeartbeatHostID, "node-b", 8080, "tenant-a", map[string]string{testHostGroupLabel: testHostGroup}), true},
-		{"httpPort changed", hostWith(testHeartbeatHostID, "node-a", 9090, "tenant-a", map[string]string{testHostGroupLabel: testHostGroup}), true},
-		{"environment changed", hostWith(testHeartbeatHostID, "node-a", 8080, "tenant-b", map[string]string{testHostGroupLabel: testHostGroup}), true},
-		{"label value changed", hostWith(testHeartbeatHostID, "node-a", 8080, "tenant-a", map[string]string{testHostGroupLabel: "other"}), true},
-		{"label added", hostWith(testHeartbeatHostID, "node-a", 8080, "tenant-a", map[string]string{testHostGroupLabel: testHostGroup, "extra": "x"}), true},
-		{"label removed", hostWith(testHeartbeatHostID, "node-a", 8080, "tenant-a", nil), true},
+		{"hostID changed", hostWith("host-id-2", "node-a", 8080, testTenant, map[string]string{testHostGroupLabel: testHostGroup}), true},
+		{"hostname changed", hostWith(testHeartbeatHostID, "node-b", 8080, testTenant, map[string]string{testHostGroupLabel: testHostGroup}), true},
+		{"httpPort changed", hostWith(testHeartbeatHostID, "node-a", 9090, testTenant, map[string]string{testHostGroupLabel: testHostGroup}), true},
+		{"environment changed", hostWith(testHeartbeatHostID, "node-a", 8080, otherTenant, map[string]string{testHostGroupLabel: testHostGroup}), true},
+		{"label value changed", hostWith(testHeartbeatHostID, "node-a", 8080, testTenant, map[string]string{testHostGroupLabel: "other"}), true},
+		{"label added", hostWith(testHeartbeatHostID, "node-a", 8080, testTenant, map[string]string{testHostGroupLabel: testHostGroup, "extra": "x"}), true},
+		{"label removed", hostWith(testHeartbeatHostID, "node-a", 8080, testTenant, nil), true},
 	}
 
 	for _, tt := range tests {
@@ -328,8 +300,8 @@ func TestHostSpecChanged(t *testing.T) {
 	// A nil label map and an empty one are equivalent and must not be reported
 	// as a change: req.GetLabels() yields nil when the heartbeat carries none.
 	t.Run("nil vs empty labels", func(t *testing.T) {
-		existing := hostWith(testHeartbeatHostID, "node-a", 8080, "tenant-a", nil)
-		next := hostWith(testHeartbeatHostID, "node-a", 8080, "tenant-a", map[string]string{})
+		existing := hostWith(testHeartbeatHostID, "node-a", 8080, testTenant, nil)
+		next := hostWith(testHeartbeatHostID, "node-a", 8080, testTenant, map[string]string{})
 		if hostSpecChanged(existing, next) {
 			t.Errorf("nil and empty label maps must compare equal")
 		}
@@ -338,18 +310,29 @@ func TestHostSpecChanged(t *testing.T) {
 
 // mockBus is a wasmbus.Bus that answers Request with a canned reply (or error),
 // recording the subject the host client addressed and the request it sent.
-// Only Request is exercised by the round-trips under test; the remaining
-// methods satisfy the interface.
+// respond, when set, answers in place of reply and err. Only Request is
+// exercised by the round-trips under test; the remaining methods satisfy the
+// interface.
 type mockBus struct {
 	reply      *wasmbus.Message
 	err        error
+	respond    func(*wasmbus.Message) (*wasmbus.Message, error)
 	gotSubject string
 	gotData    []byte
+	requests   []*wasmbus.Message
+	// deadlines holds each request's context deadline, zero for none.
+	deadlines []time.Time
 }
 
-func (m *mockBus) Request(_ context.Context, msg *wasmbus.Message) (*wasmbus.Message, error) {
+func (m *mockBus) Request(ctx context.Context, msg *wasmbus.Message) (*wasmbus.Message, error) {
 	m.gotSubject = msg.Subject
 	m.gotData = msg.Data
+	m.requests = append(m.requests, msg)
+	deadline, _ := ctx.Deadline()
+	m.deadlines = append(m.deadlines, deadline)
+	if m.respond != nil {
+		return m.respond(msg)
+	}
 	if m.err != nil {
 		return nil, m.err
 	}
@@ -623,9 +606,7 @@ func TestHeartbeatHandler_WitnessesFleet(t *testing.T) {
 	}
 
 	var fleet fleetWitness
-	// A fake client cannot serve the Server-Side Apply this handler makes, so
-	// the Host bookkeeping below fails — which is the point. Arrival is the
-	// evidence, and it has to be recorded before anything that can fail.
+	// Arrival must be recorded before any Kubernetes operation can fail.
 	updater := &hostStatusUpdater{
 		client:            fake.NewClientBuilder().WithScheme(s).Build(),
 		operatorNamespace: testNamespace,
@@ -638,7 +619,7 @@ func TestHeartbeatHandler_WitnessesFleet(t *testing.T) {
 	}
 
 	updater.handleHeartbeat(context.Background(), logr.Discard(),
-		heartbeatBytes(t, "hb-host", testHeartbeatHostID, "node-a"))
+		"runtime.operator.heartbeat."+testHeartbeatHostID, heartbeatBytes(t, "hb-host", testHeartbeatHostID, "node-a"))
 
 	// The handler's stamp is what lets a run start here; without it observe
 	// finds nothing heard and the witness never settles.
@@ -675,7 +656,7 @@ func newHostFinalizeClient(t *testing.T, objs ...client.Object) client.Client {
 
 func workloadForHost(name, hostID string) *runtimev1alpha1.Workload {
 	w := &runtimev1alpha1.Workload{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "tenant-a"},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testTenant},
 	}
 	w.Status.HostID = hostID
 	return w
@@ -698,7 +679,7 @@ func TestFinalize(t *testing.T) {
 	otherHost := workloadForHost("other-host", "host-id-2")
 
 	c := newHostFinalizeClient(t, assigned, deleting, otherHost)
-	r := &HostReconciler{Client: c}
+	r := &HostReconciler{Client: c, deleteSlots: semaphore.NewWeighted(hostFinalizeDeleteConcurrency)}
 	host := &runtimev1alpha1.Host{HostID: testHeartbeatHostID}
 
 	if err := r.finalize(context.Background(), host); err != nil {
@@ -774,19 +755,16 @@ func TestDeleteUnresponsiveHost(t *testing.T) {
 	})
 }
 
-// applyCountingClient wraps a client.Client and counts Server-Side Apply
-// patches (the spec upsert), so a test can assert whether the heartbeat handler
-// performed or skipped the apply. Status subresource patches go through
-// Status() and are not counted.
-type applyCountingClient struct {
+// specPatchCountingClient counts Host spec patches, so a test can assert
+// whether the heartbeat handler patched or skipped the spec. Status subresource
+// patches go through Status() and are not counted.
+type specPatchCountingClient struct {
 	client.Client
-	applies atomic.Int64
+	patches atomic.Int64
 }
 
-func (c *applyCountingClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-	if patch.Type() == types.ApplyPatchType {
-		c.applies.Add(1)
-	}
+func (c *specPatchCountingClient) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+	c.patches.Add(1)
 	return c.Client.Patch(ctx, obj, patch, opts...)
 }
 
@@ -803,24 +781,23 @@ func heartbeatBytes(t *testing.T, name, hostID, hostname string) []byte {
 	return data
 }
 
-// TestHeartbeatHandler_SkipsRedundantApply exercises the full handler path
-// against a real API server: the first heartbeat creates the Host (one apply),
-// an identical heartbeat is skipped (no apply), and a changed heartbeat applies
-// again. LastSeen is refreshed on every heartbeat regardless of the skip.
-func TestHeartbeatHandler_SkipsRedundantApply(t *testing.T) {
+// TestHeartbeatHandler_SkipsRedundantPatch exercises the full handler path
+// against a real API server. Valid heartbeats refresh LastSeen; only changed
+// specs need a patch.
+func TestHeartbeatHandler_SkipsRedundantPatch(t *testing.T) {
 	c, ctx := startHostEnvtest(t)
 	ns := createTestNamespace(t, ctx, c, "host-heartbeat-skip")
 
-	counter := &applyCountingClient{Client: c}
+	counter := &specPatchCountingClient{Client: c}
 	updater := &hostStatusUpdater{client: counter, operatorNamespace: ns, fleet: &fleetWitness{}}
 	log := logr.Discard()
 
 	const name = "hb-host"
 
-	// First heartbeat: object does not exist -> create via SSA.
-	updater.handleHeartbeat(ctx, log, heartbeatBytes(t, name, testHeartbeatHostID, "node-a"))
-	if got := counter.applies.Load(); got != 1 {
-		t.Fatalf("first heartbeat: applies = %d, want 1", got)
+	// The first heartbeat creates the Host.
+	updater.handleHeartbeat(ctx, log, "runtime.operator.heartbeat."+testHeartbeatHostID, heartbeatBytes(t, name, testHeartbeatHostID, "node-a"))
+	if got := counter.patches.Load(); got != 0 {
+		t.Fatalf("first heartbeat: patches = %d, want 0", got)
 	}
 	created := &runtimev1alpha1.Host{}
 	if err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, created); err != nil {
@@ -833,10 +810,10 @@ func TestHeartbeatHandler_SkipsRedundantApply(t *testing.T) {
 		t.Errorf("LastSeen must be set after the first heartbeat")
 	}
 
-	// Identical heartbeat: spec unchanged -> no apply, but LastSeen still refreshes.
-	updater.handleHeartbeat(ctx, log, heartbeatBytes(t, name, testHeartbeatHostID, "node-a"))
-	if got := counter.applies.Load(); got != 1 {
-		t.Fatalf("redundant heartbeat must not re-apply: applies = %d, want 1", got)
+	// Identical heartbeat: spec unchanged -> no patch, but LastSeen still refreshes.
+	updater.handleHeartbeat(ctx, log, "runtime.operator.heartbeat."+testHeartbeatHostID, heartbeatBytes(t, name, testHeartbeatHostID, "node-a"))
+	if got := counter.patches.Load(); got != 0 {
+		t.Fatalf("redundant heartbeat must not patch: patches = %d, want 0", got)
 	}
 	afterRedundant := &runtimev1alpha1.Host{}
 	if err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, afterRedundant); err != nil {
@@ -846,10 +823,10 @@ func TestHeartbeatHandler_SkipsRedundantApply(t *testing.T) {
 		t.Errorf("LastSeen must remain set after a redundant heartbeat")
 	}
 
-	// Changed heartbeat: hostname differs -> apply again.
-	updater.handleHeartbeat(ctx, log, heartbeatBytes(t, name, testHeartbeatHostID, "node-b"))
-	if got := counter.applies.Load(); got != 2 {
-		t.Fatalf("changed heartbeat must re-apply: applies = %d, want 2", got)
+	// Changed heartbeat: hostname differs -> patch.
+	updater.handleHeartbeat(ctx, log, "runtime.operator.heartbeat."+testHeartbeatHostID, heartbeatBytes(t, name, testHeartbeatHostID, "node-b"))
+	if got := counter.patches.Load(); got != 1 {
+		t.Fatalf("changed heartbeat must patch: patches = %d, want 1", got)
 	}
 	updated := &runtimev1alpha1.Host{}
 	if err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, updated); err != nil {
@@ -859,25 +836,68 @@ func TestHeartbeatHandler_SkipsRedundantApply(t *testing.T) {
 		t.Errorf("hostname = %q, want node-b after change", updated.Hostname)
 	}
 
-	// A restarted host that reuses its friendly name reports a new host ID, and
-	// the operator addresses every RPC by that ID — so this is the one field the
-	// skip must never swallow.
-	updater.handleHeartbeat(ctx, log, heartbeatBytes(t, name, "host-id-2", "node-b"))
-	if got := counter.applies.Load(); got != 3 {
-		t.Fatalf("changed hostID must re-apply: applies = %d, want 3", got)
+	// A new ID must not take over an existing Host's name.
+	updater.handleHeartbeat(ctx, log, "runtime.operator.heartbeat.host-id-2", heartbeatBytes(t, name, "host-id-2", "node-b"))
+	if got := counter.patches.Load(); got != 1 {
+		t.Fatalf("name takeover patched: %d", got)
 	}
 	reidentified := &runtimev1alpha1.Host{}
 	if err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, reidentified); err != nil {
-		t.Fatalf("get after hostID change: %v", err)
+		t.Fatalf("get after name takeover: %v", err)
 	}
-	if reidentified.HostID != "host-id-2" {
-		t.Errorf("hostID = %q, want host-id-2 after change", reidentified.HostID)
+	if reidentified.HostID != testHeartbeatHostID || !reidentified.Status.LastSeen.Equal(&updated.Status.LastSeen) {
+		t.Errorf("name takeover changed Host: %+v", reidentified)
+	}
+}
+
+// TestHeartbeatHandler_ClearsDroppedSpecFields checks that a heartbeat which
+// drops a label or clears its environment removes them from the Host.
+func TestHeartbeatHandler_ClearsDroppedSpecFields(t *testing.T) {
+	c, ctx := startHostEnvtest(t)
+	ns := createTestNamespace(t, ctx, c, "host-heartbeat-dropped")
+
+	counter := &specPatchCountingClient{Client: c}
+	updater := &hostStatusUpdater{client: counter, operatorNamespace: ns, fleet: &fleetWitness{}}
+	const name = "hb-dropped-host"
+	subject := "runtime.operator.heartbeat." + testHeartbeatHostID
+	heartbeat := func(labels map[string]string, environment string) []byte {
+		t.Helper()
+		data, err := protojson.Marshal(&runtimev2.HostHeartbeat{
+			FriendlyName: name,
+			Id:           testHeartbeatHostID,
+			Hostname:     "dropped-node",
+			Labels:       labels,
+			Environment:  environment,
+		})
+		if err != nil {
+			t.Fatalf("marshal heartbeat: %v", err)
+		}
+		return data
+	}
+
+	kept := map[string]string{"retained": "1"}
+	initial := maps.Clone(kept)
+	initial["drop"] = "2"
+	updater.handleHeartbeat(ctx, logr.Discard(), subject, heartbeat(initial, "prod"))
+	for range 2 {
+		updater.handleHeartbeat(ctx, logr.Discard(), subject, heartbeat(kept, ""))
+	}
+
+	got := &runtimev1alpha1.Host{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, got); err != nil {
+		t.Fatalf("get Host: %v", err)
+	}
+	if !maps.Equal(got.Labels, kept) || got.Environment != "" {
+		t.Errorf("dropped fields kept: labels=%v environment=%q", got.Labels, got.Environment)
+	}
+	if n := counter.patches.Load(); n != 1 {
+		t.Errorf("spec patches = %d, want 1 once the Host converges", n)
 	}
 }
 
 // TestHeartbeatHandler_PreservesReportedStatus is the call-site counterpart to
-// TestHostStatusPatch_ReportedFieldsPreserved: the placeholders must come from
-// the stored status, so a heartbeat leaves what reconcileReporting measured.
+// TestHostStatusPatch_ReportedFieldsPreserved: a heartbeat must leave what
+// reconcileReporting measured untouched.
 func TestHeartbeatHandler_PreservesReportedStatus(t *testing.T) {
 	c, ctx := startHostEnvtest(t)
 	ns := createTestNamespace(t, ctx, c, "host-heartbeat-status")
@@ -886,7 +906,7 @@ func TestHeartbeatHandler_PreservesReportedStatus(t *testing.T) {
 	log := logr.Discard()
 
 	const name = "hb-status-host"
-	updater.handleHeartbeat(ctx, log, heartbeatBytes(t, name, testHeartbeatHostID, "node-a"))
+	updater.handleHeartbeat(ctx, log, "runtime.operator.heartbeat."+testHeartbeatHostID, heartbeatBytes(t, name, testHeartbeatHostID, "node-a"))
 
 	// Stand in for reconcileReporting having polled the host.
 	reported := &runtimev1alpha1.Host{}
@@ -905,7 +925,7 @@ func TestHeartbeatHandler_PreservesReportedStatus(t *testing.T) {
 	}
 	seenBefore := reported.Status.LastSeen
 
-	updater.handleHeartbeat(ctx, log, heartbeatBytes(t, name, testHeartbeatHostID, "node-a"))
+	updater.handleHeartbeat(ctx, log, "runtime.operator.heartbeat."+testHeartbeatHostID, heartbeatBytes(t, name, testHeartbeatHostID, "node-a"))
 
 	after := &runtimev1alpha1.Host{}
 	if err := c.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, after); err != nil {

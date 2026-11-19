@@ -7,14 +7,14 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const PLUGIN_KEYVALUE_ID: &str = "wasi-keyvalue";
 use crate::engine::ctx::{ActiveCtx, SharedCtx, extract_active_ctx};
 use crate::engine::workload::WorkloadItem;
 use crate::plugin::{HostPlugin, WitInterfaces};
-use crate::wit::{WitInterface, WitWorld};
+use crate::wit::{Config, ConfigStr, WitInterface, WitWorld};
 use futures::StreamExt;
-use redis::AsyncCommands;
 use tracing::instrument;
 use wasmtime::component::Resource;
 
@@ -34,7 +34,7 @@ use bindings::wasi::keyvalue::store::{Error as StoreError, KeyResponse};
 
 /// Resource representation for a bucket (key-value store namespace)
 pub struct BucketHandle {
-    conn: redis::aio::MultiplexedConnection,
+    conn: Connection,
     prefix: String,
 }
 
@@ -42,12 +42,29 @@ impl BucketHandle {
     fn prefixed_key(&self, key: &str) -> String {
         format!("{}:{}", self.prefix, key)
     }
+
+    /// The values of `keys` (not empty), one slot per key, `None` where a key
+    /// is absent.
+    async fn get_many(&self, keys: &[String]) -> redis::RedisResult<Vec<Option<Vec<u8>>>> {
+        let redis_keys: Vec<String> = keys.iter().map(|k| self.prefixed_key(k)).collect();
+        // Explicit MGET: the `mget` helper downgrades to `GET` for one key,
+        // which decodes an absent key as an empty vec rather than one `None`.
+        self.conn
+            .query_read(redis::cmd("MGET").arg(redis_keys.as_slice()))
+            .await
+    }
 }
 
 /// Redis-based keyvalue plugin
 #[derive(Clone)]
 pub struct RedisKeyValue {
     client: redis::Client,
+    /// One self-healing connection shared by every bucket, opened by the first
+    /// `open` that succeeds. A failed open leaves it empty, so the next one
+    /// tries again.
+    conn: Arc<tokio::sync::OnceCell<Connection>>,
+    /// How that connection dials and waits. See [`RedisKeyValue::from_url`].
+    settings: ConnectionSettings,
     metrics: Arc<WasiKeyvalueMetrics>,
 }
 
@@ -66,18 +83,54 @@ impl WasiKeyvalueMetrics {
 }
 
 impl RedisKeyValue {
+    /// A plugin for the server `client` names, with the default connection
+    /// settings.
     pub fn new(client: redis::Client) -> Self {
+        Self::with_settings(client, ConnectionSettings::default())
+    }
+
+    fn with_settings(client: redis::Client, settings: ConnectionSettings) -> Self {
         let meter = opentelemetry::global::meter("wasi-keyvalue");
         let metrics = WasiKeyvalueMetrics::new(&meter);
         Self {
             client,
+            conn: Arc::default(),
+            settings,
             metrics: Arc::new(metrics),
         }
     }
 
+    /// A plugin for the server `url` names.
+    ///
+    /// The url's query may carry the same connection settings a multiplexed
+    /// binding's `config` does (`backend-reconnect-num-retries`,
+    /// `backend-reconnect-max-delay-ms`, `backend-connection-timeout-ms`,
+    /// `backend-response-timeout-ms`, in any case, `_` or `-`), for example
+    /// `redis://localhost:6379?backend-response-timeout-ms=500`. They are
+    /// taken out before the url reaches redis; any other query parameter is
+    /// left for redis to read.
+    ///
+    /// # Errors
+    ///
+    /// A setting redis keyvalue config would refuse, or a url redis cannot
+    /// open.
     pub fn from_url(url: &url::Url) -> anyhow::Result<Self> {
+        let (url, settings) = split_connection_settings(url)?;
         let client = redis::Client::open(url.as_str())?;
-        Ok(Self::new(client))
+        Ok(Self::with_settings(client, settings))
+    }
+
+    /// The connection every bucket shares, dialing it on first use. One that
+    /// has been quiet for [`IDLE_PROBE_AFTER`] is checked first, so an `open`
+    /// while the server is down fails as it did when each `open` dialed.
+    async fn connection(&self) -> redis::RedisResult<Connection> {
+        let conn = self
+            .conn
+            .get_or_try_init(|| Connection::connect(self.client.clone(), self.settings))
+            .await?
+            .clone();
+        conn.probe_if_idle().await?;
+        Ok(conn)
     }
 
     fn record_operation(&self, operation: &str) {
@@ -87,6 +140,746 @@ impl RedisKeyValue {
         )];
         self.metrics.operations_total.add(1, &attributes);
     }
+}
+
+/// `config` key: how many times a dropped connection is redialed before the
+/// call waiting on it fails. The v1 redis provider's name for it.
+pub(crate) const RECONNECT_NUM_RETRIES_KEY: &str = "backend-reconnect-num-retries";
+/// `config` key: the longest pause, in milliseconds, between redial attempts.
+pub(crate) const RECONNECT_MAX_DELAY_MS_KEY: &str = "backend-reconnect-max-delay-ms";
+/// `config` key: how long, in milliseconds, one connection attempt may take.
+pub(crate) const CONNECTION_TIMEOUT_MS_KEY: &str = "backend-connection-timeout-ms";
+/// `config` key: how long, in milliseconds, one command may wait for its reply.
+pub(crate) const RESPONSE_TIMEOUT_MS_KEY: &str = "backend-response-timeout-ms";
+
+/// Every redis connection setting a binding's `config` may carry. Each is the
+/// operator's: the multiplexed plugins' `KEYVALUE_HOST_OWNED_KEYS` claims
+/// them all, so a workload under `workloadConfig: deny` cannot set one.
+pub(crate) const CONNECTION_SETTING_KEYS: &[&str] = &[
+    RECONNECT_NUM_RETRIES_KEY,
+    RECONNECT_MAX_DELAY_MS_KEY,
+    CONNECTION_TIMEOUT_MS_KEY,
+    RESPONSE_TIMEOUT_MS_KEY,
+];
+
+/// Upper bound on [`RECONNECT_NUM_RETRIES_KEY`]. A call that finds the
+/// connection dead waits for every redial, so this bounds that wait.
+const MAX_RECONNECT_NUM_RETRIES: u64 = 1_000;
+/// Upper bound on each millisecond setting (ten minutes).
+const MAX_SETTING_MS: u64 = 600_000;
+
+/// How a redis keyvalue backend dials, redials, and waits on its server.
+///
+/// The defaults are the v1 redis provider's: a bounded reconnect, so a call
+/// made while the server is down fails within about a second rather than after
+/// the crate default's minutes of backoff, and a three second cap on each
+/// connection attempt. The keys keep v1's names (any case, `_` or `-`), so
+/// `BACKEND_CONNECTION_TIMEOUT_MS` from a v1 link reads the same here.
+///
+/// There is no response timeout by default. A `SCAN` page or an `MGET` of many
+/// large values can legitimately take a while, and a timed-out command is not
+/// cancelled on the server, so a default that is too tight turns slow successes
+/// into errors that still had their effect. An operator who wants one sets
+/// [`RESPONSE_TIMEOUT_MS_KEY`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ConnectionSettings {
+    reconnect_num_retries: usize,
+    reconnect_max_delay_ms: u64,
+    connection_timeout_ms: u64,
+    response_timeout_ms: Option<u64>,
+}
+
+impl Default for ConnectionSettings {
+    fn default() -> Self {
+        Self {
+            reconnect_num_retries: 3,
+            reconnect_max_delay_ms: 300,
+            connection_timeout_ms: 3_000,
+            response_timeout_ms: None,
+        }
+    }
+}
+
+impl ConnectionSettings {
+    /// Read the settings from a binding's `config`, defaulting what is unset.
+    ///
+    /// Keys match in any spelling [`crate::plugin::bindings::canonical_key`] folds
+    /// together, the same rule `workloadConfig: deny` uses to refuse them.
+    ///
+    /// # Errors
+    ///
+    /// A value that is not a whole number in range, a timeout of zero, or one
+    /// key given twice under different spellings with different values.
+    pub(crate) fn from_config(config: &Config) -> anyhow::Result<Self> {
+        let mut settings = Self::default();
+        if let Some(v) = setting(config, RECONNECT_NUM_RETRIES_KEY)? {
+            let retries =
+                parse_bounded(RECONNECT_NUM_RETRIES_KEY, v, 0, MAX_RECONNECT_NUM_RETRIES)?;
+            settings.reconnect_num_retries = usize::try_from(retries)?;
+        }
+        if let Some(v) = setting(config, RECONNECT_MAX_DELAY_MS_KEY)? {
+            settings.reconnect_max_delay_ms =
+                parse_bounded(RECONNECT_MAX_DELAY_MS_KEY, v, 0, MAX_SETTING_MS)?;
+        }
+        if let Some(v) = setting(config, CONNECTION_TIMEOUT_MS_KEY)? {
+            settings.connection_timeout_ms =
+                parse_bounded(CONNECTION_TIMEOUT_MS_KEY, v, 1, MAX_SETTING_MS)?;
+        }
+        if let Some(v) = setting(config, RESPONSE_TIMEOUT_MS_KEY)? {
+            settings.response_timeout_ms = Some(parse_bounded(
+                RESPONSE_TIMEOUT_MS_KEY,
+                v,
+                1,
+                MAX_SETTING_MS,
+            )?);
+        }
+        // Each key is bounded on its own, but together they could still keep
+        // every caller waiting on one redial for days.
+        let worst = settings.worst_case_redial_ms();
+        anyhow::ensure!(
+            worst <= MAX_SETTING_MS,
+            "redis keyvalue config `{RECONNECT_NUM_RETRIES_KEY}`, \
+             `{RECONNECT_MAX_DELAY_MS_KEY}` and `{CONNECTION_TIMEOUT_MS_KEY}` together let one \
+             redial exceed the {MAX_SETTING_MS}ms limit; lower one \
+             of them"
+        );
+        Ok(settings)
+    }
+
+    fn connection_config(&self) -> redis::AsyncConnectionConfig {
+        let mut config = redis::AsyncConnectionConfig::new()
+            .set_connection_timeout(Duration::from_millis(self.connection_timeout_ms));
+        if let Some(ms) = self.response_timeout_ms {
+            config = config.set_response_timeout(Duration::from_millis(ms));
+        }
+        config
+    }
+
+    /// The pause before redial `attempt` (counting from zero): between half
+    /// and all of `min(max delay, 50ms * 2^attempt)`. The jitter keeps many
+    /// pooled connections that lost one server from redialing in lockstep.
+    fn redial_delay(&self, attempt: usize) -> Duration {
+        let ceiling = self.redial_ceiling_ms(attempt);
+        Duration::from_millis(fastrand::u64(ceiling / 2..=ceiling))
+    }
+
+    /// The longest pause before redial `attempt`: `min(max delay, 50ms * 2^attempt)`.
+    fn redial_ceiling_ms(&self, attempt: usize) -> u64 {
+        let exponent = u32::try_from(attempt).unwrap_or(u32::MAX).min(16);
+        REDIAL_BASE_DELAY_MS
+            .saturating_mul(1 << exponent)
+            .min(self.reconnect_max_delay_ms)
+    }
+
+    /// The longest one redial can take: every attempt running into the
+    /// connection timeout, with the longest pause between each. Callers that
+    /// find the connection dead queue behind the redial for all of it.
+    fn worst_case_redial_ms(&self) -> u64 {
+        let attempts = self.reconnect_num_retries as u64 + 1;
+        let pauses: u64 = (0..self.reconnect_num_retries)
+            .map(|attempt| self.redial_ceiling_ms(attempt))
+            .sum();
+        self.connection_timeout_ms
+            .saturating_mul(attempts)
+            .saturating_add(pauses)
+    }
+}
+
+/// The first redial pause, before doubling; see
+/// [`ConnectionSettings::redial_delay`].
+const REDIAL_BASE_DELAY_MS: u64 = 50;
+
+/// `url` without the connection settings in its query, and those settings.
+fn split_connection_settings(url: &url::Url) -> anyhow::Result<(url::Url, ConnectionSettings)> {
+    let is_setting = |key: &str| {
+        CONNECTION_SETTING_KEYS.contains(&crate::plugin::bindings::canonical_key(key).as_str())
+    };
+    let (settings, rest): (Vec<_>, Vec<_>) = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .partition(|(k, _)| is_setting(k));
+    let mut config = Config::new();
+    for (k, v) in settings {
+        // Two spellings of one key are refused by `from_config`; the same
+        // spelling twice would be lost in the map, so refuse it here.
+        if config.insert(k.clone(), v).is_some() {
+            anyhow::bail!("redis keyvalue url sets `{k}` more than once");
+        }
+    }
+    let settings = ConnectionSettings::from_config(&config)?;
+
+    let mut url = url.clone();
+    if rest.is_empty() {
+        url.set_query(None);
+    } else {
+        url.query_pairs_mut().clear().extend_pairs(rest);
+    }
+    Ok((url, settings))
+}
+
+/// The value of `key` in `config`, in any spelling that folds to it.
+fn setting<'a>(config: &'a Config, key: &str) -> anyhow::Result<Option<ConfigStr<'a>>> {
+    let mut found: Option<(&str, ConfigStr<'a>)> = None;
+    for (k, v) in config.iter() {
+        if crate::plugin::bindings::canonical_key(k) != key {
+            continue;
+        }
+        let Some(v) = v.as_config_str() else {
+            anyhow::bail!("redis keyvalue config `{k}` is not text");
+        };
+        match found {
+            Some((first, value)) if value.expose() != v.expose() => anyhow::bail!(
+                "redis keyvalue config sets `{key}` twice with different values \
+                 (`{first}` and `{k}`)"
+            ),
+            _ => found = Some((k.as_str(), v)),
+        }
+    }
+    Ok(found.map(|(_, v)| v))
+}
+
+fn parse_bounded(key: &str, value: ConfigStr<'_>, min: u64, max: u64) -> anyhow::Result<u64> {
+    let parsed: u64 = value.expose().trim().parse().map_err(|_| {
+        anyhow::anyhow!("redis keyvalue config `{key}` must be a whole number, got {value:?}")
+    })?;
+    anyhow::ensure!(
+        (min..=max).contains(&parsed),
+        "redis keyvalue config `{key}` must be between {min} and {max}, got {value}"
+    );
+    Ok(parsed)
+}
+
+/// A redis connection that replaces itself when it dies, shared by every
+/// call on a backend.
+///
+/// Both redis keyvalue plugins hold a connection longer than one call (the
+/// multiplexed backend is pooled and outlives any one workload; the
+/// single-backend plugin shares one across every bucket it opens), so a bare
+/// `MultiplexedConnection` that dies with the server (a restart, a failover)
+/// would fail every later call until the host restarts. This one drops a
+/// connection that a command found dead, and the next command dials a new one.
+/// A read that found it dead is sent once more on the replacement (see
+/// [`Connection::query_read`]); a write may already have run, so its call
+/// fails and the calls after it use the fresh connection. To keep that from
+/// happening after every idle period, a write on a connection that has been
+/// quiet for [`IDLE_PROBE_AFTER`] is preceded by a `PING`. A `READONLY` reply
+/// (perhaps a failover that demoted the server in place) swaps in a fresh
+/// connection only if that one reaches a primary; otherwise the read-only
+/// connection is kept and reads go on (see [`Connection::follow_primary`]).
+///
+/// Every dial uses the same `client`, so the same host and port that the
+/// multiplexed provider's `check_egress` approved, resolved by name exactly as
+/// the first connect was, with the same credentials and DB.
+///
+/// The first connect is one attempt, so a server that is down, a wrong url or
+/// a bad password fails a bind at once. A redial makes up to the configured
+/// number of further attempts, pausing as [`ConnectionSettings`] says, and
+/// concurrent callers wait on that one redial rather than each dialing. A
+/// redial that fails leaves no connection behind, so the next call starts a
+/// fresh one: no failure, of any kind, is kept.
+///
+/// This is not redis's own `ConnectionManager`: in redis 0.27 its first
+/// backoff pause ignores the configured maximum (one to two seconds whatever
+/// the setting), its initial connect cannot be made to fail fast, and a redial
+/// that fails with anything but an I/O error (an `AUTH` refusal, or `LOADING`
+/// while a restarted server reads its dataset) is kept and returned to every
+/// later call, with no further redial, until the host restarts.
+#[derive(Clone)]
+pub(crate) struct Connection {
+    inner: Arc<ConnectionInner>,
+}
+
+struct ConnectionInner {
+    client: redis::Client,
+    settings: ConnectionSettings,
+    /// The live connection and the generation that dialed it, or `None` once
+    /// a command found it dead.
+    current: std::sync::Mutex<Option<(redis::aio::MultiplexedConnection, u64)>>,
+    /// Held while redialing, so one redial serves every caller waiting on it.
+    dialing: tokio::sync::Mutex<Redials>,
+    /// How many redials have finished, read without the lock so a caller can
+    /// tell whether one finished while it waited.
+    redials_finished: std::sync::atomic::AtomicU64,
+    /// When a command last got a reply (or a connection was last dialed). A
+    /// write sent after [`IDLE_PROBE_AFTER`] of quiet is preceded by a `PING`.
+    last_reply: std::sync::Mutex<Instant>,
+    /// When a `READONLY` refusal last checked for a primary, if ever. See
+    /// [`Connection::follow_primary`].
+    last_role_check: std::sync::Mutex<Option<Instant>>,
+}
+
+/// The shortest time between two checks for a primary after `READONLY`
+/// refusals. See [`Connection::follow_primary`].
+const ROLE_CHECK_COOLDOWN: Duration = Duration::from_secs(1);
+
+/// How long a connection may sit quiet before a write first checks it with a
+/// `PING`. A server's `timeout`, or a load balancer's idle cutoff, closes a
+/// quiet connection, and a write that then finds it dead cannot be retried
+/// (it might have run). A `PING` can be, so the write goes out on a live
+/// connection instead of failing.
+const IDLE_PROBE_AFTER: Duration = Duration::from_secs(5);
+
+/// A list-keys cursor this backend handed out has this bit set, the
+/// generation of the connection that issued it in the bits below, and the
+/// redis `SCAN` cursor in the low [`CURSOR_BITS`]. See
+/// [`Connection::scan_page`].
+///
+/// Every token is below 2^53, so a guest that carries it through JSON or a
+/// JavaScript `number` gets it back intact.
+const TOKEN_FLAG: u64 = 1 << 52;
+/// Bits of a redis `SCAN` cursor a token carries. A redis cursor indexes the
+/// keyspace hash table, which never approaches 2^40 buckets (that table alone
+/// would take terabytes).
+const CURSOR_BITS: u32 = 40;
+const CURSOR_MASK: u64 = (1 << CURSOR_BITS) - 1;
+/// Bits of the connection generation a token carries (it wraps after 4096
+/// reconnects).
+const GENERATION_MASK: u64 = (1 << (52 - CURSOR_BITS)) - 1;
+
+#[derive(Default)]
+struct Redials {
+    /// Connections dialed so far, used as their generation.
+    dialed: u64,
+    /// The last redial's failure, tagged with the `redials_finished` count it
+    /// set, or `None` once a redial succeeds.
+    failed: Option<(u64, Arc<redis::RedisError>)>,
+}
+
+/// Why a [`Connection`] call failed: no connection could be made, or the
+/// command failed on one.
+enum ConnectionError {
+    Dial(redis::RedisError),
+    Command(redis::RedisError),
+}
+
+impl ConnectionError {
+    fn into_inner(self) -> redis::RedisError {
+        match self {
+            Self::Dial(e) | Self::Command(e) => e,
+        }
+    }
+}
+
+impl Connection {
+    /// Connect to the server `client` names, in one attempt.
+    pub(crate) async fn connect(
+        client: redis::Client,
+        settings: ConnectionSettings,
+    ) -> redis::RedisResult<Self> {
+        let conn = client
+            .get_multiplexed_async_connection_with_config(&settings.connection_config())
+            .await?;
+        Ok(Self {
+            inner: Arc::new(ConnectionInner {
+                client,
+                settings,
+                current: std::sync::Mutex::new(Some((conn, 0))),
+                dialing: tokio::sync::Mutex::default(),
+                redials_finished: std::sync::atomic::AtomicU64::new(0),
+                last_reply: std::sync::Mutex::new(Instant::now()),
+                last_role_check: std::sync::Mutex::new(None),
+            }),
+        })
+    }
+
+    fn mark_reply(&self) {
+        *self
+            .inner
+            .last_reply
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
+    }
+
+    fn idle_for(&self) -> Duration {
+        self.inner
+            .last_reply
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .elapsed()
+    }
+
+    /// Check the connection with a `PING` if it has been quiet for
+    /// [`IDLE_PROBE_AFTER`], redialing if the `PING` finds it dead.
+    async fn probe_if_idle(&self) -> redis::RedisResult<()> {
+        if self.idle_for() < IDLE_PROBE_AFTER {
+            return Ok(());
+        }
+        self.query_read::<String>(&redis::cmd("PING"))
+            .await
+            .map(drop)
+    }
+
+    fn live(&self) -> Option<(redis::aio::MultiplexedConnection, u64)> {
+        self.inner
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The live connection, redialing first if a command found it dead.
+    ///
+    /// A caller that waited while another redialed takes that redial's
+    /// outcome, failure included, rather than starting its own: during an
+    /// outage, a queue of callers fails together after one redial schedule
+    /// instead of each in turn after its own. A caller that arrives after a
+    /// redial failed starts a fresh one.
+    async fn get(&self) -> redis::RedisResult<(redis::aio::MultiplexedConnection, u64)> {
+        use std::sync::atomic::Ordering;
+
+        if let Some(live) = self.live() {
+            return Ok(live);
+        }
+        let seen = self.inner.redials_finished.load(Ordering::Acquire);
+        let mut redials = self.inner.dialing.lock().await;
+        if let Some(live) = self.live() {
+            return Ok(live);
+        }
+        if let Some((finished, e)) = &redials.failed
+            && *finished > seen
+        {
+            return Err(copy_redial_error(e));
+        }
+
+        let settings = &self.inner.settings;
+        let config = settings.connection_config();
+        let mut attempt = 0;
+        let outcome = loop {
+            match self
+                .inner
+                .client
+                .get_multiplexed_async_connection_with_config(&config)
+                .await
+            {
+                Ok(conn) => break Ok(conn),
+                Err(e) if attempt >= settings.reconnect_num_retries => break Err(e),
+                Err(e) => {
+                    tracing::debug!(error = %e, attempt, "redis redial failed; retrying");
+                    tokio::time::sleep(settings.redial_delay(attempt)).await;
+                    attempt += 1;
+                }
+            }
+        };
+        let finished = self.inner.redials_finished.load(Ordering::Acquire) + 1;
+        let result = match outcome {
+            Ok(conn) => {
+                redials.dialed += 1;
+                redials.failed = None;
+                let live = (conn, redials.dialed);
+                *self
+                    .inner
+                    .current
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(live.clone());
+                self.mark_reply();
+                Ok(live)
+            }
+            Err(e) => {
+                // The waiters get a copy; this caller gets the error itself.
+                redials.failed = Some((finished, Arc::new(copy_redial_error(&e))));
+                Err(e)
+            }
+        };
+        self.inner
+            .redials_finished
+            .store(finished, Ordering::Release);
+        result
+    }
+
+    /// Forget connection `generation` if it is still the live one.
+    fn discard(&self, generation: u64) {
+        let mut current = self
+            .inner
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.as_ref().is_some_and(|(_, g)| *g == generation) {
+            *current = None;
+        }
+    }
+
+    /// Send `cmd` on `live`. A command that proved the connection dead drops
+    /// it, and the next command redials. A `READONLY` refusal checks whether a
+    /// primary can now be reached (see [`Connection::follow_primary`]).
+    async fn run<T: redis::FromRedisValue>(
+        &self,
+        (mut conn, generation): (redis::aio::MultiplexedConnection, u64),
+        cmd: &redis::Cmd,
+    ) -> redis::RedisResult<T> {
+        let result = cmd.query_async(&mut conn).await;
+        match &result {
+            Ok(_) => self.mark_reply(),
+            Err(e) if e.is_unrecoverable_error() => self.discard(generation),
+            Err(e) if e.kind() == redis::ErrorKind::ReadOnly => {
+                self.follow_primary(generation).await;
+            }
+            Err(_) => {}
+        }
+        result
+    }
+
+    /// After connection `generation` refused a write with `READONLY`, dial a
+    /// fresh connection and swap it in only if it reaches a primary.
+    ///
+    /// A failover that demotes the old primary in place leaves the connection
+    /// open, and only a new connection follows the url's name to the new
+    /// primary. But a server can also be read-only with nowhere better to go
+    /// (a primary that lost its own, a replica the url names on purpose). There
+    /// the current connection is kept: reads go on, and list-keys cursors it
+    /// issued stay valid, which they would not across a swap. So the swap
+    /// happens only when the fresh connection's `ROLE` says `master`.
+    ///
+    /// At most one check runs per [`ROLE_CHECK_COOLDOWN`], so a stream of
+    /// refused writes does not dial once each. The refused write is not
+    /// retried either way: it is a write.
+    async fn follow_primary(&self, generation: u64) {
+        {
+            let mut last = self
+                .inner
+                .last_role_check
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if last.is_some_and(|at| at.elapsed() < ROLE_CHECK_COOLDOWN) {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+
+        // Held like a redial, so the two never race to replace the connection.
+        let mut redials = self.inner.dialing.lock().await;
+        if self.live().map(|(_, g)| g) != Some(generation) {
+            // Already replaced or dropped since the refusal.
+            return;
+        }
+        let config = self.inner.settings.connection_config();
+        let mut fresh = match self
+            .inner
+            .client
+            .get_multiplexed_async_connection_with_config(&config)
+            .await
+        {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                tracing::debug!(error = %e, "redis primary check could not dial; keeping the connection");
+                return;
+            }
+        };
+        let role = redis::cmd("ROLE")
+            .query_async::<Vec<redis::Value>>(&mut fresh)
+            .await;
+        if !role.as_deref().is_ok_and(is_primary_role) {
+            tracing::debug!("redis is still read-only; keeping the connection");
+            return;
+        }
+        tracing::info!(
+            "redis write refused as read-only, and a primary is reachable; switching to it"
+        );
+        redials.dialed += 1;
+        redials.failed = None;
+        *self
+            .inner
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((fresh, redials.dialed));
+        self.mark_reply();
+    }
+
+    /// Send `cmd` once, telling a failure to connect from a failed command.
+    async fn send<T: redis::FromRedisValue>(&self, cmd: &redis::Cmd) -> Result<T, ConnectionError> {
+        let live = self.get().await.map_err(ConnectionError::Dial)?;
+        self.run(live, cmd).await.map_err(ConnectionError::Command)
+    }
+
+    /// Make a read with `attempt`, and once more if the connection dropped
+    /// under the first try (see [`is_dropped_connection`]).
+    async fn retrying_read<T, F, Fut>(&self, attempt: F) -> redis::RedisResult<T>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T, ConnectionError>>,
+    {
+        match attempt().await {
+            Err(ConnectionError::Command(e)) if is_dropped_connection(&e) => {
+                tracing::debug!(error = %e, "redis connection dropped; retrying a read once");
+                attempt().await.map_err(ConnectionError::into_inner)
+            }
+            other => other.map_err(ConnectionError::into_inner),
+        }
+    }
+
+    /// Send a write once. If the connection proved dead, it is dropped, and
+    /// the next command redials. A connection that has been quiet for a while
+    /// is checked first (see [`IDLE_PROBE_AFTER`]).
+    pub(crate) async fn query<T: redis::FromRedisValue>(
+        &self,
+        cmd: &redis::Cmd,
+    ) -> redis::RedisResult<T> {
+        self.probe_if_idle().await?;
+        self.send(cmd).await.map_err(ConnectionError::into_inner)
+    }
+
+    /// Send a read, and once more if the connection dropped under the first
+    /// attempt (see [`is_dropped_connection`]).
+    ///
+    /// Only for reads (`GET`, `MGET`, `EXISTS`): running one twice changes
+    /// nothing. Writes are sent once with [`Connection::query`], even `SET`,
+    /// `MSET` and `DEL`, which leave the same state however often they run on
+    /// their own: if the first attempt was applied and only its reply was lost
+    /// with the connection, a replay could land after another client's write
+    /// to the same key and overwrite or delete it. So a write that finds the
+    /// connection dead returns the error, and the caller decides whether to
+    /// try again. `INCRBY` and `SET NX` are never retried for the same reason
+    /// and more (a second `INCRBY` adds twice).
+    ///
+    /// Only a command that failed on a connection is retried. If no connection
+    /// could be made, the redial already spent its retries, and the error is
+    /// returned as it is.
+    ///
+    /// The retry redials, so after a restart the first read succeeds rather
+    /// than failing once per pooled connection.
+    pub(crate) async fn query_read<T: redis::FromRedisValue>(
+        &self,
+        cmd: &redis::Cmd,
+    ) -> redis::RedisResult<T> {
+        self.retrying_read(|| self.send(cmd)).await
+    }
+
+    /// Fetch one `SCAN` page of keys matching `pattern`, as `(next cursor,
+    /// keys)`, where a cursor of zero starts and ends a listing.
+    ///
+    /// A redis cursor names a position in the hash table of the server that
+    /// issued it, and a restarted or failed-over server may lay its table out
+    /// differently, so a redis cursor replayed there could silently skip keys.
+    /// So the cursors handed out are tokens that carry the generation of the
+    /// connection that issued them beside the redis cursor (see
+    /// [`TOKEN_FLAG`]), and a token from before the latest redial (however
+    /// that redial came about, a `get` between pages included) is refused,
+    /// telling the caller to list again from the first page. Nothing is
+    /// remembered per token, so no caller's listing can crowd out another's.
+    ///
+    /// A cursor without [`TOKEN_FLAG`] (one from before tokens) is sent to
+    /// redis as it is, unchecked. A redis cursor too large to carry, which no
+    /// redis keyspace produces, fails the page rather than being handed out
+    /// bare.
+    ///
+    /// A page whose connection dropped under it is retried once like any read.
+    /// For a first page that is a fresh scan; for a later one the retry
+    /// redials, and its token is then refused as above.
+    pub(crate) async fn scan_page<K: redis::FromRedisValue>(
+        &self,
+        token: u64,
+        pattern: &str,
+        count: usize,
+    ) -> redis::RedisResult<(u64, Vec<K>)> {
+        self.retrying_read(|| self.scan_once(token, pattern, count))
+            .await
+    }
+
+    /// One try at a `SCAN` page for [`Connection::scan_page`]. A refused
+    /// cursor is reported as a failed command: it is not a dropped
+    /// connection, so it is not retried.
+    async fn scan_once<K: redis::FromRedisValue>(
+        &self,
+        token: u64,
+        pattern: &str,
+        count: usize,
+    ) -> Result<(u64, Vec<K>), ConnectionError> {
+        let live = self.get().await.map_err(ConnectionError::Dial)?;
+        let generation = live.1;
+        let cursor = decode_cursor(token, generation).map_err(ConnectionError::Command)?;
+        let scan = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(pattern)
+            .arg("COUNT")
+            .arg(count)
+            .clone();
+        let (next, keys) = self
+            .run::<(u64, Vec<K>)>(live, &scan)
+            .await
+            .map_err(ConnectionError::Command)?;
+        let next = encode_cursor(generation, next).map_err(ConnectionError::Command)?;
+        Ok((next, keys))
+    }
+}
+
+/// Whether `e` says the connection died under the command, as when the
+/// server restarts: a broken pipe, a reset or aborted connection, or an EOF.
+///
+/// A refused connection or a timeout is not one. A refusal reaches a call
+/// only after a redial's bounded attempts have failed, so retrying it would
+/// just run that schedule again and double the time a call takes to fail
+/// while the server is down. A timeout (only with a response timeout set)
+/// means the server is slow, not gone, and retrying would double the wait.
+pub(crate) fn is_dropped_connection(e: &redis::RedisError) -> bool {
+    e.is_io_error() && e.is_unrecoverable_error() && !e.is_connection_refusal()
+}
+
+/// Whether a `ROLE` reply comes from a primary: its first element is
+/// `master` (a replica says `slave`, a sentinel `sentinel`).
+fn is_primary_role(role: &[redis::Value]) -> bool {
+    role.first()
+        .and_then(|kind| redis::from_redis_value::<String>(kind).ok())
+        .is_some_and(|kind| kind == "master")
+}
+
+/// A copy of a failed redial's error for the callers that waited on it
+/// (`RedisError` is not `Clone`). An I/O error stays one, of a kind that
+/// answers `is_connection_refusal`, `is_timeout` and `is_connection_dropped`
+/// as the original does; anything else keeps its kind and text.
+fn copy_redial_error(e: &redis::RedisError) -> redis::RedisError {
+    use std::io::{Error, ErrorKind};
+
+    let io_kind = if e.is_connection_refusal() {
+        Some(ErrorKind::ConnectionRefused)
+    } else if e.is_timeout() {
+        Some(ErrorKind::TimedOut)
+    } else if e.is_connection_dropped() {
+        Some(ErrorKind::BrokenPipe)
+    } else if e.is_io_error() {
+        Some(ErrorKind::Other)
+    } else {
+        None
+    };
+    match io_kind {
+        Some(kind) => Error::new(kind, format!("redis redial failed: {e}")).into(),
+        None => redis::RedisError::from((e.kind(), "redis redial failed", e.to_string())),
+    }
+}
+
+/// The list-keys cursor handed out for redis `SCAN` cursor `next`, issued on
+/// connection `generation`. See [`TOKEN_FLAG`].
+///
+/// A redis cursor too large to carry is refused rather than handed out bare:
+/// a bare cursor with [`TOKEN_FLAG`] set would be read back as a token.
+fn encode_cursor(generation: u64, next: u64) -> redis::RedisResult<u64> {
+    if next == 0 {
+        return Ok(0);
+    }
+    if next > CURSOR_MASK {
+        return Err(redis::RedisError::from((
+            redis::ErrorKind::ClientError,
+            "redis returned a SCAN cursor too large to carry",
+            format!("cursor {next} exceeds {CURSOR_BITS} bits"),
+        )));
+    }
+    Ok(TOKEN_FLAG | ((generation & GENERATION_MASK) << CURSOR_BITS) | next)
+}
+
+/// The redis `SCAN` cursor to send for list-keys cursor `token` on connection
+/// `generation`. A token from another generation is refused; a cursor without
+/// [`TOKEN_FLAG`] (from before tokens) is sent as it is.
+fn decode_cursor(token: u64, generation: u64) -> redis::RedisResult<u64> {
+    if token & TOKEN_FLAG == 0 {
+        return Ok(token);
+    }
+    if (token >> CURSOR_BITS) & GENERATION_MASK != generation & GENERATION_MASK {
+        return Err(redis::RedisError::from((
+            redis::ErrorKind::ClientError,
+            "list-keys cursor is from before a reconnect",
+            "the server may have changed; list again from the first page".to_string(),
+        )));
+    }
+    Ok(token & CURSOR_MASK)
 }
 
 // Implementation for the store interface
@@ -100,7 +893,11 @@ impl<'a> bindings::wasi::keyvalue::store::Host for ActiveCtx<'a> {
 
         plugin.record_operation("open");
 
-        let conn = match plugin.client.get_multiplexed_async_connection().await {
+        // Every bucket shares one multiplexed connection that replaces itself
+        // if the server restarts, rather than dialing (and holding) a fresh
+        // connection per `open`: a guest that opens a bucket per request would
+        // otherwise pay a connect each time.
+        let conn = match plugin.connection().await {
             Ok(conn) => conn,
             Err(e) => {
                 tracing::error!("Failed to connect to Redis: {e}");
@@ -133,10 +930,13 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         plugin.record_operation("get");
 
         let bucket_handle = self.table.get(&bucket)?;
-        let mut conn = bucket_handle.conn.clone();
+        let conn = bucket_handle.conn.clone();
         let redis_key = bucket_handle.prefixed_key(&key);
 
-        match conn.get::<_, Option<Vec<u8>>>(redis_key).await {
+        match conn
+            .query_read::<Option<Vec<u8>>>(redis::cmd("GET").arg(redis_key))
+            .await
+        {
             Ok(value) => Ok(Ok(value)),
             Err(e) => {
                 tracing::error!("Redis error getting key: {}", e);
@@ -157,10 +957,13 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         plugin.record_operation("set");
 
         let bucket_handle = self.table.get(&bucket)?;
-        let mut conn = bucket_handle.conn.clone();
+        let conn = bucket_handle.conn.clone();
         let redis_key = bucket_handle.prefixed_key(&key);
 
-        match conn.set::<_, _, ()>(redis_key, value).await {
+        match conn
+            .query::<()>(redis::cmd("SET").arg(redis_key).arg(value))
+            .await
+        {
             Ok(_) => Ok(Ok(())),
             Err(e) => {
                 tracing::error!("Redis error setting key: {}", e);
@@ -180,10 +983,10 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         plugin.record_operation("delete");
 
         let bucket_handle = self.table.get(&bucket)?;
-        let mut conn = bucket_handle.conn.clone();
+        let conn = bucket_handle.conn.clone();
         let redis_key = bucket_handle.prefixed_key(&key);
 
-        match conn.del::<_, ()>(redis_key).await {
+        match conn.query::<()>(redis::cmd("DEL").arg(redis_key)).await {
             Ok(_) => Ok(Ok(())),
             Err(e) => {
                 tracing::error!("Redis error deleting key: {}", e);
@@ -203,10 +1006,13 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         plugin.record_operation("exists");
 
         let bucket_handle = self.table.get(&bucket)?;
-        let mut conn = bucket_handle.conn.clone();
+        let conn = bucket_handle.conn.clone();
         let redis_key = bucket_handle.prefixed_key(&key);
 
-        match conn.exists::<_, bool>(redis_key).await {
+        match conn
+            .query_read::<bool>(redis::cmd("EXISTS").arg(redis_key))
+            .await
+        {
             Ok(exists) => Ok(Ok(exists)),
             Err(e) => {
                 tracing::error!("Redis error checking key existence: {}", e);
@@ -226,17 +1032,12 @@ impl<'a> bindings::wasi::keyvalue::store::HostBucket for ActiveCtx<'a> {
         plugin.record_operation("list_keys");
 
         let bucket_handle = self.table.get(&bucket)?;
-        let mut conn = bucket_handle.conn.clone();
+        let conn = bucket_handle.conn.clone();
         let pattern = bucket_handle.prefixed_key("*");
         let redis_cursor = cursor.unwrap_or(0);
 
-        let (next_cursor, raw_keys): (u64, Vec<String>) = match redis::cmd("SCAN")
-            .arg(redis_cursor)
-            .arg("MATCH")
-            .arg(&pattern)
-            .arg("COUNT")
-            .arg(LIST_KEYS_BATCH_SIZE)
-            .query_async(&mut conn)
+        let (next_cursor, raw_keys): (u64, Vec<String>) = match conn
+            .scan_page::<String>(redis_cursor, &pattern, LIST_KEYS_BATCH_SIZE)
             .await
         {
             Ok(result) => result,
@@ -292,12 +1093,17 @@ impl<'a> bindings::wasi::keyvalue::atomics::Host for ActiveCtx<'a> {
         plugin.record_operation("increment");
 
         let bucket_handle = self.table.get(&bucket)?;
-        let mut conn = bucket_handle.conn.clone();
+        let conn = bucket_handle.conn.clone();
         let redis_key = bucket_handle.prefixed_key(&key);
 
+        // Sent once: if the connection drops under it, INCRBY may already have
+        // run, so a retry could add twice. The error surfaces instead.
         let delta_i64 = i64::try_from(delta)
             .map_err(|_| wasmtime::format_err!("delta value {} exceeds i64::MAX", delta))?;
-        match conn.incr::<_, _, i64>(redis_key, delta_i64).await {
+        match conn
+            .query::<i64>(redis::cmd("INCRBY").arg(redis_key).arg(delta_i64))
+            .await
+        {
             Ok(new_value) => Ok(Ok(new_value as u64)),
             Err(e) => {
                 tracing::error!("Redis error incrementing key: {}", e);
@@ -321,15 +1127,12 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         plugin.record_operation("get_many");
 
         let bucket_handle = self.table.get(&bucket)?;
-        let mut conn = bucket_handle.conn.clone();
 
         if keys.is_empty() {
             return Ok(Ok(vec![]));
         }
 
-        let redis_keys: Vec<String> = keys.iter().map(|k| bucket_handle.prefixed_key(k)).collect();
-
-        let values: Vec<Option<Vec<u8>>> = match conn.mget(redis_keys.as_slice()).await {
+        let values = match bucket_handle.get_many(&keys).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!("Redis error getting keys: {}", e);
@@ -357,7 +1160,7 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         plugin.record_operation("set_many");
 
         let bucket_handle = self.table.get(&bucket)?;
-        let mut conn = bucket_handle.conn.clone();
+        let conn = bucket_handle.conn.clone();
 
         if key_values.is_empty() {
             return Ok(Ok(()));
@@ -368,7 +1171,10 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
             .map(|(key, value)| (bucket_handle.prefixed_key(&key), value))
             .collect();
 
-        match conn.mset::<_, _, ()>(pairs.as_slice()).await {
+        match conn
+            .query::<()>(redis::cmd("MSET").arg(pairs.as_slice()))
+            .await
+        {
             Ok(_) => Ok(Ok(())),
             Err(e) => {
                 tracing::error!("Redis error setting keys: {}", e);
@@ -390,10 +1196,10 @@ impl<'a> bindings::wasi::keyvalue::batch::Host for ActiveCtx<'a> {
         let bucket_handle = self.table.get(&bucket)?;
 
         let values = futures::stream::FuturesOrdered::from_iter(keys.iter().map(|key| {
-            let mut conn = bucket_handle.conn.clone();
+            let conn = bucket_handle.conn.clone();
             let redis_key = bucket_handle.prefixed_key(key);
             async move {
-                match conn.del::<_, ()>(redis_key).await {
+                match conn.query::<()>(redis::cmd("DEL").arg(redis_key)).await {
                     Ok(_) => Ok(()),
                     Err(e) => {
                         tracing::error!("Redis error deleting key: {}", e);
@@ -446,7 +1252,7 @@ impl HostPlugin for RedisKeyValue {
             workload_id = component_handle.id(),
             "Adding keyvalue interfaces to linker for workload"
         );
-        let linker = component_handle.linker();
+        let linker = component_handle.linker()?;
 
         bindings::wasi::keyvalue::store::add_to_linker::<_, SharedCtx>(linker, extract_active_ctx)?;
         bindings::wasi::keyvalue::atomics::add_to_linker::<_, SharedCtx>(
@@ -474,5 +1280,473 @@ impl HostPlugin for RedisKeyValue {
         tracing::debug!("WasiKeyvalue plugin unbound from workload '{workload_id}'");
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(entries: &[(&str, &str)]) -> Config {
+        entries.iter().copied().collect()
+    }
+
+    #[test]
+    fn connection_settings_default_to_the_v1_provider_values() {
+        let settings = ConnectionSettings::from_config(&config(&[("url", "redis://h")])).unwrap();
+        assert_eq!(settings, ConnectionSettings::default());
+        assert_eq!(settings.reconnect_num_retries, 3);
+        assert_eq!(settings.reconnect_max_delay_ms, 300);
+        assert_eq!(settings.connection_timeout_ms, 3_000);
+        assert_eq!(settings.response_timeout_ms, None);
+    }
+
+    #[test]
+    fn connection_settings_read_the_v1_spelling_too() {
+        let settings = ConnectionSettings::from_config(&config(&[
+            ("BACKEND_RECONNECT_NUM_RETRIES", "5"),
+            ("backend_reconnect_max_delay_ms", "1000"),
+            ("Backend-Connection-Timeout-Ms", "250"),
+            ("backend-response-timeout-ms", "2000"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            settings,
+            ConnectionSettings {
+                reconnect_num_retries: 5,
+                reconnect_max_delay_ms: 1_000,
+                connection_timeout_ms: 250,
+                response_timeout_ms: Some(2_000),
+            }
+        );
+    }
+
+    #[test]
+    fn connection_settings_refuse_what_they_cannot_honor() {
+        for (key, value, expect) in [
+            (RECONNECT_NUM_RETRIES_KEY, "three", "whole number"),
+            (RECONNECT_NUM_RETRIES_KEY, "-1", "whole number"),
+            (RECONNECT_NUM_RETRIES_KEY, "1001", "between 0 and 1000"),
+            (RECONNECT_MAX_DELAY_MS_KEY, "1.5", "whole number"),
+            (RECONNECT_MAX_DELAY_MS_KEY, "600001", "between 0 and 600000"),
+            (CONNECTION_TIMEOUT_MS_KEY, "0", "between 1 and 600000"),
+            (CONNECTION_TIMEOUT_MS_KEY, "", "whole number"),
+            (RESPONSE_TIMEOUT_MS_KEY, "0", "between 1 and 600000"),
+            (RESPONSE_TIMEOUT_MS_KEY, "off", "whole number"),
+        ] {
+            let err = ConnectionSettings::from_config(&config(&[(key, value)]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(key), "{key}={value:?}: {err}");
+            assert!(err.contains(expect), "{key}={value:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_refused_secret_setting_is_not_quoted() {
+        for value in ["hunter2", "987654321"] {
+            let text = config(&[(RESPONSE_TIMEOUT_MS_KEY, value)]);
+            let err = format!("{:#}", ConnectionSettings::from_config(&text).unwrap_err());
+            assert!(err.contains(value), "{err}");
+
+            let mut secret = Config::new();
+            secret.insert(
+                RESPONSE_TIMEOUT_MS_KEY,
+                crate::plugin::SecretValue::new(value),
+            );
+            let err = format!(
+                "{:#}",
+                ConnectionSettings::from_config(&secret).unwrap_err()
+            );
+            assert!(err.contains(RESPONSE_TIMEOUT_MS_KEY), "{err}");
+            assert!(!err.contains(value), "{err}");
+            assert!(err.contains("<redacted>"), "{err}");
+        }
+    }
+
+    #[test]
+    fn redial_limit_errors_do_not_quote_totals_derived_from_secrets() {
+        let mut config = config(&[
+            (RECONNECT_NUM_RETRIES_KEY, "1"),
+            (RECONNECT_MAX_DELAY_MS_KEY, "1"),
+        ]);
+        config.insert(
+            CONNECTION_TIMEOUT_MS_KEY,
+            crate::plugin::SecretValue::new("400601"),
+        );
+        let err = format!(
+            "{:#}",
+            ConnectionSettings::from_config(&config).unwrap_err()
+        );
+        assert!(err.contains(CONNECTION_TIMEOUT_MS_KEY), "{err}");
+        assert!(err.contains("600000ms limit"), "{err}");
+        assert!(!err.contains("400601"), "{err}");
+        assert!(!err.contains("801203"), "{err}");
+    }
+
+    #[test]
+    fn connection_settings_refuse_one_key_set_twice_differently() {
+        let err = ConnectionSettings::from_config(&config(&[
+            ("BACKEND_CONNECTION_TIMEOUT_MS", "100"),
+            ("backend-connection-timeout-ms", "200"),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("twice"), "{err}");
+
+        // The same value under two spellings is not a conflict.
+        ConnectionSettings::from_config(&config(&[
+            ("BACKEND_CONNECTION_TIMEOUT_MS", "100"),
+            ("backend-connection-timeout-ms", "100"),
+        ]))
+        .unwrap();
+    }
+
+    #[test]
+    fn settings_compare_by_parsed_value_not_spelling() {
+        let a = ConnectionSettings::from_config(&config(&[("BACKEND_RESPONSE_TIMEOUT_MS", "500")]))
+            .unwrap();
+        let b =
+            ConnectionSettings::from_config(&config(&[("backend-response-timeout-ms", "0500")]))
+                .unwrap();
+        let c = ConnectionSettings::from_config(&config(&[("backend-response-timeout-ms", "600")]))
+            .unwrap();
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, ConnectionSettings::default());
+    }
+
+    /// The first connect is not put through the reconnect backoff: a refused
+    /// connection is reported at once, however generous the redial schedule.
+    #[tokio::test]
+    async fn the_first_connect_fails_fast_when_nothing_listens() {
+        // A port that was just free; nothing listens on it once this drops.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let client = redis::Client::open(format!("redis://127.0.0.1:{port}")).unwrap();
+        // Ten redials with up to five seconds between them: a first connect put
+        // through the redial schedule would take tens of seconds.
+        let settings = ConnectionSettings::from_config(&config(&[
+            (RECONNECT_NUM_RETRIES_KEY, "10"),
+            (RECONNECT_MAX_DELAY_MS_KEY, "5000"),
+        ]))
+        .unwrap();
+        let started = std::time::Instant::now();
+        let err = Connection::connect(client, settings)
+            .await
+            .err()
+            .expect("nothing listens on the port");
+        let elapsed = started.elapsed();
+        assert!(err.is_connection_refusal(), "{err}");
+        // Windows retries a refused SYN before reporting it, which takes about
+        // two seconds; the redial schedule above would take tens of seconds.
+        let bound = Duration::from_secs(if cfg!(windows) { 5 } else { 1 });
+        assert!(elapsed < bound, "the first connect took {elapsed:?}");
+    }
+
+    #[test]
+    fn redial_pauses_never_exceed_the_configured_maximum() {
+        for max in [0u64, 1, 50, 300, 10_000] {
+            let settings = ConnectionSettings::from_config(&config(&[(
+                RECONNECT_MAX_DELAY_MS_KEY,
+                &max.to_string(),
+            )]))
+            .unwrap();
+            for attempt in [0usize, 1, 2, 3, 10, 64, usize::MAX] {
+                let ceiling = REDIAL_BASE_DELAY_MS
+                    .saturating_mul(1 << u32::try_from(attempt).unwrap_or(u32::MAX).min(16))
+                    .min(max);
+                for _ in 0..50 {
+                    let pause = settings.redial_delay(attempt);
+                    assert!(
+                        pause <= Duration::from_millis(max),
+                        "attempt {attempt}, max {max}ms: {pause:?}"
+                    );
+                    assert!(
+                        pause >= Duration::from_millis(ceiling / 2),
+                        "attempt {attempt}, max {max}ms: {pause:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "wasm_component_model_implements")]
+    #[test]
+    fn every_connection_setting_is_claimed_for_the_host() {
+        for key in CONNECTION_SETTING_KEYS {
+            assert!(
+                crate::plugin::multiplex::KEYVALUE_HOST_OWNED_KEYS.contains(key),
+                "{key} is not host-owned"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_whose_redial_could_take_too_long_are_refused() {
+        // 1001 attempts that each run into a 3s connect timeout.
+        let err = ConnectionSettings::from_config(&config(&[(RECONNECT_NUM_RETRIES_KEY, "1000")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("together"), "{err}");
+
+        // One attempt may take the whole budget, but not two.
+        ConnectionSettings::from_config(&config(&[
+            (RECONNECT_NUM_RETRIES_KEY, "0"),
+            (CONNECTION_TIMEOUT_MS_KEY, "600000"),
+        ]))
+        .unwrap();
+        ConnectionSettings::from_config(&config(&[
+            (RECONNECT_NUM_RETRIES_KEY, "1"),
+            (CONNECTION_TIMEOUT_MS_KEY, "600000"),
+        ]))
+        .unwrap_err();
+
+        let worst = ConnectionSettings::default().worst_case_redial_ms();
+        // Four 3s attempts and pauses of at most 50, 100 and 200ms.
+        assert_eq!(worst, 4 * 3_000 + 50 + 100 + 200);
+    }
+
+    #[test]
+    fn list_keys_cursors_round_trip_and_stay_json_safe() {
+        for generation in [0, 1, 7, GENERATION_MASK, GENERATION_MASK + 1, u64::MAX] {
+            for next in [1, 12_345, CURSOR_MASK] {
+                let token = encode_cursor(generation, next).unwrap();
+                assert!(token < 1 << 53, "{token} does not fit a JSON number");
+                assert_eq!(decode_cursor(token, generation).unwrap(), next);
+            }
+            assert_eq!(
+                encode_cursor(generation, 0).unwrap(),
+                0,
+                "zero ends a listing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cursor_from_another_connection_is_refused() {
+        let token = encode_cursor(1, 99).unwrap();
+        let err = decode_cursor(token, 2).unwrap_err().to_string();
+        assert!(err.contains("first page"), "{err}");
+        // The generation a token carries wraps, after 4096 reconnects.
+        assert_eq!(decode_cursor(token, 1 + GENERATION_MASK + 1).unwrap(), 99);
+    }
+
+    #[test]
+    fn an_untagged_cursor_is_sent_as_it_is() {
+        assert_eq!(decode_cursor(12_345, 7).unwrap(), 12_345);
+    }
+
+    #[test]
+    fn a_scan_cursor_too_large_to_carry_is_refused() {
+        let err = encode_cursor(0, CURSOR_MASK + 1).unwrap_err().to_string();
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn dead_connections_are_dropped_but_slow_and_read_only_ones_are_not() {
+        use std::io::{Error, ErrorKind};
+
+        // A read-only server keeps its connection (reads still work there)
+        // unless a primary turns out to be reachable, and the refused write
+        // is not retried.
+        let readonly = redis::RedisError::from((
+            redis::ErrorKind::ReadOnly,
+            "READONLY",
+            "You can't write against a read only replica.".to_string(),
+        ));
+        assert!(!readonly.is_unrecoverable_error());
+        assert!(!is_dropped_connection(&readonly));
+
+        let broken = redis::RedisError::from(Error::from(ErrorKind::BrokenPipe));
+        assert!(broken.is_unrecoverable_error());
+        assert!(is_dropped_connection(&broken));
+
+        let timeout = redis::RedisError::from(Error::from(ErrorKind::TimedOut));
+        assert!(!timeout.is_unrecoverable_error());
+        assert!(!is_dropped_connection(&timeout));
+
+        let refused = redis::RedisError::from(Error::from(ErrorKind::ConnectionRefused));
+        assert!(!is_dropped_connection(&refused));
+    }
+
+    #[test]
+    fn only_a_primary_role_is_followed() {
+        use redis::Value;
+
+        let reply = |kind: &str| {
+            vec![
+                Value::BulkString(kind.as_bytes().to_vec()),
+                Value::Int(0),
+                Value::Array(vec![]),
+            ]
+        };
+        assert!(is_primary_role(&reply("master")));
+        assert!(!is_primary_role(&reply("slave")));
+        assert!(!is_primary_role(&reply("sentinel")));
+        assert!(!is_primary_role(&[]));
+        assert!(!is_primary_role(&[Value::Int(1)]));
+    }
+
+    #[test]
+    fn a_waiters_copy_of_a_redial_error_answers_like_the_original() {
+        use std::io::{Error, ErrorKind};
+
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::TimedOut,
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::Other,
+        ] {
+            let original = redis::RedisError::from(Error::from(kind));
+            let copy = copy_redial_error(&original);
+            assert_eq!(copy.is_io_error(), original.is_io_error(), "{kind:?}");
+            assert_eq!(
+                copy.is_connection_refusal(),
+                original.is_connection_refusal(),
+                "{kind:?}"
+            );
+            assert_eq!(copy.is_timeout(), original.is_timeout(), "{kind:?}");
+            assert_eq!(
+                copy.is_connection_dropped(),
+                original.is_connection_dropped(),
+                "{kind:?}"
+            );
+            assert!(copy.to_string().contains("redial failed"), "{copy}");
+        }
+
+        let auth = redis::RedisError::from((
+            redis::ErrorKind::AuthenticationFailed,
+            "WRONGPASS",
+            "invalid username-password pair".to_string(),
+        ));
+        let copy = copy_redial_error(&auth);
+        assert_eq!(copy.kind(), redis::ErrorKind::AuthenticationFailed);
+        assert!(copy.to_string().contains("WRONGPASS"), "{copy}");
+    }
+
+    #[test]
+    fn url_settings_are_read_and_taken_out_of_the_url() {
+        let url = url::Url::parse(
+            "redis://h:6379/2?BACKEND_RESPONSE_TIMEOUT_MS=500&protocol=resp3\
+             &backend-reconnect-num-retries=1",
+        )
+        .unwrap();
+        let (rest, settings) = split_connection_settings(&url).unwrap();
+        assert_eq!(rest.as_str(), "redis://h:6379/2?protocol=resp3");
+        assert_eq!(settings.response_timeout_ms, Some(500));
+        assert_eq!(settings.reconnect_num_retries, 1);
+
+        let only = url::Url::parse("redis://h:6379?backend-connection-timeout-ms=250").unwrap();
+        let (rest, settings) = split_connection_settings(&only).unwrap();
+        assert_eq!(rest.as_str(), "redis://h:6379");
+        assert_eq!(settings.connection_timeout_ms, 250);
+
+        let plain = url::Url::parse("redis://h:6379").unwrap();
+        let (rest, settings) = split_connection_settings(&plain).unwrap();
+        assert_eq!(rest, plain);
+        assert_eq!(settings, ConnectionSettings::default());
+
+        let bad = url::Url::parse("redis://h?backend-response-timeout-ms=soon").unwrap();
+        let err = RedisKeyValue::from_url(&bad).err().unwrap().to_string();
+        assert!(err.contains(RESPONSE_TIMEOUT_MS_KEY), "{err}");
+
+        let twice = url::Url::parse(
+            "redis://h?backend-response-timeout-ms=1&backend-response-timeout-ms=1",
+        )
+        .unwrap();
+        let err = split_connection_settings(&twice).unwrap_err().to_string();
+        assert!(err.contains("more than once"), "{err}");
+    }
+
+    use testcontainers::{
+        ContainerAsync, GenericImage,
+        core::{IntoContainerPort, WaitFor},
+        runners::AsyncRunner,
+    };
+
+    async fn start_redis() -> (ContainerAsync<GenericImage>, url::Url) {
+        let container = GenericImage::new("redis", "7-alpine")
+            .with_exposed_port(6379.tcp())
+            .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+            .start()
+            .await
+            .expect("redis starts");
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = url::Url::parse(&format!("redis://127.0.0.1:{port}")).unwrap();
+        (container, url)
+    }
+
+    /// The single-backend plugin shares one connection across its buckets, a
+    /// bucket's reads survive the server dropping that connection, and
+    /// `get-many` of one absent key returns one `None`.
+    #[tokio::test]
+    #[ignore = "requires Docker (redis); run with `cargo test --include-ignored`"]
+    async fn the_single_backend_plugin_shares_and_heals_one_connection() {
+        let (_redis, url) = start_redis().await;
+        let plugin = RedisKeyValue::from_url(&url).unwrap();
+        let first = plugin.connection().await.unwrap();
+        let second = plugin.connection().await.unwrap();
+        assert!(
+            Arc::ptr_eq(&first.inner, &second.inner),
+            "one shared connection"
+        );
+
+        let mut raw = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        redis::cmd("SET")
+            .arg("b:k")
+            .arg("v")
+            .query_async::<()>(&mut raw)
+            .await
+            .unwrap();
+        let bucket = BucketHandle {
+            conn: first,
+            prefix: "b".to_string(),
+        };
+
+        // Kill every client connection but this one, as a server restart would.
+        redis::cmd("CLIENT")
+            .arg("KILL")
+            .arg("TYPE")
+            .arg("normal")
+            .query_async::<u64>(&mut raw)
+            .await
+            .unwrap();
+        let values = bucket
+            .get_many(&["k".to_string(), "absent".to_string()])
+            .await
+            .expect("a read is retried on a fresh connection");
+        assert_eq!(values, vec![Some(b"v".to_vec()), None]);
+        assert_eq!(
+            bucket.get_many(&["absent".to_string()]).await.unwrap(),
+            vec![None]
+        );
+    }
+
+    /// `open` checks a connection that has been quiet, so it fails while the
+    /// server is down, as it did when each `open` dialed.
+    #[tokio::test]
+    #[ignore = "requires Docker (redis); run with `cargo test --include-ignored`"]
+    async fn open_fails_while_the_server_is_down() {
+        let (redis, url) = start_redis().await;
+        let plugin = RedisKeyValue::from_url(&url).unwrap();
+        plugin.connection().await.unwrap();
+
+        redis.stop().await.unwrap();
+        tokio::time::sleep(IDLE_PROBE_AFTER + Duration::from_millis(500)).await;
+        plugin
+            .connection()
+            .await
+            .err()
+            .expect("the PING finds the server gone");
     }
 }

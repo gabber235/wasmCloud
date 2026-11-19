@@ -9,6 +9,7 @@ pub use propagation::{PropagationContext, context_from_propagation, inject_conte
 // them through the module rather than re-exporting keeps that path from
 // reading as unused in a build without that feature.
 pub(crate) mod otel;
+pub(crate) mod rate_limit;
 
 pub use meters::{
     FuelConsumptionMeter, GuestMeter, InvocationMeter, MeterKind, Meters, WorkloadIdentity,
