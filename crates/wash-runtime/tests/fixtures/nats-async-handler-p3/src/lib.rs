@@ -61,6 +61,16 @@ const CONC_MARKER: &str = "conc:";
 /// next delivery arrives, short enough not to pace the test.
 const CONC_NANOS: u64 = 50_000_000; // 50ms
 
+/// Deliveries on a system subject are relayed through this subject, and its
+/// answer goes back on the delivery's `reply-to`.
+///
+/// This stands in for an auth callout responder. The test signs the answer,
+/// because signing is not what the host is under test for; the subscription,
+/// the delivery and the reply to the server's own inbox all go through the host.
+const RELAY_SUBJECT: &str = "test.relay";
+/// How long the relay waits for the test to answer.
+const RELAY_TIMEOUT_MS: u32 = 5_000;
+
 /// Lives in this instance's linear memory and nowhere else: a fresh store per
 /// delivery reads 1 every time, a warm instance counts up.
 static WARM_DELIVERIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -402,11 +412,40 @@ async fn kv_api_probe(spec: &str) -> Result<String, NatsError> {
     }
 }
 
+/// Answers `msg` on its `reply-to` with what [`RELAY_SUBJECT`] answers for it.
+async fn relay(msg: NatsMessage) -> Result<(), String> {
+    let reply_to = msg
+        .reply_to
+        .ok_or_else(|| format!("a delivery on `{}` has no reply-to", msg.subject))?;
+    let answer = core::request(
+        NatsMessage {
+            subject: RELAY_SUBJECT.to_string(),
+            body: msg.body,
+            reply_to: None,
+            headers: None,
+        },
+        RELAY_TIMEOUT_MS,
+    )
+    .await
+    .map_err(|e| label(&e))?;
+    core::publish(NatsMessage {
+        subject: reply_to,
+        body: answer.body,
+        reply_to: None,
+        headers: None,
+    })
+    .await
+    .map_err(|e| label(&e))
+}
+
 impl CoreGuest for Component {
     /// Echoes onto `reply-to` when there is one — a request/reply round trip
     /// driven entirely from inside an async export.
     async fn handle_message(msg: NatsMessage) -> Result<(), String> {
         monotonic_clock::wait_for(YIELD_NANOS).await;
+        if msg.subject.starts_with("$SYS.") {
+            return relay(msg).await;
+        }
         let body = String::from_utf8_lossy(&msg.body).to_string();
         if let Some(spec) = body.strip_prefix("js-api:") {
             let outcome = js_api_probe(spec).await.unwrap_or_else(|e| label(&e));

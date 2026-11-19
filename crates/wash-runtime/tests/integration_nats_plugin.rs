@@ -2837,3 +2837,222 @@ async fn a_recreated_kv_bucket_replays_early_writes_during_consumer_recovery() -
     let _ = proxy.await;
     Ok(())
 }
+
+/// The account an auth callout places the clients it authorizes in.
+const CALLOUT_TARGET_ACCOUNT: &str = "APP";
+
+/// A component granted `$SYS.REQ.USER.AUTH` answers nats-server's auth callout,
+/// and the client the answer vouches for is let in.
+///
+/// The server sends each callout with a reply inbox under `$SYS._INBOX.`, which
+/// no grant names, so the answer only gets out on the reply grant the host
+/// records for that delivery. The fixture relays the request to the test to be
+/// signed, so the issuer key stays out of the component.
+#[tokio::test]
+#[ignore = "requires Docker (NATS); run with `cargo test --include-ignored`"]
+async fn a_component_answers_the_auth_callout() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init()
+        .ok();
+    let issuer = Arc::new(nkeys::KeyPair::new_account());
+    let config = format!(
+        r#"
+accounts {{
+  AUTH {{ users: [ {{ user: auth, password: auth }} ] }}
+  {CALLOUT_TARGET_ACCOUNT} {{}}
+  SYS {{}}
+}}
+system_account: SYS
+authorization {{
+  auth_callout {{
+    issuer: {issuer}
+    auth_users: [ auth ]
+    account: AUTH
+  }}
+}}
+"#,
+        issuer = issuer.public_key()
+    );
+    let container = GenericImage::new("nats", "2.12.15-alpine")
+        .with_exposed_port(4222.tcp())
+        .with_wait_for(WaitFor::message_on_stderr("Server is ready"))
+        .with_copy_to("/etc/nats/callout.conf", config.into_bytes())
+        .with_cmd(["-c", "/etc/nats/callout.conf"])
+        .start()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to start NATS container: {e}"))?;
+    let port = container
+        .get_host_port_ipv4(4222)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to get NATS port: {e}"))?;
+    let nats_url = format!("nats://127.0.0.1:{port}");
+
+    let signer = connect_as(&nats_url, "auth", "auth", Duration::from_secs(30)).await?;
+    let mut requests = signer.subscribe("test.relay").await?;
+    signer.flush().await?;
+    let signing = tokio::spawn({
+        let signer = signer.clone();
+        let issuer = Arc::clone(&issuer);
+        async move {
+            while let Some(request) = requests.next().await {
+                let Some(reply) = request.reply else {
+                    continue;
+                };
+                let answer = authorize(&issuer, &request.payload)?;
+                signer.publish(reply, answer.into()).await?;
+            }
+            anyhow::Ok(())
+        }
+    });
+
+    let host = start_host().await?;
+    host.workload_start(workload_request(
+        "wl-auth-callout",
+        nats_async_interface(&[
+            ("servers", &nats_url),
+            ("username", "auth"),
+            ("password", "auth"),
+            ("subject-allow", "$SYS.REQ.USER.AUTH,test.relay"),
+            ("core-subscriptions", "$SYS.REQ.USER.AUTH"),
+        ]),
+    ))
+    .await
+    .context("failed to start the auth callout workload")?;
+
+    // Until the component's subscription is live a callout has no responder
+    // and the connection is refused, so keep knocking.
+    let client = connect_as(&nats_url, "alice", "secret", Duration::from_secs(30))
+        .await
+        .context("the component never authorized a client through the callout")?;
+    let mut echo = client.subscribe("app.ping").await?;
+    client.publish("app.ping", "pong".into()).await?;
+    let delivered = timeout(Duration::from_secs(5), echo.next())
+        .await
+        .context("the authorized client never received its own message")?
+        .context("the authorized client's subscription closed")?;
+    assert_eq!(delivered.payload.as_ref(), b"pong");
+
+    signing.abort();
+    Ok(())
+}
+
+/// Connects with a user and password once the server accepts them, or gives up
+/// at `budget`.
+async fn connect_as(
+    url: &str,
+    user: &str,
+    password: &str,
+    budget: Duration,
+) -> Result<async_nats::Client> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let attempt =
+            async_nats::ConnectOptions::with_user_and_password(user.into(), password.into())
+                .connect(url)
+                .await;
+        match attempt {
+            Ok(client) => return Ok(client),
+            Err(e) if tokio::time::Instant::now() >= deadline => {
+                return Err(anyhow::anyhow!("{user} never connected to {url}: {e}"));
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
+}
+
+/// The signed authorization response for an auth callout request: it admits
+/// the user the server generated for this connection into
+/// [`CALLOUT_TARGET_ACCOUNT`] without further limits.
+fn authorize(issuer: &nkeys::KeyPair, request: &[u8]) -> Result<String> {
+    let request = std::str::from_utf8(request).context("the callout request is not text")?;
+    let claims: serde_json::Value = serde_json::from_slice(&base64url_decode(
+        request
+            .split('.')
+            .nth(1)
+            .context("the callout request is not a JWT")?,
+    )?)?;
+    let user = claims
+        .pointer("/nats/user_nkey")
+        .and_then(serde_json::Value::as_str)
+        .context("the callout request names no user nkey")?;
+    let server = claims
+        .pointer("/nats/server_id/id")
+        .and_then(serde_json::Value::as_str)
+        .context("the callout request names no server")?;
+    let user_jwt = sign_jwt(
+        issuer,
+        serde_json::json!({
+            "sub": user,
+            "aud": CALLOUT_TARGET_ACCOUNT,
+            "name": "callout-user",
+            "nats": {
+                "pub": {}, "sub": {},
+                "subs": -1, "data": -1, "payload": -1,
+                "type": "user", "version": 2,
+            },
+        }),
+    )?;
+    sign_jwt(
+        issuer,
+        serde_json::json!({
+            "sub": user,
+            "aud": server,
+            "nats": { "jwt": user_jwt, "type": "authorization_response", "version": 2 },
+        }),
+    )
+}
+
+/// Encodes `claims` as a NATS JWT issued and signed by `issuer`.
+fn sign_jwt(issuer: &nkeys::KeyPair, claims: serde_json::Value) -> Result<String> {
+    let serde_json::Value::Object(mut claims) = claims else {
+        anyhow::bail!("JWT claims must be an object");
+    };
+    let issued_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    claims.insert("iss".into(), issuer.public_key().into());
+    claims.insert("iat".into(), issued_at.as_secs().into());
+    claims.insert("jti".into(), issued_at.as_nanos().to_string().into());
+    let header = base64url_encode(br#"{"typ":"JWT","alg":"ed25519-nkey"}"#);
+    let payload = base64url_encode(&serde_json::to_vec(&claims)?);
+    let signed = format!("{header}.{payload}");
+    let signature = issuer
+        .sign(signed.as_bytes())
+        .map_err(|e| anyhow::anyhow!("failed to sign a JWT: {e}"))?;
+    Ok(format!("{signed}.{}", base64url_encode(&signature)))
+}
+
+const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// Unpadded base64url, the encoding JWT segments use.
+fn base64url_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+        let digits =
+            (0..=chunk.len()).filter_map(|i| BASE64URL.get((n >> (18 - 6 * i) & 63) as usize));
+        out.extend(digits.map(|&digit| char::from(digit)));
+    }
+    out
+}
+
+/// Decodes unpadded base64url.
+fn base64url_decode(text: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let (mut bits, mut held) = (0u32, 0u32);
+    for c in text.trim_end_matches('=').bytes() {
+        let value = BASE64URL
+            .iter()
+            .position(|&d| d == c)
+            .context("not base64url")?;
+        bits = bits << 6 | value as u32;
+        held += 6;
+        if held >= 8 {
+            held -= 8;
+            out.push((bits >> held) as u8);
+        }
+    }
+    Ok(out)
+}
