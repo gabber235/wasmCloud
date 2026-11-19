@@ -16,7 +16,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 use super::config::{ConnKey, NatsConfig};
-use super::policy::PolicyEngine;
+use super::policy::{PolicyEngine, ReplyGrants};
 
 /// Budget for draining one connection's in-flight work at shutdown.
 ///
@@ -27,13 +27,6 @@ use super::policy::PolicyEngine;
 fn drain_budget() -> std::time::Duration {
     crate::timeouts::plugin_stop().saturating_sub(std::time::Duration::from_millis(500))
 }
-
-/// How long a delivered `reply-to` stays publishable — see [`ConnHandle::pending_replies`].
-const REPLY_GRANT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Cap on outstanding reply grants, so a firehose of unanswered requests cannot
-/// grow the map without bound.
-const MAX_PENDING_REPLIES: usize = 1024;
 
 /// A live connection plus everything derived from the config that opened it.
 pub struct ConnHandle {
@@ -79,12 +72,7 @@ pub struct ConnHandle {
     pub publishes: super::ledger::PublishLedger,
     /// Inboxes the host has handed to the guest as a `reply-to`, each good for
     /// one publish.
-    ///
-    /// A responder has to answer on a random `_INBOX` subject that no sane
-    /// grant covers. Granting `_INBOX.>` instead would let the workload read
-    /// every other client's replies, so the authorization is scoped to the
-    /// exact inbox the host just delivered and consumed on first use.
-    pending_replies: std::sync::Mutex<HashMap<String, tokio::time::Instant>>,
+    pub(super) reply_grants: ReplyGrants,
 }
 
 impl ConnHandle {
@@ -111,29 +99,6 @@ impl ConnHandle {
     /// The connected server's version, live for the same reason.
     pub fn server_version(&self) -> String {
         self.client.server_info().version
-    }
-
-    /// Records that `inbox` was handed to the guest and may be replied to once.
-    pub fn grant_reply(&self, inbox: &str) {
-        let now = tokio::time::Instant::now();
-        let Ok(mut pending) = self.pending_replies.lock() else {
-            return;
-        };
-        pending.retain(|_, granted| now.duration_since(*granted) < REPLY_GRANT_TTL);
-        if pending.len() >= MAX_PENDING_REPLIES {
-            return;
-        }
-        pending.insert(inbox.to_string(), now);
-    }
-
-    /// Consumes a reply grant, if this subject has an unexpired one.
-    pub fn take_reply_grant(&self, subject: &str) -> bool {
-        let Ok(mut pending) = self.pending_replies.lock() else {
-            return false;
-        };
-        pending.remove(subject).is_some_and(|granted| {
-            tokio::time::Instant::now().duration_since(granted) < REPLY_GRANT_TTL
-        })
     }
 }
 
@@ -480,7 +445,7 @@ impl ConnectionRegistry {
             fetch_budget: Arc::new(super::jetstream::FetchBudget::new(
                 u64::try_from(config.limits.subscription_capacity_bytes).unwrap_or(u64::MAX),
             )),
-            pending_replies: std::sync::Mutex::new(HashMap::new()),
+            reply_grants: ReplyGrants::default(),
             activity: Arc::new(super::activity::Activity::default()),
         });
 

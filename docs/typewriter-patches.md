@@ -28,7 +28,7 @@ Kept on the new base:
 - W3C trace context over NATS headers and outbound HTTP.
 - Per entry NATS configuration, merged with upstream's `Key::identity` and retyped for `wit::Config`.
 - Broker synchronization, `WasmcloudNats::wait_core_idle` and activity generations.
-- System subjects through normal host grants.
+- System subjects through normal host grants, with one time reply grants limited to the server's own `$SYS._INBOX.` inboxes.
 - `HostCommand::handle_with_plugins` and `ClusterHostBuilder::with_plugin(Arc<dyn HostPlugin>)`.
 - The `fork-release` workflow and repository guards on upstream publishing workflows.
 
@@ -51,6 +51,8 @@ Upstream instead releases the routes from a detached task after the drain and ke
 ## Host policy
 
 System subjects follow normal host subject grants. There is no special `$SYS` prohibition or auth callout exception machinery. Production grants `$SYS.REQ.USER.AUTH` explicitly alongside application subjects. Other system subjects remain unavailable without a matching host grant. Workloads cannot widen those grants when `workloadConfig = deny`.
+
+A one time reply grant covers a system subject only under `$SYS._INBOX.`, where nats-server puts the reply inbox of a request it sends itself, such as an auth callout. The requester picks the `reply-to`, so without this limit a requester could aim a responder at `$SYS.REQ.SERVER.PING` or any other system request. The server's other reply subject, `$SYS._INBOX_.<server id>`, answers account connection counts between servers and stays reachable only through a host grant.
 
 ## Interface entry configuration
 

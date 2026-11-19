@@ -90,7 +90,7 @@ pub(super) fn check_publish_subject(
 ) -> Result<(), types::NatsError> {
     match conn.policy.check_subject(subject) {
         Ok(()) => Ok(()),
-        Err(Denied::NotGranted) if conn.take_reply_grant(subject) => Ok(()),
+        Err(Denied::NotGranted) if conn.reply_grants.take(subject) => Ok(()),
         Err(reason) => Err(denied(reason, types::DeniedResource::Subject, subject)),
     }
 }

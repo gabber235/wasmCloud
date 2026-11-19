@@ -4,6 +4,12 @@
 //! this, importing `wasmcloud:nats/core` would reach every subject the
 //! connection can see.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use tokio::time::Instant;
+
 use super::config::PolicySpec;
 
 /// Subject prefixes denied regardless of grant.
@@ -25,6 +31,70 @@ const RESERVED_SUBJECT_PREFIXES: &[&str] = &["$JS.", "$KV.", "$OBJ.", "_nats_pus
 /// [`super::conn::workload_inbox_prefix`] builds its per-workload prefixes from
 /// this same token so the two cannot drift.
 pub const INBOX_TOKEN_PREFIX: &str = "_INBOX";
+
+/// Where nats-server puts the reply inbox of a request it sends itself, such
+/// as an auth callout.
+///
+/// Its other system reply subject, `$SYS._INBOX_.<server id>`, answers account
+/// connection counts between servers, which no workload takes part in.
+const SERVER_INBOX_PREFIX: &str = "$SYS._INBOX.";
+
+/// How long a delivered `reply-to` stays publishable.
+const REPLY_GRANT_TTL: Duration = Duration::from_secs(30);
+
+/// Cap on outstanding reply grants, so a firehose of unanswered requests cannot
+/// grow the map without bound.
+const MAX_PENDING_REPLIES: usize = 1024;
+
+/// Inboxes the host has handed to a guest as a `reply-to`, each good for one
+/// publish.
+///
+/// A responder has to answer on a random `_INBOX` subject that no sane grant
+/// covers. Granting `_INBOX.>` instead would let the workload read every other
+/// client's replies, so the authorization is scoped to the exact inbox the host
+/// just delivered and consumed on first use.
+///
+/// The requester picks the `reply-to`, so a grant must not reach anything a
+/// requester could abuse. System subjects follow normal host grants and are
+/// not reserved, so a requester could otherwise aim a responder at
+/// `$SYS.REQ.SERVER.PING` or another system request. A grant therefore covers
+/// a system subject only inside the server's own reply inboxes, where an auth
+/// callout expects its answer.
+#[derive(Debug, Default)]
+pub struct ReplyGrants {
+    pending: Mutex<HashMap<String, Instant>>,
+}
+
+impl ReplyGrants {
+    /// Records that `inbox` was handed to the guest and may be replied to once.
+    ///
+    /// A system subject outside the server's reply inboxes is not recorded.
+    pub fn grant(&self, inbox: &str) {
+        let system = inbox.split('.').next() == Some("$SYS");
+        if system && !inbox.starts_with(SERVER_INBOX_PREFIX) {
+            return;
+        }
+        let now = Instant::now();
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        pending.retain(|_, granted| now.duration_since(*granted) < REPLY_GRANT_TTL);
+        if pending.len() >= MAX_PENDING_REPLIES {
+            return;
+        }
+        pending.insert(inbox.to_string(), now);
+    }
+
+    /// Consumes a reply grant, if this subject has an unexpired one.
+    pub fn take(&self, subject: &str) -> bool {
+        let Ok(mut pending) = self.pending.lock() else {
+            return false;
+        };
+        pending
+            .remove(subject)
+            .is_some_and(|granted| Instant::now().duration_since(granted) < REPLY_GRANT_TTL)
+    }
+}
 
 /// Stream-name prefixes that back a KV or object-store bucket.
 ///
@@ -472,6 +542,25 @@ mod tests {
             },
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn a_reply_grant_reaches_server_inboxes_but_no_other_system_subject() {
+        let grants = ReplyGrants::default();
+        for subject in [
+            "$SYS.REQ.SERVER.PING",
+            "$SYS.REQ.USER.AUTH",
+            "$SYS._INBOX_.server",
+            "$SYS",
+        ] {
+            grants.grant(subject);
+            assert!(!grants.take(subject), "{subject} took a reply grant");
+        }
+        for subject in ["$SYS._INBOX.abc.def", "_INBOX.abc", "_INBOX_orders.abc"] {
+            grants.grant(subject);
+            assert!(grants.take(subject), "{subject} lost its reply grant");
+            assert!(!grants.take(subject), "{subject} replayed its reply grant");
+        }
     }
 
     #[test]

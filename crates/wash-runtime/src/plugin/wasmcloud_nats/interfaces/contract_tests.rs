@@ -767,7 +767,7 @@ async fn core_publish_and_request_map_every_refusal() -> anyhow::Result<()> {
                 Err(types::NatsError::Timeout(_))
             ));
 
-            conn.grant_reply("_INBOX.abc");
+            conn.reply_grants.grant("_INBOX.abc");
             <SharedCtx as core::HostWithStore<_>>::publish(
                 accessor,
                 message("_INBOX.abc", b"reply"),
@@ -783,6 +783,27 @@ async fn core_publish_and_request_map_every_refusal() -> anyhow::Result<()> {
             );
             assert_eq!(denial.reason, types::DenialReason::NotGranted);
             assert_eq!(denial.name, "_INBOX.abc");
+
+            // The server's own inboxes, where an auth callout expects its
+            // answer, take a reply grant. Any other system subject is reachable
+            // only through a host grant, whatever reply-to a requester picked.
+            conn.reply_grants.grant("$SYS._INBOX.abc.def");
+            <SharedCtx as core::HostWithStore<_>>::publish(
+                accessor,
+                message("$SYS._INBOX.abc.def", b"reply"),
+            )
+            .await?
+            .unwrap();
+            conn.reply_grants.grant("$SYS.REQ.SERVER.PING");
+            let denial = expect_denied(
+                <SharedCtx as core::HostWithStore<_>>::publish(
+                    accessor,
+                    message("$SYS.REQ.SERVER.PING", b"reply"),
+                )
+                .await?,
+            );
+            assert_eq!(denial.reason, types::DenialReason::NotGranted);
+            assert_eq!(denial.name, "$SYS.REQ.SERVER.PING");
             Ok::<_, wasmtime::Error>(())
         }),
     )

@@ -1373,7 +1373,7 @@ pub(super) async fn spawn_jetstream_subscriptions(
                             // covers. This is what authorizes that one reply,
                             // for this inbox only.
                             if let Some(reply) = message.reply.as_deref() {
-                                conn.grant_reply(reply);
+                                conn.reply_grants.grant(reply);
                             }
                             let handle = MessageHandle {
                                 settlement,
@@ -2087,7 +2087,7 @@ pub(super) async fn spawn_core_subscriptions(
                         // which no sane grant covers. This is what authorizes
                         // that one reply, for this inbox only.
                         if let Some(reply) = raw.reply.as_deref() {
-                            conn.grant_reply(reply);
+                            conn.reply_grants.grant(reply);
                         }
 
                         let parent = raw.headers.as_ref().and_then(super::trace::parent);
