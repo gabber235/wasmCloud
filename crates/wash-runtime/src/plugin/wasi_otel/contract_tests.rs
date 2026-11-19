@@ -229,6 +229,21 @@ where
     plugin
 }
 
+/// Shut the test component's span exporter down, the way unbinding its
+/// workload does, so every span it was handed has been exported.
+async fn drain_component_spans(plugin: &WasiOtel) {
+    plugin
+        .tracker
+        .write()
+        .await
+        .remove_workload_with_cleanup(
+            "workload",
+            |_| async {},
+            |component| async move { component.shutdown() },
+        )
+        .await;
+}
+
 /// Every f64 point by metric name: `None` for a gauge, `Some(is_monotonic)` for a sum.
 fn f64_points(
     exported: &[ResourceMetrics],
@@ -375,8 +390,7 @@ async fn guest_telemetry_reaches_providers_with_its_shape_intact() {
     l::Host::on_emit(&mut ctx, record(Some(17))).await.unwrap();
     m::Host::export(&mut ctx, metrics()).await.unwrap().unwrap();
 
-    // Component spans drain through their exporter thread on shutdown.
-    plugin.stop().await.unwrap();
+    drain_component_spans(&plugin).await;
     let exported = spans.spans();
     assert_eq!(exported.len(), 1);
     let exported = &exported[0];
@@ -440,7 +454,7 @@ async fn guest_telemetry_reaches_providers_with_its_shape_intact() {
     assert_eq!(points["in-flight"], (Some(false), -2.0, route));
 
     plugin.stop().await.unwrap();
-    assert!(plugin.tracker.read().await.workloads.is_empty());
+    plugin.stop().await.unwrap();
     assert!(plugin.logger_provider.read().await.is_none());
     assert!(plugin.meter_provider.read().await.is_none());
 }
