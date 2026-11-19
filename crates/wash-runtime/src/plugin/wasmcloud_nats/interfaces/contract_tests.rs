@@ -697,7 +697,9 @@ async fn core_publish_and_request_map_every_refusal() -> anyhow::Result<()> {
                 )
                 .await?,
             );
-            assert_eq!(denial.reason, types::DenialReason::Reserved);
+            // System subjects follow normal host grants, so an ungranted one
+            // is refused as not granted rather than reserved.
+            assert_eq!(denial.reason, types::DenialReason::NotGranted);
             assert!(matches!(denial.target, types::DeniedResource::Subject));
             assert_eq!(denial.name, "$SYS.x");
             assert_eq!(conn.publishes.totals(), (1, 2));
