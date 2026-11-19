@@ -192,8 +192,8 @@ jobs:
           Path("release-notes.md").write_text(
               f"Typewriter wasmCloud fork based on upstream {os.environ['VERSION']}.\n\n"
               f"Source commit: `{os.environ['SOURCE_SHA']}`.\n\n"
-              "Includes the retained Typewriter runtime patches and the dependency security fixes recorded in docs/typewriter-patches.md. "
-              "Nix and Dagger consume these exact binaries using SHA256 digests.\n"
+              "Includes the retained Typewriter runtime patches recorded in docs/typewriter-patches.md. "
+              "Nix consumes these exact binaries using SHA256 digests.\n"
           )
           PYTHON
       - name: Attest release artifacts
