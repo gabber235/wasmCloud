@@ -780,10 +780,12 @@ mod pinned_tests {
                 let mut ctx = Ctx::builder("workload", "component").build();
                 ctx.volume_mounts.push(resolved);
                 let mut table = ResourceTable::new();
+                #[cfg(feature = "wasi-otel")]
                 let guest_traces = Default::default();
                 let mut active = ActiveCtx {
                     ctx: &mut ctx,
                     table: &mut table,
+                    #[cfg(feature = "wasi-otel")]
                     guest_traces: &guest_traces,
                 };
                 let mut directories = if p3 {
