@@ -13,7 +13,7 @@ use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::logs::InMemoryLogExporter;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader};
-use opentelemetry_sdk::trace::{SimpleSpanProcessor, SpanData, SpanExporter};
+use opentelemetry_sdk::trace::{BatchSpanProcessor, SimpleSpanProcessor, SpanData, SpanExporter};
 use tracing_subscriber::layer::SubscriberExt as _;
 
 const LINK_SPAN_ID: &str = "1111111111111111";
@@ -198,15 +198,35 @@ where
     }
 }
 
+/// Hands each bound component the batch processor the default OTLP path
+/// builds, exporting to `exporter`.
+#[derive(Debug)]
+struct BatchTo<E>(E);
+
+impl<E> WasiOtelSpanProcessorFactory for BatchTo<E>
+where
+    E: SpanExporter + Clone + std::fmt::Debug + 'static,
+{
+    fn create(&self, _resource: &opentelemetry_sdk::Resource) -> Box<dyn SpanProcessor> {
+        Box::new(BatchSpanProcessor::builder(self.0.clone()).build())
+    }
+}
+
 /// A plugin whose span processors export to `exporter`, with the test
 /// context's component bound the way `on_workload_item_bind` binds it.
 async fn plugin_tracing_to<E>(exporter: E) -> Arc<WasiOtel>
 where
     E: SpanExporter + Clone + std::fmt::Debug + 'static,
 {
+    plugin_with_processors(Arc::new(ExportTo(exporter))).await
+}
+
+/// A plugin whose span processors come from `factory`, bound as
+/// [`plugin_tracing_to`] binds them.
+async fn plugin_with_processors(factory: Arc<dyn WasiOtelSpanProcessorFactory>) -> Arc<WasiOtel> {
     let plugin = Arc::new(WasiOtel::new(
         WasiOtelConfig::builder()
-            .span_processor_factory(Arc::new(ExportTo(exporter)))
+            .span_processor_factory(factory)
             .build(),
     ));
     let resource = opentelemetry_sdk::Resource::builder_empty().build();
@@ -505,6 +525,25 @@ async fn root_spans_have_no_parent() {
         exported[0].span_context.span_id().to_string(),
         span_context().span_id
     );
+}
+
+/// The fork hands every span a guest reports to the component's processor,
+/// whatever its sampled flag says, and the batch processor the default OTLP
+/// path builds exports it, as docs/typewriter-patches.md records.
+#[tokio::test]
+async fn unsampled_guest_spans_are_still_exported() {
+    let spans = Captured::default();
+    let plugin = plugin_with_processors(Arc::new(BatchTo(spans.clone()))).await;
+    let mut shared = context(Some(plugin.clone()));
+    let mut ctx = extract_active_ctx(&mut shared);
+
+    let mut unsampled = span();
+    unsampled.span_context.trace_flags = WitTraceFlags::empty();
+    t::Host::on_end(&mut ctx, unsampled).await.unwrap();
+    plugin.stop().await.unwrap();
+    let exported = spans.spans();
+    assert_eq!(exported.len(), 1);
+    assert!(!exported[0].span_context.is_sampled());
 }
 
 fn sums(
