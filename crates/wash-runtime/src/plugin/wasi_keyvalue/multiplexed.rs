@@ -373,6 +373,21 @@ impl HostPlugin for MultiplexedKeyValue {
         MULTIPLEXED_KEYVALUE_ID
     }
 
+    /// Retains the declared ceiling; each bind checks its backend's url
+    /// against it before a connection is opened or reused.
+    fn configure_egress_policy(
+        &self,
+        policy: Arc<crate::plugin::PluginEgressPolicy>,
+    ) -> anyhow::Result<()> {
+        self.mux.configure_egress_policy(policy)
+    }
+
+    fn binding_schema(&self) -> crate::plugin::BindingSchema {
+        crate::plugin::multiplex::backend_binding_schema(
+            crate::plugin::multiplex::KEYVALUE_HOST_OWNED_KEYS,
+        )
+    }
+
     fn world(&self) -> WitWorld {
         WitWorld {
             imports: HashSet::from([WitInterface::from(
@@ -399,7 +414,7 @@ impl HostPlugin for MultiplexedKeyValue {
         // Clone the component (cheap, Arc-backed) so the immutable borrow ends
         // before we take the mutable linker borrow.
         let component = item.component().clone();
-        let linker = item.linker();
+        let linker = item.linker()?;
 
         bindings::named_imports::wasi::keyvalue::store::add_to_linker::<_, SharedCtx>(
             linker,
@@ -424,11 +439,12 @@ impl HostPlugin for MultiplexedKeyValue {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
     fn kv_iface(name: Option<&str>, backend: Option<&str>) -> WitInterface {
-        let mut config = HashMap::new();
+        let mut config = crate::wit::Config::new();
         if let Some(b) = backend {
             config.insert("backend".to_string(), b.to_string());
         }
@@ -491,7 +507,7 @@ mod tests {
             package: "keyvalue".to_string(),
             interfaces: ["store".to_string()].into_iter().collect(),
             version: None,
-            config: HashMap::from([
+            config: crate::wit::Config::from_iter([
                 ("backend".to_string(), "filesystem".to_string()),
                 ("root".to_string(), dir.to_string_lossy().to_string()),
             ]),

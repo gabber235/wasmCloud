@@ -7,9 +7,15 @@
 //
 // Invoked from .github/workflows/bench{,-compare}.yml. Reads:
 //
-//   WASMCLOUD_BENCH_HOSTNAME       expected hostname (workflow: vars.WASMCLOUD_BENCH_HOSTNAME)
+//   WASMCLOUD_BENCH_HOST_LABEL     the runner label of the host (default: hetzner; bench-host.mjs)
+//   WASMCLOUD_BENCH_REPO_VARS      toJSON(vars); its hostnameVar(label) is the expected
+//                                  hostname. An env var of that name wins (local runs).
 //   WASMCLOUD_BENCH_ISOLATED_CPU   override for the isolated-CPU index (default: "5")
+//   WASMCLOUD_BENCH_EXPECTED_NPROC online CPUs with nosmt (default: 6, the dedicated host)
+//   WASMCLOUD_BENCH_NO_CPUFREQ     "1" on a VM with no cpufreq driver, whose clock the
+//                                  hypervisor sets (EC2 Graviton): skip the governor check
 //   CARGO_TARGET_DIR               persistent target dir (default: /var/lib/bench/target)
+//   WASMCLOUD_BENCH_K6             "1" for a k6bench run: also check its tools (#12)
 //
 // Each invariant prints one line on success ("pre-flight: …") or a
 // GitHub Actions error annotation on failure and exits non-zero.
@@ -18,7 +24,15 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, statfsSync } from 'node:fs';
 import { hostname, loadavg, platform } from 'node:os';
 
-const EXPECTED_NPROC = 6;
+import { DEFAULT_HOST_LABEL, hostnameVar, parseHostLabel } from './bench-host.mjs';
+import {
+  ancestry,
+  formatLeftovers,
+  loginctlSession,
+  scanSessionProcesses,
+  settledLeftovers,
+} from './bench-sessions.mjs';
+
 const EXPECTED_GOVERNOR = 'performance';
 const MIN_FREE_BYTES = 5 * 1024 ** 3; // 5 GiB
 const MAX_LOAD1 = 1.0;
@@ -71,6 +85,11 @@ function countCpuMask(mask) {
   return total;
 }
 
+const EXPECTED_NPROC = Number(process.env.WASMCLOUD_BENCH_EXPECTED_NPROC || 6);
+if (!Number.isInteger(EXPECTED_NPROC) || EXPECTED_NPROC < 1) {
+  fail(`WASMCLOUD_BENCH_EXPECTED_NPROC='${process.env.WASMCLOUD_BENCH_EXPECTED_NPROC}' is not a CPU count`);
+}
+
 // 0. Linux only. Every check below reads /proc or /sys, and os.loadavg()
 //    returns [0, 0, 0] on Windows — which would silently sail past the
 //    load guard. Refuse outright rather than bench on a bogus baseline.
@@ -78,21 +97,32 @@ if (platform() !== 'linux') {
   fail(`unsupported platform '${platform()}'; the bench host must be Linux`);
 }
 
-// 1. WASMCLOUD_BENCH_HOSTNAME must be exported, and we must be on that host.
-const expectedHostname = process.env.WASMCLOUD_BENCH_HOSTNAME;
+// 1. The host label's expected hostname must be set, and we must be on that host.
+let hostLabel;
+try {
+  hostLabel = parseHostLabel(process.env.WASMCLOUD_BENCH_HOST_LABEL || DEFAULT_HOST_LABEL);
+} catch (e) {
+  fail(e.message);
+}
+const hostVar = hostnameVar(hostLabel);
+let repoVars = {};
+try {
+  repoVars = JSON.parse(process.env.WASMCLOUD_BENCH_REPO_VARS || '{}') ?? {};
+} catch (e) {
+  fail(`WASMCLOUD_BENCH_REPO_VARS is not JSON: ${e.message}`);
+}
+const expectedHostname = process.env[hostVar] || repoVars[hostVar];
 if (!expectedHostname) {
-  fail(
-    'WASMCLOUD_BENCH_HOSTNAME not set ' +
-      '(workflow: vars.WASMCLOUD_BENCH_HOSTNAME; local: export from 1Password)',
-  );
+  fail(`${hostVar} not set (workflow: repo variable ${hostVar}; local: export from 1Password)`);
 }
 const actualHostname = hostname();
 if (actualHostname !== expectedHostname) {
   fail(`wrong host: ${actualHostname} (expected ${expectedHostname})`);
 }
-ok(`host: ${expectedHostname}`);
+ok(`host: ${expectedHostname} (${hostLabel})`);
 
-// 2. /sys/.../cpu/online == 6 cores (nosmt collapsed 12 SMT → 6 physical).
+// 2. /sys/.../cpu/online == EXPECTED_NPROC (on the dedicated host, nosmt
+//    collapses 12 SMT → 6 physical).
 //    None of the `nproc` variants are right here:
 //      - bare `nproc` honors `sched_getaffinity`, which systemd narrows
 //        to "online minus isolcpus" for every service unit it manages
@@ -116,17 +146,28 @@ if (onlineCount !== EXPECTED_NPROC) {
 }
 ok(`online CPUs: ${onlineCount}  (mask '${onlineMask}'; nosmt active)`);
 
-// 3. cpufreq governor == "performance" on every CPU.
-const governors = runStdout('sh', [
-  '-c',
-  'cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor',
-]).split('\n');
-for (const g of governors) {
-  if (g !== EXPECTED_GOVERNOR) {
-    fail(`scaling_governor = ${g} (expected ${EXPECTED_GOVERNOR})`);
+// 3. cpufreq governor == "performance" on every CPU. A host registered with
+//    install-runner.sh --no-cpufreq has no governor to pin; the check still
+//    fails if a cpufreq driver shows up there, since its clock is no longer
+//    fixed.
+const hasCpufreq = existsSync('/sys/devices/system/cpu/cpu0/cpufreq');
+if (process.env.WASMCLOUD_BENCH_NO_CPUFREQ === '1') {
+  if (hasCpufreq) {
+    fail('WASMCLOUD_BENCH_NO_CPUFREQ=1 but cpu0 has a cpufreq driver; pin its governor instead');
   }
+  ok('governor: none (no cpufreq driver; the hypervisor sets the clock)');
+} else {
+  const governors = runStdout('sh', [
+    '-c',
+    'cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor',
+  ]).split('\n');
+  for (const g of governors) {
+    if (g !== EXPECTED_GOVERNOR) {
+      fail(`scaling_governor = ${g} (expected ${EXPECTED_GOVERNOR})`);
+    }
+  }
+  ok(`governor: ${EXPECTED_GOVERNOR} on every CPU`);
 }
-ok(`governor: ${EXPECTED_GOVERNOR} on every CPU`);
 
 // 4. /sys/devices/system/cpu/isolated matches the expected isolated CPU.
 //    Override via WASMCLOUD_BENCH_ISOLATED_CPU for hosts staged differently.
@@ -200,5 +241,95 @@ if (!existsSync(cargoBin)) {
   fail(`cargo not found at ${cargoBin}`);
 }
 ok(`cargo: ${runStdout(cargoBin, ['--version'])}`);
+
+// 10. Nothing left running by a closed login session. provision.yml's logind
+//     drop-in kills a session's processes when it closes; this catches a host
+//     without it. Such work can sleep below the load check yet keep the
+//     socket-activated Docker daemon up by polling `docker ps`.
+let leftovers;
+try {
+  leftovers = settledLeftovers(
+    scanSessionProcesses,
+    { sessionInfo: loginctlSession, exclude: ancestry(process.pid), runnerUid: process.getuid() },
+    { sleep: sleepSync },
+  );
+} catch (err) {
+  fail(`can't check login sessions: ${err.message}`);
+}
+if (leftovers.length > 0) {
+  fail(formatLeftovers(leftovers));
+}
+ok('login sessions: no processes left by a closed one');
+
+// 11. Docker idle. The daemon is socket-activated, and `docker ps` would start
+//     it (and the always-restart local registry), so ask systemd instead,
+//     which doesn't. A criterion or gungraun bench refuses to share the host
+//     with a running daemon; k6bench.yml stops it after every run, so one
+//     running here means that teardown didn't happen. A k6 run starts it
+//     anyway, and only needs no leftover containers: a stray kind cluster
+//     keeps kube-apiserver and etcd busy on every CPU. memory_pressure also
+//     drives Docker itself, and it records counts rather than timings.
+const hasDocker = spawnSync('sh', ['-c', 'command -v docker'], { stdio: 'ignore' }).status === 0;
+const dockerUp =
+  hasDocker &&
+  spawnSync('systemctl', ['is-active', '--quiet', 'docker.service'], { stdio: 'ignore' }).status ===
+    0;
+const usesDocker =
+  process.env.WASMCLOUD_BENCH_K6 === '1' || process.env.WASMCLOUD_BENCH_NAME === 'memory_pressure';
+if (dockerUp && !usesDocker) {
+  fail(
+    'docker daemon is running; stop it first (sudo systemctl stop docker.service). ' +
+      'It is socket-activated, so any client still polling it starts it again: ' +
+      'usually work left by a dropped SSH session (check 10, login sessions), ' +
+      'otherwise one started outside a login session (systemd-cgls)',
+  );
+}
+if (dockerUp) {
+  const allowed = new Set(['kind-registry']);
+  const running = spawnSync('docker', ['ps', '--format', '{{.Names}}'], { encoding: 'utf8' });
+  if (running.status !== 0) {
+    fail(`docker ps failed: ${running.stderr.trim()}`);
+  }
+  const stray = running.stdout
+    .split('\n')
+    .filter((n) => n && !allowed.has(n));
+  if (stray.length > 0) {
+    fail(`containers still running: ${stray.join(', ')} (kind delete cluster --name k6bench)`);
+  }
+}
+ok(dockerUp ? 'docker: no leftover containers' : 'docker: daemon not running');
+
+// 12. k6bench runs only: the tools scripts/k6bench/run.sh drives, and room
+//     for the node and wasmCloud images.
+if (process.env.WASMCLOUD_BENCH_K6 === '1') {
+  if (!hasDocker || spawnSync('docker', ['info'], { stdio: 'ignore' }).status !== 0) {
+    fail('docker is not usable by this user');
+  }
+  // A non-release ref builds images from the tree, and the Dockerfile needs
+  // BuildKit, which `docker build` uses only when the buildx plugin exists.
+  if (spawnSync('docker', ['buildx', 'version'], { stdio: 'ignore' }).status !== 0) {
+    fail(
+      'docker buildx not installed (scripts/bench/ansible/provision.yml installs docker-buildx)',
+    );
+  }
+  for (const tool of ['kind', 'kubectl', 'helm', 'k6']) {
+    if (spawnSync('sh', ['-c', `command -v ${tool}`], { stdio: 'ignore' }).status !== 0) {
+      fail(`${tool} not on PATH (scripts/bench/ansible/provision.yml installs it)`);
+    }
+  }
+  // With the daemon stopped, #11 couldn't see a cluster a failed teardown left
+  // behind; run.sh would otherwise reuse it, stopped nodes and all.
+  const clusters = runStdout('kind', ['get', 'clusters']);
+  if (clusters.split('\n').includes('k6bench')) {
+    fail('kind cluster k6bench left over from an earlier run (kind delete cluster --name k6bench)');
+  }
+  const dockerRoot = runStdout('docker', ['info', '--format', '{{.DockerRootDir}}']);
+  const dfs = statfsSync(dockerRoot);
+  const dockerFree = Number(dfs.bavail) * Number(dfs.bsize);
+  if (dockerFree < 2 * MIN_FREE_BYTES) {
+    fail(`less than 10 GiB free for docker at ${dockerRoot}`);
+  }
+  ok(`k6bench tools present; ${Math.floor(dockerFree / 1024 ** 3)} GiB free at ${dockerRoot}`);
+}
 
 ok('all checks passed');

@@ -24,16 +24,37 @@ concurrency:
 permissions: {}
 
 jobs:
+  dependency-review:
+    needs:
+      - changes
+    if: needs.changes.outputs.dependencies == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          config-file: ./.github/dependency-review-config.yml
+
   changes:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: read
     outputs:
       relevant: ${{ steps.filter.outputs.relevant }}
+      dependencies: ${{ steps.filter.outputs.dependencies }}
+      audit-config: ${{ steps.filter.outputs.audit_config }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'merge_group'
         with:
           persist-credentials: false
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
@@ -43,9 +64,64 @@ jobs:
             relevant:
               - '**/Cargo.toml'
               - '**/Cargo.lock'
+              - 'fuzz/**'
+              - 'xtask/src/fuzz.rs'
+              - 'deny.toml'
               - '.github/workflows/audit.yml'
+              - '.github/scripts/check-dependency-licenses.mjs'
+              - 'vex/**'
+              - '.github/scripts/check-vex.mjs'
+              - '.github/scripts/check-vex.test.mjs'
+              - '.github/scripts/release-vex.mjs'
+              - '.github/scripts/release-vex.test.mjs'
+              - '.github/scripts/lib/vex.mjs'
+              - 'osv-scanner.toml'
+            audit_config:
+              - '.cargo/audit.toml'
+            dependencies:
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - 'fuzz/Cargo.toml.in'
+              - '**/go.mod'
+              - '**/go.sum'
+              - '**/go.work'
+              - '**/go.work.sum'
+              - 'deny.toml'
+              - '.github/dependency-review-config.yml'
+              - '.github/workflows/*.yml'
+              - '.github/workflows/*.yaml'
+              - '.github/actions/**/action.yml'
+              - '.github/actions/**/action.yaml'
 
   cargo-audit:
+    needs:
+      - changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true' || needs.changes.outputs.audit-config == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        env:
+          # Authenticate the action's GitHub API calls so they aren't throttled
+          # by the 60/hr anonymous per-IP limit shared across hosted runners.
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tool: cargo-audit
+      - name: Check VEX assessments and suppression coverage
+        run: |
+          node --test .github/scripts/check-vex.test.mjs .github/scripts/release-vex.test.mjs
+          node .github/scripts/check-vex.mjs
+      - name: Run cargo audit
+        run: cargo audit
+
+  cargo-deny-licenses:
     needs:
       - changes
     if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
@@ -58,21 +134,69 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         env:
-          # Authenticate the action's GitHub API calls so they aren't throttled
-          # by the 60/hr anonymous per-IP limit shared across hosted runners.
           GITHUB_TOKEN: ${{ github.token }}
         with:
-          tool: cargo-audit
-      - name: Run cargo audit
-        run: cargo audit
+          tool: cargo-deny@0.20.2
+      - name: Check dependency licenses
+        run: node .github/scripts/check-dependency-licenses.mjs
+      - name: Checkout fuzz source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: fuzz-source
+          persist-credentials: false
+      - name: Check fuzz dependency licenses
+        run: |
+          cargo run --locked -p xtask -- fuzz prepare --source fuzz-source --language rust
+          cargo metadata --manifest-path fuzz-source/fuzz/Cargo.toml --format-version 1 > /dev/null
+          cargo run --locked -p xtask -- fuzz verify-lock --source fuzz-source
+          cargo deny --manifest-path fuzz-source/fuzz/Cargo.toml --workspace --config deny.toml --locked check licenses
+
+  # OSV, which also carries the OpenSSF malicious-packages feed, over every
+  # lockfile in the repository: Cargo, Go and npm. Runs on every change, so a
+  # newly published advisory or malicious package blocks merges until it is
+  # fixed or assessed (OSPS-VM-05.03).
+  # Findings that don't affect wasmCloud are ignored in osv-scanner.toml.
+  # osv-gate.mjs decides which findings block.
+  osv-scanner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: runtime-operator/go.mod
+          cache: false
+      # Fetched through the Go module proxy and verified against the Go
+      # checksum database, like any other module.
+      - name: Install osv-scanner
+        run: GOBIN="$RUNNER_TEMP" go install github.com/google/osv-scanner/v2/cmd/osv-scanner@v2.7.0
+      - name: Scan every lockfile
+        run: |
+          # osv-scanner exits 1 when it has findings, which osv-gate.mjs
+          # classifies; any other non-zero status is a scan error.
+          status=0
+          "$RUNNER_TEMP/osv-scanner" scan source --recursive --config=osv-scanner.toml \
+            --format json --output-file "$RUNNER_TEMP/osv-report.json" ./ || status=$?
+          if [ "$status" -gt 1 ]; then exit "$status"; fi
+          node .github/scripts/osv-gate.mjs "$RUNNER_TEMP/osv-report.json"
 
   gate:
     name: gate-audit
     needs:
+      - changes
+      - dependency-review
       - cargo-audit
+      - cargo-deny-licenses
+      - osv-scanner
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:

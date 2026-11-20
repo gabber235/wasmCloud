@@ -1,10 +1,22 @@
+#![cfg_attr(coverage_nightly, recursion_limit = "256")]
+#![cfg_attr(all(test, coverage_nightly), feature(coverage_attribute))]
+#![cfg_attr(all(test, coverage_nightly), allow(unstable_features))]
 #![doc = include_str!("../README.md")]
 
 pub mod engine;
 /// Setting a named environment variable in a test without racing the others.
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod env_guard;
 pub mod host;
+pub mod ids;
+#[cfg(any(feature = "washlet", feature = "wasmcloud-nats"))]
+mod nats_credentials;
+#[cfg(all(
+    test,
+    any(feature = "washlet", feature = "wasm_component_model_implements")
+))]
+mod nats_test;
 pub mod observability;
 pub mod plugin;
 pub mod sockets;

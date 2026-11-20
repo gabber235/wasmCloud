@@ -4,10 +4,12 @@
 //! serving the outbound (consumer) `publish`/`request` path — the same surface
 //! the standalone `NatsMessaging` plugin uses.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::plugin::multiplex::BackendProvider;
+use crate::plugin::PluginEgressPolicy;
+use crate::plugin::multiplex::{
+    BackendProvider, check_nats_url, check_nats_url_resolved, connect_nats,
+};
 
 use super::{BrokerMessage, MsgBackend, MsgError, MsgId};
 
@@ -71,24 +73,54 @@ impl MsgBackend for NatsMsgBackend {
 /// NATS provider, selected by `config.backend = "nats"`. Requires `config.url`
 /// (e.g. `nats://127.0.0.1:4222`).
 #[derive(Default)]
-pub struct NatsMsgProvider;
+pub struct NatsMsgProvider {
+    ignore_discovered_servers: bool,
+}
+
+impl NatsMsgProvider {
+    /// Restrict connections to their configured URL even without an egress policy.
+    pub fn with_ignore_discovered_servers(mut self, ignore: bool) -> Self {
+        self.ignore_discovered_servers = ignore;
+        self
+    }
+}
 
 #[async_trait::async_trait]
 impl BackendProvider<MsgId> for NatsMsgProvider {
-    fn pool_key(&self, config: &HashMap<String, String>) -> Option<String> {
-        config.get("url").cloned()
+    fn pool_key(&self, config: &crate::wit::Config) -> Option<String> {
+        config.expose("url").map(str::to_string)
     }
     fn backend_type(&self) -> &'static str {
         "nats"
     }
 
-    async fn instantiate(&self, config: &HashMap<String, String>) -> anyhow::Result<MsgId> {
+    async fn instantiate(
+        &self,
+        config: &crate::wit::Config,
+        egress: Option<&PluginEgressPolicy>,
+    ) -> anyhow::Result<MsgId> {
         let url = config
-            .get("url")
+            .value("url")
             .ok_or_else(|| anyhow::anyhow!("nats messaging backend requires a 'url' config"))?;
-        let client = async_nats::connect(url).await?;
+        let client = connect_nats(url, egress, self.ignore_discovered_servers).await?;
         Ok(Arc::new(NatsMsgBackend {
             client: Arc::new(client),
         }))
+    }
+
+    fn check_egress(
+        &self,
+        config: &crate::wit::Config,
+        policy: &PluginEgressPolicy,
+    ) -> anyhow::Result<()> {
+        check_nats_url(config, policy)
+    }
+
+    async fn check_resolved_egress(
+        &self,
+        config: &crate::wit::Config,
+        policy: &PluginEgressPolicy,
+    ) -> anyhow::Result<()> {
+        check_nats_url_resolved(config, policy).await
     }
 }

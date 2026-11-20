@@ -1,0 +1,2132 @@
+//! WIT dependency management for wash components
+//!
+//! This module provides functionality to fetch and manage WebAssembly Interface Type (WIT)
+//! dependencies for wasmCloud components. It integrates with the wasm-pkg-client for
+//! fetching dependencies from registries and manages lock files for reproducible builds.
+
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    path::{Path, PathBuf},
+};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use tracing::{debug, instrument, warn};
+use url::Url;
+use wasm_pkg_client::{
+    ContentDigest, CustomConfig, PackageRef, Registry, RegistryMapping, RegistryMetadata,
+    caching::{CachingClient, FileCache},
+    oci::{BasicCredentials, OciRegistryConfig},
+};
+use wasm_pkg_core::{
+    lock::LockFile,
+    wit::{OutputType, WIT_DEPS_DIR},
+};
+
+mod errors;
+mod retry;
+
+use errors::{SourceLacksPackage, missing_from_registry, multiple_versions_message};
+use retry::{WIT_FETCH_MAX_ATTEMPTS, is_transient_registry_fetch_error, wait_to_retry_wit_fetch};
+
+/// The default name of the lock file for wasmCloud projects
+pub const WKG_LOCK_FILE_NAME: &str = "wkg.lock";
+
+/// Configuration for WIT dependency management
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WitConfig {
+    /// Authentication for OCI registries that host WIT packages. Namespace-to-registry mapping
+    /// is configured via [`WitConfig::sources`] or the wkg config; these entries only supply
+    /// credentials for a registry host.
+    #[serde(default)]
+    pub registries: Vec<WitRegistry>,
+    /// Skip fetching WIT dependencies
+    #[serde(default)]
+    pub skip_fetch: bool,
+    /// The directory where WIT files are stored, if not `./wit` in the project root
+    #[serde(default)]
+    pub wit_dir: Option<PathBuf>,
+    /// Source overrides for WIT dependencies (target -> source mapping)
+    #[serde(default)]
+    pub sources: HashMap<String, String>,
+}
+
+impl WitConfig {
+    pub fn validate(&self, project_dir: &Path) -> anyhow::Result<()> {
+        let mut errors: Vec<String> = Vec::new();
+
+        for reg in &self.registries {
+            if let Err(err) = reg.registry() {
+                errors.push(format!(
+                    "wit.registries entry '{}' is not a valid registry host: {err}",
+                    reg.url
+                ));
+            }
+            if let Err(err) = reg.basic_auth_credentials() {
+                errors.push(err.to_string());
+            }
+        }
+
+        for (target, source) in &self.sources {
+            if target.trim().is_empty() {
+                errors.push("wit.sources contains an entry with empty target key".to_string());
+            }
+
+            if source.trim().is_empty() {
+                errors.push(format!("wit.sources['{target}'] has an empty source value"));
+                continue;
+            }
+
+            if let RegistryPullSource::LocalPath(_) = detect_source_type(source) {
+                let resolved = project_dir.join(source);
+                let exists = resolved.exists();
+
+                if !exists {
+                    errors.push(format!(
+                        "wit.sources['{target}'] local path '{}' does not exist",
+                        resolved.display()
+                    ));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("{}", errors.join("\n"))
+        }
+    }
+}
+
+/// Authentication for an OCI registry host that serves WIT packages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WitRegistry {
+    /// Registry host this applies to, e.g. `ghcr.io` (a full `https://ghcr.io` URL is also
+    /// accepted; the host is extracted from it).
+    pub url: String,
+
+    /// Username for basic auth. Required alongside `token`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+
+    /// Password or personal access token for basic auth. Required alongside `username`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+impl WitRegistry {
+    /// The registry host this entry configures.
+    fn registry(&self) -> Result<Registry> {
+        registry_authority(&self.url)
+    }
+
+    /// Basic-auth credentials for this entry, or `None` when unset. Errors when exactly one of
+    /// `username`/`token` is set, since basic auth requires both.
+    fn basic_auth_credentials(&self) -> Result<Option<(&str, &str)>> {
+        match (self.username.as_deref(), self.token.as_deref()) {
+            (Some(username), Some(token)) => Ok(Some((username, token))),
+            (None, None) => Ok(None),
+            _ => bail!(
+                "wit.registries entry '{}' must set both username and token, or neither",
+                self.url
+            ),
+        }
+    }
+}
+
+/// Extract a wkg [`Registry`] (host`[:port]`) from a `wit.registries` `url`, accepting both a
+/// bare authority (`ghcr.io`) and a full URL (`https://ghcr.io`).
+fn registry_authority(url: &str) -> Result<Registry> {
+    let authority = match Url::parse(url) {
+        Ok(parsed) if !parsed.authority().is_empty() => parsed.authority().to_string(),
+        _ => url.to_string(),
+    };
+    authority
+        .parse()
+        .with_context(|| format!("invalid registry host [{url}]"))
+}
+
+/// Registry pull source types for WIT dependency overrides
+#[derive(Debug, Clone)]
+pub enum RegistryPullSource {
+    /// Local filesystem path
+    LocalPath(String),
+    /// HTTP/HTTPS URL (tar.gz archives)
+    RemoteHttp(String),
+    /// Git repository URL
+    RemoteGit(String),
+    /// OCI registry reference
+    RemoteOci(String),
+}
+
+/// Build a wkg registry mapping from an OCI source reference for the given WIT target.
+///
+/// wasm-pkg reconstructs an OCI repository as `{namespace_prefix}{namespace}/{name}`, so
+/// only the reference's host is a valid [`Registry`]. Any repository path leading up to the
+/// conventional `{namespace}/{package}` (or `{namespace}` for a namespace-level override)
+/// suffix becomes the OCI namespace prefix, expressed as a [`RegistryMapping::Custom`].
+fn oci_registry_mapping(
+    reference: &str,
+    namespace: &str,
+    package: Option<&str>,
+) -> Result<RegistryMapping> {
+    let reference = reference.strip_prefix("oci://").unwrap_or(reference);
+
+    let (authority, repository) = match reference.split_once('/') {
+        Some((authority, repository)) => (authority, Some(repository)),
+        None => (reference, None),
+    };
+
+    let registry: Registry = authority.parse().with_context(|| {
+        format!("invalid OCI registry host [{authority}] in source [{reference}]")
+    })?;
+
+    let Some(repository) = repository else {
+        return Ok(RegistryMapping::Registry(registry));
+    };
+
+    // Drop any `:tag`; the tag is derived from the package version at fetch time.
+    let repository = repository
+        .rsplit_once(':')
+        .map_or(repository, |(repo, _tag)| repo)
+        .trim_end_matches('/');
+
+    let suffix = match package {
+        Some(package) => format!("{namespace}/{package}"),
+        None => namespace.to_string(),
+    };
+
+    let namespace_prefix = if repository == suffix {
+        None
+    } else if let Some(prefix) = repository.strip_suffix(&format!("/{suffix}")) {
+        Some(format!("{prefix}/"))
+    } else {
+        bail!(
+            "OCI source [{reference}] does not resolve to the expected repository suffix \
+             [{suffix}]; the WIT namespace must appear in the OCI repository path"
+        );
+    };
+
+    let Some(namespace_prefix) = namespace_prefix else {
+        return Ok(RegistryMapping::Registry(registry));
+    };
+
+    let mut oci_config = serde_json::Map::new();
+    oci_config.insert("registry".to_string(), authority.into());
+    oci_config.insert("namespacePrefix".to_string(), namespace_prefix.into());
+
+    let mut metadata = RegistryMetadata::default();
+    metadata.preferred_protocol = Some("oci".to_string());
+    metadata
+        .protocol_configs
+        .insert("oci".to_string(), oci_config);
+
+    Ok(RegistryMapping::Custom(CustomConfig { registry, metadata }))
+}
+
+/// Wrapper around a `wasm_pkg_client::Client` including configuration for fetching WIT dependencies.
+/// Primarily enables reuse of functionality to override dependencies and properly setup the client.
+pub struct WkgFetcher {
+    wkg_config: wasm_pkg_core::manifest::Manifest,
+    wkg_client_config: wasm_pkg_client::Config,
+    cache: FileCache,
+    cache_dir: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct CachedRelease {
+    #[serde(rename = "version")]
+    _version: semver::Version,
+    content_digest: ContentDigest,
+}
+
+async fn cached_blob_matches_digest(path: &Path, digest: &str) -> Result<bool> {
+    let Some(expected) = digest.strip_prefix("sha256:") else {
+        return Ok(false);
+    };
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(false);
+    }
+    let contents = tokio::fs::read(path).await.with_context(|| {
+        format!(
+            "failed to read WIT package cache entry [{}]",
+            path.display()
+        )
+    })?;
+    Ok(format!("{:x}", Sha256::digest(contents)) == expected)
+}
+
+async fn discard_cache_entry(path: &Path) -> Result<()> {
+    warn!(path = %path.display(), "discarding incomplete WIT package cache entry");
+    tokio::fs::remove_file(path).await.with_context(|| {
+        format!(
+            "failed to remove invalid WIT package cache entry [{}]",
+            path.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+// Colons in FileCache names become NTFS alternate data streams.
+fn windows_cache_streams(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    use std::{
+        ffi::OsString,
+        os::windows::ffi::{OsStrExt as _, OsStringExt as _},
+    };
+    use windows_sys::Win32::{
+        Foundation::{ERROR_HANDLE_EOF, HANDLE, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            FindClose, FindFirstStreamW, FindNextStreamW, FindStreamInfoStandard,
+            WIN32_FIND_STREAM_DATA,
+        },
+    };
+
+    struct FindHandle(HANDLE);
+
+    impl Drop for FindHandle {
+        fn drop(&mut self) {
+            // SAFETY: FindFirstStreamW returned this handle.
+            let _ = unsafe { FindClose(self.0) };
+        }
+    }
+
+    let mut wide_path: Vec<_> = path.as_os_str().encode_wide().collect();
+    wide_path.push(0);
+    let mut data = WIN32_FIND_STREAM_DATA::default();
+    // SAFETY: wide_path is NUL-terminated, and data is valid for writes.
+    let handle = unsafe {
+        FindFirstStreamW(
+            wide_path.as_ptr(),
+            FindStreamInfoStandard,
+            (&raw mut data).cast(),
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
+            Ok(Vec::new())
+        } else {
+            Err(error)
+        };
+    }
+    let handle = FindHandle(handle);
+    let mut paths = Vec::new();
+    const DATA_SUFFIX: &[u16] = &[
+        b':' as u16,
+        b'$' as u16,
+        b'D' as u16,
+        b'A' as u16,
+        b'T' as u16,
+        b'A' as u16,
+    ];
+
+    loop {
+        let length = data
+            .cStreamName
+            .iter()
+            .position(|character| *character == 0)
+            .unwrap_or(data.cStreamName.len());
+        let stream = &data.cStreamName[..length];
+        if let Some(name) = stream.strip_suffix(DATA_SUFFIX)
+            && name != [b':' as u16]
+        {
+            let mut full_name: Vec<_> = path.as_os_str().encode_wide().collect();
+            full_name.extend_from_slice(name);
+            paths.push(PathBuf::from(OsString::from_wide(&full_name)));
+        }
+
+        data = WIN32_FIND_STREAM_DATA::default();
+        // SAFETY: handle and data remain valid for the enumeration.
+        if unsafe { FindNextStreamW(handle.0, (&raw mut data).cast()) } == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
+                break;
+            }
+            return Err(error);
+        }
+    }
+
+    Ok(paths)
+}
+
+/// Common arguments for Wasm package tooling.
+#[derive(Debug, Clone, Default)]
+pub struct CommonPackageArgs {
+    /// The path to the [wasm_pkg_client::Config] configuration file.
+    pub config: Option<PathBuf>,
+    /// The path to the cache directory. Defaults to `WKG_CACHE_DIR`, then to the default wkg
+    /// cache directory for this platform.
+    pub cache: Option<PathBuf>,
+}
+
+impl CommonPackageArgs {
+    fn cache_dir(&self) -> Result<PathBuf> {
+        match (self.cache.as_ref(), std::env::var_os("WKG_CACHE_DIR")) {
+            (Some(path), _) => Ok(path.to_owned()),
+            (None, Some(path)) => Ok(PathBuf::from(path)),
+            (None, None) => {
+                FileCache::global_cache_path().context("no default WIT package cache directory")
+            }
+        }
+    }
+
+    /// Helper to load the config from the given path or other default paths
+    pub async fn load_config(&self) -> anyhow::Result<wasm_pkg_client::Config> {
+        // Get the default config so we have the default fallbacks
+        let mut conf = wasm_pkg_client::Config::default();
+
+        // We attempt to load config in the following order of preference:
+        // 1. Path provided by the user via flag
+        // 2. Path provided by the user via `WASH` prefixed environment variable
+        // 3. Path provided by the users via `WKG` prefixed environment variable
+        // 4. Default path to config file in wash dir
+        // 5. Default path to config file from wkg
+        match (self.config.as_ref(), std::env::var_os("WKG_CONFIG_FILE")) {
+            // We have a config file provided by the user flag or WASH env var
+            (Some(path), _) => {
+                let loaded = wasm_pkg_client::Config::from_file(&path)
+                    .await
+                    .context(format!("error loading config file {path:?}"))?;
+                // Merge the two configs
+                conf.merge(loaded);
+            }
+            // We have a config file provided by the user via `WKG` env var
+            (None, Some(path)) => {
+                let loaded = wasm_pkg_client::Config::from_file(&path)
+                    .await
+                    .context(format!("error loading config file from {path:?}"))?;
+                // Merge the two configs
+                conf.merge(loaded);
+            }
+            // Otherwise fall back to the user's global wkg config (e.g.
+            // `~/.config/wasm-pkg/config.toml`), matching `wkg`'s own resolution so that
+            // namespace registries and registry auth configured there are honored without
+            // requiring `WKG_CONFIG_FILE`.
+            (None, None) => {
+                if let Some(loaded) = wasm_pkg_client::Config::read_global_config()
+                    .await
+                    .context("failed to read global wkg config")?
+                {
+                    conf.merge(loaded);
+                }
+            }
+        };
+        let wasmcloud_label = "wasmcloud"
+            .parse()
+            .context("failed to parse wasmcloud label")?;
+        // If they don't have a config set for the wasmcloud namespace, set it to the default defined here
+        if conf.namespace_registry(&wasmcloud_label).is_none() {
+            conf.set_namespace_registry(
+                wasmcloud_label,
+                RegistryMapping::Registry(
+                    "wasmcloud.com"
+                        .parse()
+                        .context("failed to parse wasmcloud registry")?,
+                ),
+            );
+        }
+        // Same for wrpc
+        let wrpc_label = "wrpc".parse().context("failed to parse wrpc label")?;
+        if conf.namespace_registry(&wrpc_label).is_none() {
+            conf.set_namespace_registry(
+                wrpc_label,
+                RegistryMapping::Registry(
+                    "bytecodealliance.org"
+                        .parse()
+                        .context("failed to parse wrpc registry")?,
+                ),
+            );
+        }
+        // And cosmonic, which is published under the cosmonic-labs GHCR org
+        let cosmonic_label = "cosmonic"
+            .parse()
+            .context("failed to parse cosmonic label")?;
+        if conf.namespace_registry(&cosmonic_label).is_none() {
+            conf.set_namespace_registry(
+                cosmonic_label,
+                oci_registry_mapping("ghcr.io/cosmonic-labs/cosmonic", "cosmonic", None)
+                    .context("failed to build cosmonic registry mapping")?,
+            );
+        }
+        Ok(conf)
+    }
+
+    /// Helper for loading the [`FileCache`]
+    pub async fn load_cache(&self) -> anyhow::Result<FileCache> {
+        FileCache::new(self.cache_dir()?).await
+    }
+}
+
+impl WkgFetcher {
+    pub const fn new(
+        wkg_config: wasm_pkg_core::manifest::Manifest,
+        wkg_client_config: wasm_pkg_client::Config,
+        cache: FileCache,
+        cache_dir: PathBuf,
+    ) -> Self {
+        Self {
+            wkg_config,
+            wkg_client_config,
+            cache,
+            cache_dir,
+        }
+    }
+
+    /// Load a `WkgFetcher` from a `CommonPackageArgs` and a `wasm_pkg_core::manifest::Manifest`
+    pub async fn from_common(
+        common: &CommonPackageArgs,
+        wkg_config: wasm_pkg_core::manifest::Manifest,
+    ) -> Result<Self> {
+        let cache_dir = common.cache_dir()?;
+        let cache = common
+            .load_cache()
+            .await
+            .context("failed to load wkg cache")?;
+        let wkg_client_config = common
+            .load_config()
+            .await
+            .context("failed to load wkg config")?;
+        Ok(Self::new(wkg_config, wkg_client_config, cache, cache_dir))
+    }
+
+    /// Build a fetcher for a project: reads the project's `wkg.toml` overrides and the resolved
+    /// wkg client config, caching packages under `cache_dir`.
+    pub async fn for_project(cache_dir: PathBuf, project_dir: impl AsRef<Path>) -> Result<Self> {
+        let args = CommonPackageArgs {
+            config: None,
+            cache: Some(cache_dir),
+        };
+        let wkg_config = load_wkg_config(project_dir).await?;
+        Self::from_common(&args, wkg_config).await
+    }
+
+    /// Apply a project's `[wit]` configuration to this fetcher: registry authentication (which
+    /// configures credentials per registry host) and source overrides (which map WIT packages to
+    /// registries or local paths). The two are independent and touch different config.
+    pub async fn apply_wit_config(
+        &mut self,
+        wit_config: &WitConfig,
+        project_dir: impl AsRef<Path>,
+    ) -> Result<()> {
+        self.apply_registry_auth(&wit_config.registries)?;
+        if !wit_config.sources.is_empty() {
+            debug!("applying WIT source overrides: {:?}", wit_config.sources);
+            self.resolve_extended_pull_configs(&wit_config.sources, project_dir)
+                .await
+                .context("failed to resolve WIT source overrides")?;
+        }
+        Ok(())
+    }
+
+    /// Apply `wit.registries` authentication to the wkg client config as OCI basic-auth
+    /// credentials for each registry host. Entries without credentials are ignored.
+    pub fn apply_registry_auth(&mut self, registries: &[WitRegistry]) -> Result<()> {
+        for reg in registries {
+            let Some((username, token)) = reg.basic_auth_credentials()? else {
+                continue;
+            };
+            let oci_config = OciRegistryConfig {
+                credentials: Some(BasicCredentials {
+                    username: username.to_string(),
+                    password: token.to_string().into(),
+                }),
+                ..Default::default()
+            };
+            self.wkg_client_config
+                .get_or_insert_registry_config_mut(&reg.registry()?)
+                .set_backend_config("oci", oci_config)
+                .with_context(|| format!("failed to set registry auth for [{}]", reg.url))?;
+        }
+        Ok(())
+    }
+
+    /// Enable extended pull configurations for wkg config. Call before calling `fetch_wit_dependencies` to
+    /// update configuration used.
+    pub async fn resolve_extended_pull_configs(
+        &mut self,
+        sources: &HashMap<String, String>,
+        project_dir: impl AsRef<Path>,
+    ) -> Result<()> {
+        let wkg_config_overrides = self.wkg_config.overrides.get_or_insert_default();
+
+        for (target, source) in sources {
+            let (ns, pkgs, _version) = parse_wit_package_name(target)?;
+
+            match detect_source_type(source) {
+                RegistryPullSource::LocalPath(path) => {
+                    let resolved_path = project_dir.as_ref().join(&path);
+                    if !tokio::fs::try_exists(&resolved_path)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to check for WIT source path [{}]",
+                                resolved_path.display()
+                            )
+                        })?
+                    {
+                        bail!(
+                            "WIT source path [{}] does not exist",
+                            resolved_path.display()
+                        );
+                    }
+                    set_override_for_target(wkg_config_overrides, &ns, &pkgs, resolved_path);
+                }
+                RegistryPullSource::RemoteHttp(url) => {
+                    let wit_dir = download_and_extract_http(&url)
+                        .await
+                        .with_context(|| format!("failed to download HTTP source [{url}]"))?;
+                    set_override_for_target(wkg_config_overrides, &ns, &pkgs, wit_dir);
+                }
+                RegistryPullSource::RemoteGit(url) => {
+                    let wit_dir = clone_git_and_find_wit(&url)
+                        .await
+                        .with_context(|| format!("failed to clone Git source [{url}]"))?;
+                    set_override_for_target(wkg_config_overrides, &ns, &pkgs, wit_dir);
+                }
+                RegistryPullSource::RemoteOci(reference) => match pkgs.as_slice() {
+                    [] => {
+                        // Namespace-level override
+                        let mapping = oci_registry_mapping(&reference, &ns, None)?;
+                        self.wkg_client_config
+                            .set_namespace_registry(ns.clone().try_into()?, mapping);
+                    }
+                    packages => {
+                        // Package-level overrides
+                        for pkg in packages {
+                            let mapping = oci_registry_mapping(&reference, &ns, Some(pkg))?;
+                            self.wkg_client_config.set_package_registry_override(
+                                PackageRef::new(
+                                    ns.clone().try_into()?,
+                                    pkg.to_string().try_into()?,
+                                ),
+                                mapping,
+                            );
+                        }
+                    }
+                },
+            }
+        }
+        Ok(())
+    }
+
+    /// A caching client for this fetcher's registry configuration
+    fn client(&self) -> CachingClient<FileCache> {
+        CachingClient::new(
+            Some(wasm_pkg_client::Client::new(self.wkg_client_config.clone())),
+            self.cache.clone(),
+        )
+    }
+
+    async fn discard_invalid_cache_entries(&self) -> Result<()> {
+        let cache_dir = &self.cache_dir;
+        let mut entries = tokio::fs::read_dir(cache_dir).await.with_context(|| {
+            format!("failed to read WIT package cache [{}]", cache_dir.display())
+        })?;
+        let mut referenced = Vec::new();
+        let mut checked = HashSet::new();
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if !entry.file_type().await?.is_file() {
+                continue;
+            }
+
+            let paths = vec![path.clone()];
+            #[cfg(windows)]
+            let paths = {
+                let mut paths = paths;
+                paths.extend(windows_cache_streams(&path)?);
+                paths
+            };
+
+            for path in paths {
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+
+                let valid = if name.starts_with("sha256:") {
+                    checked.insert(path.clone());
+                    cached_blob_matches_digest(&path, name).await?
+                } else if path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                {
+                    match serde_json::from_slice::<CachedRelease>(&tokio::fs::read(&path).await?) {
+                        Ok(release) => {
+                            referenced.push(release.content_digest);
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                } else {
+                    true
+                };
+
+                if !valid {
+                    discard_cache_entry(&path).await?;
+                }
+            }
+        }
+
+        for digest in referenced {
+            let digest = digest.to_string();
+            let path = cache_dir.join(&digest);
+            if !checked.insert(path.clone()) {
+                continue;
+            }
+            if !tokio::fs::try_exists(&path).await.with_context(|| {
+                format!(
+                    "failed to inspect WIT package cache entry [{}]",
+                    path.display()
+                )
+            })? {
+                continue;
+            }
+            if !cached_blob_matches_digest(&path, &digest).await? {
+                discard_cache_entry(&path).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The override that serves `package`: its own, or else its namespace's. A namespace's local
+    /// source serves the package from wherever in that source it lives, and fails with
+    /// [`SourceLacksPackage`] if it is not there, because the source replaces the registry for its
+    /// whole namespace. Calls that share `sources` scan each namespace's source once.
+    fn override_for(
+        &self,
+        package: &PackageRef,
+        sources: &mut BTreeMap<String, BTreeMap<PackageRef, PathBuf>>,
+    ) -> Result<Option<wasm_pkg_core::manifest::Override>> {
+        let Some(overrides) = self.wkg_config.overrides.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(package_override) = overrides.get(&package.to_string()) {
+            return Ok(Some(package_override.clone()));
+        }
+        let namespace = package.namespace().to_string();
+        let Some(namespace_override) = overrides.get(&namespace) else {
+            return Ok(None);
+        };
+        let Some(source) = namespace_override.path.as_ref() else {
+            return Ok(Some(namespace_override.clone()));
+        };
+        let held = sources
+            .entry(namespace)
+            .or_insert_with_key(|namespace| namespace_source_packages(source, namespace));
+        match held.get(package) {
+            Some(path) => Ok(Some(wasm_pkg_core::manifest::Override {
+                path: Some(path.clone()),
+                version: namespace_override.version.clone(),
+            })),
+            None => Err(SourceLacksPackage {
+                package: package.clone(),
+                source: source.clone(),
+                held: held.keys().cloned().collect(),
+            }
+            .into()),
+        }
+    }
+
+    /// The overrides that serve the `pending` packages and, through their local sources, what
+    /// those depend on, keyed by `namespace:package`. A registry package needs no such walk: it
+    /// carries its own dependencies.
+    fn reachable_overrides(
+        &self,
+        mut pending: Vec<PackageRef>,
+    ) -> Result<HashMap<String, wasm_pkg_core::manifest::Override>> {
+        let mut sources = BTreeMap::new();
+        let mut visited = BTreeSet::new();
+        let mut reached = HashMap::new();
+        while let Some(package) = pending.pop() {
+            if !visited.insert(package.clone()) {
+                continue;
+            }
+            let Some(package_override) = self.override_for(&package, &mut sources)? else {
+                continue;
+            };
+            if let Some(path) = package_override.path.as_ref() {
+                pending.extend(named_packages(path).unwrap_or_default());
+            }
+            reached.insert(package.to_string(), package_override);
+        }
+        Ok(reached)
+    }
+
+    /// The manifest to resolve `wit_dir` with. `wasm_pkg_core` reads every override key as
+    /// `namespace:package`, so a namespace-wide override becomes an entry for each package in that
+    /// namespace that `wit_dir` or a local source needs.
+    fn resolution_manifest(&self, wit_dir: &Path) -> Result<wasm_pkg_core::manifest::Manifest> {
+        let mut manifest = self.wkg_config.clone();
+        let Some(overrides) = manifest.overrides.as_mut() else {
+            return Ok(manifest);
+        };
+        if overrides.keys().all(|key| key.contains(':')) {
+            return Ok(manifest);
+        }
+        overrides.retain(|key, _| key.contains(':'));
+
+        let mut pending = named_packages(wit_dir)?;
+        for path in overrides.values().filter_map(|o| o.path.as_ref()) {
+            // A path that cannot be read is reported by the resolution that follows
+            pending.extend(named_packages(path).unwrap_or_default());
+        }
+        for (key, package_override) in self.reachable_overrides(pending)? {
+            overrides.entry(key).or_insert(package_override);
+        }
+        Ok(manifest)
+    }
+
+    /// Says which namespace-wide overrides served no package in the expanded `manifest`.
+    fn warn_of_unused_namespace_sources(&self, manifest: &wasm_pkg_core::manifest::Manifest) {
+        let expanded = manifest.overrides.iter().flatten();
+        let served: BTreeSet<&str> = expanded
+            .filter_map(|(key, _)| key.split_once(':'))
+            .map(|(namespace, _)| namespace)
+            .collect();
+        let configured = self.wkg_config.overrides.iter().flatten();
+        for (key, _) in configured {
+            if !key.contains(':') && !served.contains(key.as_str()) {
+                warn!(
+                    namespace = key,
+                    "the WIT source override for this namespace matches no package in use"
+                );
+            }
+        }
+    }
+
+    pub async fn fetch_wit_dependencies(
+        &self,
+        wit_dir: impl AsRef<Path>,
+        lock: &mut LockFile,
+    ) -> Result<()> {
+        let wit_dir = wit_dir.as_ref();
+        let manifest = self.resolution_manifest(wit_dir)?;
+        self.warn_of_unused_namespace_sources(&manifest);
+        let mut attempt = 1;
+        loop {
+            self.discard_invalid_cache_entries().await?;
+            match wasm_pkg_core::wit::fetch_dependencies(
+                &manifest,
+                wit_dir,
+                lock,
+                self.client(),
+                OutputType::Wit,
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if attempt < WIT_FETCH_MAX_ATTEMPTS
+                        && is_transient_registry_fetch_error(&error) =>
+                {
+                    wait_to_retry_wit_fetch(&error, attempt).await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Build a WIT package into a Wasm binary
+    pub async fn build_wit_package(
+        &self,
+        wit_dir: impl AsRef<Path>,
+        lock: &mut LockFile,
+    ) -> Result<(
+        wasm_pkg_client::PackageRef,
+        Option<semver::Version>,
+        Vec<u8>,
+    )> {
+        let wit_dir = wit_dir.as_ref();
+        let manifest = self.resolution_manifest(wit_dir)?;
+        let mut attempt = 1;
+        loop {
+            self.discard_invalid_cache_entries().await?;
+            match wasm_pkg_core::wit::build_package(&manifest, wit_dir, lock, self.client()).await {
+                Ok(package) => return Ok(package),
+                Err(error)
+                    if attempt < WIT_FETCH_MAX_ATTEMPTS
+                        && is_transient_registry_fetch_error(&error) =>
+                {
+                    wait_to_retry_wit_fetch(&error, attempt).await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Work out what is wrong with a WIT directory that failed to fetch. Resolution reports only
+    /// that it failed, so this turns that into the two things it usually is: a package or version
+    /// the sources do not have, or one package named at two versions.
+    ///
+    /// Returns an empty list when nothing is found, which means the fetch failed for a reason its
+    /// own error already describes.
+    pub async fn diagnose_wit(&self, wit_dir: impl AsRef<Path>) -> Result<Vec<String>> {
+        let (_, packages) = wasm_pkg_core::wit::get_packages(wit_dir.as_ref())?;
+
+        // A HashSet has no order of its own, and the report should read the same every time
+        let mut required: BTreeMap<PackageRef, Vec<semver::VersionReq>> = BTreeMap::new();
+        for (package, requirement) in packages {
+            required.entry(package).or_default().push(requirement);
+        }
+        for requirements in required.values_mut() {
+            requirements.sort_by_key(ToString::to_string);
+        }
+
+        let overrides = self.wkg_config.overrides.clone().unwrap_or_default();
+        let client = self.client();
+
+        let mut problems = Vec::new();
+        for (package, requirements) in required {
+            // A fetch resolves one version per package name, so a package named at more than one
+            // version has no single version to ask the registry about either
+            if requirements.len() > 1 {
+                problems.push(multiple_versions_message(&package, &requirements));
+                continue;
+            }
+
+            // An overridden package does not come from the registry, so the registry has nothing
+            // to say about it
+            if overrides.contains_key(&package.to_string())
+                || overrides.contains_key(&package.namespace().to_string())
+            {
+                continue;
+            }
+
+            let Some(requirement) = requirements.first() else {
+                continue;
+            };
+            let version = requested_version(requirement);
+            match missing_from_registry(&client, &package, version.as_deref(), requirement).await {
+                Ok(Some(message)) => problems.push(message),
+                Ok(None) => {}
+                // A package that cannot be looked up is not a package that is known to be absent,
+                // and a registry that cannot answer for one will not answer for the rest either
+                Err(e) => {
+                    debug!("could not check [{package}] against its registry: {e:#}");
+                    break;
+                }
+            }
+        }
+
+        Ok(problems)
+    }
+
+    /// Load a single package from its source and report the interfaces and worlds it defines. A
+    /// world imports interfaces rather than whole packages, so this is what turns
+    /// `wasmcloud:messaging` into the set of names that can actually appear in a world.
+    ///
+    /// A package that the registry does not have comes back as [`PackageLookup::Missing`] with a
+    /// message naming what was searched; a lookup that could not be completed at all comes back
+    /// as [`PackageLookup::Failed`], so a caller can tell "there is no such package" apart from
+    /// "the registry could not be reached".
+    pub async fn load_package(
+        &self,
+        package: &PackageRef,
+        version: Option<&str>,
+        lock: Option<&LockFile>,
+    ) -> PackageLookup {
+        match self.try_load_package(package, version, lock).await {
+            Ok(lookup) => lookup,
+            Err(e) => match e.downcast::<SourceLacksPackage>() {
+                Ok(lacks) => PackageLookup::Missing(lacks.to_string()),
+                Err(e) => PackageLookup::Failed(e),
+            },
+        }
+    }
+
+    async fn try_load_package(
+        &self,
+        package: &PackageRef,
+        version: Option<&str>,
+        lock: Option<&LockFile>,
+    ) -> Result<PackageLookup> {
+        let requirement = match version {
+            Some(version) => semver::VersionReq::parse(&format!("={version}"))
+                .map_err(|e| anyhow::anyhow!("invalid version [{version}]: {e}"))?,
+            None => semver::VersionReq::STAR,
+        };
+
+        // A `wkg.toml` override (which is also where a `wit.sources` local path lands) replaces
+        // the registry for this package, so the registry is only searched when there is none.
+        let package_override = self.override_for(package, &mut BTreeMap::new())?;
+
+        let local = package_override
+            .as_ref()
+            .is_some_and(|package_override| package_override.path.is_some());
+        let client = self.client();
+
+        // The lock file goes in so that a version it already pins is the one selected here, the
+        // same way the fetch that follows selects it
+        let mut resolver =
+            wasm_pkg_core::resolver::DependencyResolver::new_with_client(client.clone(), lock)
+                .context("failed to create dependency resolver")?;
+        let mut local_dir = None;
+
+        match package_override {
+            Some(package_override) => {
+                // An override that pins a different version than the one asked for wins, the same
+                // way it does during a fetch, so say so rather than quietly resolving the other one
+                if let Some(pinned) = package_override.version.as_ref()
+                    && let Some(version) = version
+                    && semver::Version::parse(version)
+                        .is_ok_and(|requested| !pinned.matches(&requested))
+                {
+                    return Ok(PackageLookup::Missing(format!(
+                        "[{package}] is pinned to [{pinned}] by a source override, which does not \
+                         provide the requested version [{version}].\n\
+                         \n\
+                         Change the override under `wit.sources` in .wash/config.yaml (or in \
+                         wkg.toml), or ask for the pinned version."
+                    )));
+                }
+                let dependency = override_dependency(package, package_override, &requirement)
+                    .await
+                    .with_context(|| format!("failed to apply the override for [{package}]"))?;
+                match dependency {
+                    wasm_pkg_core::resolver::Dependency::Local(path) if path.is_dir() => {
+                        local_dir = Some(path);
+                    }
+                    dependency => resolver
+                        .add_dependency(package, &dependency)
+                        .await
+                        .with_context(|| format!("failed to load package [{package}]"))?,
+                }
+            }
+            None => {
+                if let Some(missing) =
+                    missing_from_registry(&client, package, version, &requirement).await?
+                {
+                    return Ok(PackageLookup::Missing(missing));
+                }
+                resolver
+                    .add_packages([(package.clone(), requirement.clone())])
+                    .await
+                    .with_context(|| format!("failed to look up package [{package}]"))?;
+            }
+        }
+
+        let (resolve, package_id) = match local_dir {
+            // A local package's dependencies resolve the way a fetch resolves them, so one it
+            // needs from a source override comes from there rather than from a registry. Only
+            // the overrides it reaches go in, since resolution loads every override it is given.
+            Some(path) => {
+                let mut overrides = self.reachable_overrides(named_packages(&path)?)?;
+                overrides.remove(&package.to_string());
+                let mut manifest = self.wkg_config.clone();
+                manifest.overrides = Some(overrides);
+                wasm_pkg_core::wit::resolve_dependencies(&manifest, &path, lock, client)
+                    .await
+                    .with_context(|| format!("failed to resolve package [{package}]"))?
+                    .generate_resolve(&path)
+                    .await
+                    .with_context(|| format!("failed to parse the WIT of package [{package}]"))?
+            }
+            None => {
+                let resolutions = resolver
+                    .resolve()
+                    .await
+                    .with_context(|| format!("failed to resolve package [{package}]"))?;
+                let resolution = resolutions
+                    .get(package)
+                    .with_context(|| format!("package [{package}] resolved to nothing"))?;
+                let decoded = resolution
+                    .decode()
+                    .await
+                    .with_context(|| format!("failed to decode package [{package}]"))?;
+                let (resolve, package_id, _) = decoded
+                    .resolve()
+                    .with_context(|| format!("failed to parse the WIT of package [{package}]"))?;
+                (resolve, package_id)
+            }
+        };
+        let resolved = resolve
+            .packages
+            .get(package_id)
+            .with_context(|| format!("package [{package}] is missing from its own WIT"))?;
+
+        // A local override serves whatever version its files declare, whatever was asked for
+        if local
+            && let Some(requested) = version
+            && let Some(actual) = resolved.name.version.as_ref()
+            && !requirement.matches(actual)
+        {
+            return Ok(PackageLookup::Missing(format!(
+                "[{package}] comes from a source override that provides version [{actual}], not \
+                 the requested version [{requested}].\n\
+                 \n\
+                 Change the override under `wit.sources` in .wash/config.yaml (or in wkg.toml), \
+                 or ask for version [{actual}]."
+            )));
+        }
+
+        Ok(PackageLookup::Found(PackageContents {
+            version: resolved.name.version.clone(),
+            interfaces: resolved.interfaces.keys().cloned().collect(),
+            worlds: resolved.worlds.keys().cloned().collect(),
+        }))
+    }
+}
+
+/// The packages a WIT file or directory names, without their version requirements.
+fn named_packages(path: &Path) -> Result<Vec<PackageRef>> {
+    let (_, packages) = wasm_pkg_core::wit::get_packages(path)?;
+    Ok(packages.into_iter().map(|(package, _)| package).collect())
+}
+
+/// The packages of `namespace` that a local source holds, by where each one lives: `source`
+/// itself, its entries, and the entries of its `deps` directory, which is where a WIT tree keeps
+/// the packages it depends on. The first place found wins. Only directories and `.wit` files are
+/// parsed, so other files in the source are never read.
+fn namespace_source_packages(source: &Path, namespace: &str) -> BTreeMap<PackageRef, PathBuf> {
+    let mut candidates = vec![source.to_path_buf()];
+    for dir in [source.to_path_buf(), source.join(WIT_DEPS_DIR)] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir() || path.extension().is_some_and(|ext| ext == "wit"))
+            .collect();
+        paths.sort();
+        candidates.extend(paths);
+    }
+
+    let mut packages = BTreeMap::new();
+    for candidate in candidates {
+        match wasm_pkg_core::wit::get_packages(&candidate) {
+            Ok((spec, _)) if spec.package.namespace().to_string() == namespace => {
+                packages.entry(spec.package).or_insert(candidate);
+            }
+            Ok(_) => {}
+            Err(e) => debug!(path = %candidate.display(), "not a WIT package: {e:#}"),
+        }
+    }
+    packages
+}
+
+/// The version a requirement asks for, when it asks for exactly one. WIT carries a whole version
+/// or none, and that is what wkg turns into `=<version>` or `*`.
+fn requested_version(requirement: &semver::VersionReq) -> Option<String> {
+    let requirement = requirement.to_string();
+    requirement.strip_prefix('=').map(ToString::to_string)
+}
+
+/// The outcome of loading one package, which separates a package the source does not have from a
+/// lookup that could not be completed
+pub enum PackageLookup {
+    /// The package was loaded, and this is what it defines
+    Found(PackageContents),
+    /// The source answered, and the package or the requested version is not in it. The message
+    /// says what was searched and, where the registry knows them, which versions do exist.
+    Missing(String),
+    /// The lookup could not be completed: the registry was unreachable, the credentials were
+    /// rejected, or the package was there but could not be read
+    Failed(anyhow::Error),
+}
+
+/// Turn a `wkg.toml` override into the dependency the resolver should load the package from
+async fn override_dependency(
+    package: &PackageRef,
+    package_override: wasm_pkg_core::manifest::Override,
+    requirement: &semver::VersionReq,
+) -> Result<wasm_pkg_core::resolver::Dependency> {
+    match (package_override.path, package_override.version) {
+        (Some(path), _) => {
+            let path = tokio::fs::canonicalize(&path)
+                .await
+                .with_context(|| format!("local path [{}] does not exist", path.display()))?;
+            Ok(wasm_pkg_core::resolver::Dependency::Local(path))
+        }
+        (None, version) => Ok(wasm_pkg_core::resolver::Dependency::Package(
+            wasm_pkg_core::resolver::RegistryPackage {
+                name: Some(package.clone()),
+                version: version.unwrap_or_else(|| requirement.clone()),
+                registry: None,
+            },
+        )),
+    }
+}
+
+/// What a WIT package defines, as resolved from a registry
+#[derive(Debug, Clone)]
+pub struct PackageContents {
+    /// The resolved version of the package, if it is versioned
+    pub version: Option<semver::Version>,
+    /// Names of the interfaces the package defines
+    pub interfaces: Vec<String>,
+    /// Names of the worlds the package defines
+    pub worlds: Vec<String>,
+}
+
+/// Detect source type from string format
+fn detect_source_type(source: &str) -> RegistryPullSource {
+    if is_git_source(source) {
+        RegistryPullSource::RemoteGit(source.to_string())
+    } else if source.starts_with("http://") || source.starts_with("https://") {
+        RegistryPullSource::RemoteHttp(source.to_string())
+    } else if source.contains('/')
+        && !source.starts_with('.')
+        && !source.starts_with('/')
+        && !source.starts_with("file://")
+    {
+        // Likely OCI reference (contains slash but not a filesystem path)
+        RegistryPullSource::RemoteOci(source.to_string())
+    } else {
+        // Default to local path
+        RegistryPullSource::LocalPath(source.to_string())
+    }
+}
+
+/// Heuristic for detecting a Git source URL.
+///
+/// A bare `.contains(".git")` is too eager — it misclassifies OCI registries
+/// whose hostname happens to include `.git`, such as `registry.gitlab.com`.
+/// Treat a source as Git only when it uses a Git-specific scheme/form or its
+/// resource path ends with `.git` (optionally followed by a `#<ref>` fragment).
+fn is_git_source(source: &str) -> bool {
+    if source.starts_with("git+") || source.starts_with("git@") {
+        return true;
+    }
+    // Strip any `#<ref>` fragment and trailing slash, then look for a `.git` suffix.
+    let without_fragment = source.split('#').next().unwrap_or(source);
+    without_fragment.trim_end_matches('/').ends_with(".git")
+}
+
+/// Parse a WIT package name into namespace, packages, and version
+/// Format: namespace:package@version or namespace@version
+fn parse_wit_package_name(target: &str) -> Result<(String, Vec<String>, Option<String>)> {
+    // Split on @ to separate version
+    let (name_part, version) = if let Some((name, ver)) = target.rsplit_once('@') {
+        (name, Some(ver.to_string()))
+    } else {
+        (target, None)
+    };
+
+    // Split on : to separate namespace and packages
+    if let Some((namespace, packages_part)) = name_part.split_once(':') {
+        let packages = if packages_part.is_empty() {
+            vec![]
+        } else {
+            vec![packages_part.to_string()]
+        };
+        Ok((namespace.to_string(), packages, version))
+    } else {
+        // Just namespace, no packages
+        Ok((name_part.to_string(), vec![], version))
+    }
+}
+
+/// Set override for the target WIT package using the wkg config overrides map
+fn set_override_for_target(
+    overrides: &mut std::collections::HashMap<String, wasm_pkg_core::manifest::Override>,
+    namespace: &str,
+    packages: &[String],
+    path: PathBuf,
+) {
+    use wasm_pkg_core::manifest::Override;
+
+    if packages.is_empty() {
+        // Namespace-level override: "namespace" = { path = "..." }
+        overrides.insert(
+            namespace.to_string(),
+            Override {
+                path: Some(path),
+                version: None,
+            },
+        );
+    } else {
+        // Package-level override: "namespace:package" = { path = "..." }
+        for package in packages {
+            let key = format!("{namespace}:{package}");
+            overrides.insert(
+                key,
+                Override {
+                    path: Some(path.clone()),
+                    version: None,
+                },
+            );
+        }
+    }
+}
+
+/// Download and extract HTTP tar.gz source
+async fn download_and_extract_http(url: &str) -> Result<PathBuf> {
+    let parsed_url = Url::parse(url).with_context(|| format!("invalid HTTP URL [{url}]"))?;
+
+    let tempdir = tempfile::tempdir()
+        .with_context(|| format!("failed to create temp dir for downloading [{url}]"))?
+        .keep();
+
+    let output_path = tempdir.join("unpacked");
+
+    // Use reqwest to download the archive with rustls-tls
+    let client = reqwest::ClientBuilder::new()
+        .use_rustls_tls()
+        .build()
+        .context("failed to build HTTP client")?;
+    let response = client
+        .get(parsed_url)
+        .send()
+        .await
+        .with_context(|| format!("failed to download from URL [{url}]"))?;
+
+    let bytes = response
+        .bytes()
+        .await
+        .with_context(|| format!("failed to read response from URL [{url}]"))?;
+
+    // Extract tar.gz
+    let decoder = flate2::read::GzDecoder::new(&bytes[..]);
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .unpack(&output_path)
+        .with_context(|| format!("failed to unpack archive from URL [{url}]"))?;
+
+    find_wit_folder_in_path(&output_path).await
+}
+
+/// Clone git repository and find WIT directory
+async fn clone_git_and_find_wit(url: &str) -> Result<PathBuf> {
+    let tempdir = tempfile::tempdir()
+        .with_context(|| format!("failed to create temp dir for cloning [{url}]"))?
+        .keep();
+
+    // Parse git URL to handle git+ prefix
+    let git_url = if let Some(stripped) = url.strip_prefix("git+") {
+        stripped
+    } else {
+        url
+    };
+
+    debug!(
+        "cloning git repository: {} to {}",
+        git_url,
+        tempdir.display()
+    );
+
+    // Use system git command to clone the repository
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(["clone", git_url, tempdir.to_string_lossy().as_ref()]);
+
+    let output = cmd
+        .output()
+        .await
+        .with_context(|| format!("failed to execute git clone command for [{git_url}]"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("Git clone failed for [{git_url}]: {stderr}");
+    }
+
+    debug!(url = git_url, "successfully cloned git repository");
+
+    let wit_path = find_wit_folder_in_path(&tempdir).await?;
+    debug!(path = %wit_path.display(), "found WIT path");
+    Ok(wit_path)
+}
+
+/// Find the WIT directory in the given path, preferring root-level 'wit' directories
+async fn find_wit_folder_in_path(search_path: &Path) -> Result<PathBuf> {
+    use tracing::debug;
+
+    // First check if there's a 'wit' directory at the root level
+    let root_wit = search_path.join("wit");
+    if root_wit.exists() && root_wit.is_dir() {
+        debug!(path = %root_wit.display(), "found root-level WIT directory");
+        return Ok(root_wit);
+    }
+
+    // If no root-level wit directory, search recursively
+    find_wit_folder_in_path_internal(search_path, 0).await
+}
+
+/// Internal helper for find_wit_folder_in_path with depth limit to prevent infinite recursion
+fn find_wit_folder_in_path_internal(
+    search_path: &Path,
+    depth: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PathBuf>> + Send + '_>> {
+    Box::pin(async move {
+        if depth > 10 {
+            // Prevent infinite recursion
+            return Ok(search_path.to_path_buf());
+        }
+
+        let mut entries = tokio::fs::read_dir(search_path)
+            .await
+            .with_context(|| format!("failed to read directory [{}]", search_path.display()))?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) == Some("wit") {
+                    return Ok(path);
+                }
+
+                // Recursively search subdirectories
+                if let Ok(nested_wit) = find_wit_folder_in_path_internal(&path, depth + 1).await
+                    && nested_wit != path
+                {
+                    return Ok(nested_wit);
+                }
+            }
+        }
+
+        // If no wit directory found, return the search path itself
+        Ok(search_path.to_path_buf())
+    })
+}
+
+/// Load a lock file from the project directory
+///
+/// The lock file is expected to be at `wkg.lock` in the project root, or `.wash/wasmcloud.lock` relative to the project directory.
+#[instrument(skip_all)]
+pub async fn load_lock_file(project_dir: impl AsRef<Path>) -> Result<LockFile> {
+    let project_dir = project_dir.as_ref();
+
+    let wkg_lock_file_path = project_dir.join(WKG_LOCK_FILE_NAME);
+
+    let lock_file_path = if wkg_lock_file_path.exists() {
+        // If the wkg.lock file exists, we prefer to use it
+        debug!(path = %wkg_lock_file_path.display(), "found wkg.lock file, using it");
+        Some(&wkg_lock_file_path)
+    } else {
+        None
+    };
+
+    if let Some(lock_file_path) = lock_file_path {
+        debug!(lock_file_path = %lock_file_path.display(), "loading lock file ");
+        // Check if the lock file is empty; if so, remove it and create a new lock file
+        let metadata = tokio::fs::metadata(lock_file_path).await?;
+        if metadata.len() == 0 {
+            debug!("wkg.lock file is empty, removing and creating a new one");
+            tokio::fs::remove_file(lock_file_path).await?;
+            return LockFile::new_with_path([], lock_file_path)
+                .await
+                .context("failed to create new lock file after removing empty wkg.lock file");
+        }
+        LockFile::load_from_path(lock_file_path, false)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to load lock file: {lock_file_path}",
+                    lock_file_path = lock_file_path.display()
+                )
+            })
+    } else {
+        debug!("lock file does not exist, will create wkg.lock at project root when saving");
+        // Create a new empty lock file that will be written to wkg.lock at the project root
+        LockFile::new_with_path([], &wkg_lock_file_path)
+            .await
+            .context("failed to create new lock file")
+    }
+}
+
+/// Load a project's `wkg.toml` package overrides, or the default (empty) config
+/// when the project has none.
+///
+/// `wkg.toml` lets a project resolve WIT packages from a local path or an
+/// alternate registry instead of the default one. Both `wash build` and
+/// `wash wit fetch` call this so those overrides are honored the same way the
+/// standalone `wkg` tool honors them.
+pub async fn load_wkg_config(
+    project_dir: impl AsRef<Path>,
+) -> Result<wasm_pkg_core::manifest::Manifest> {
+    let config_path = project_dir
+        .as_ref()
+        .join(wasm_pkg_core::manifest::MANIFEST_FILE_NAME);
+    if tokio::fs::try_exists(&config_path).await.unwrap_or(false) {
+        debug!(path = %config_path.display(), "loading wkg.toml overrides");
+        wasm_pkg_core::manifest::Manifest::load_from_path(&config_path)
+            .with_context(|| format!("failed to load {}", config_path.display()))
+    } else {
+        Ok(wasm_pkg_core::manifest::Manifest::default())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+    use std::{collections::HashMap, time::Duration};
+
+    /// A `WkgFetcher` backed by a cache under `dir` and empty configs, for exercising the
+    /// config-application methods.
+    async fn test_fetcher(dir: &Path) -> WkgFetcher {
+        let cache = FileCache::new(dir.to_path_buf()).await.unwrap();
+        WkgFetcher {
+            wkg_config: wasm_pkg_core::manifest::Manifest::default(),
+            wkg_client_config: wasm_pkg_client::Config::default(),
+            cache,
+            cache_dir: dir.to_path_buf(),
+        }
+    }
+
+    #[tokio::test]
+    async fn wit_fetch_discards_incomplete_cache_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let fetcher = test_fetcher(temp.path()).await;
+        let valid_digest = temp
+            .path()
+            .join("sha256:ec654fac9599f62e79e2706abef23dfb7c07c08185aa86db4d8695f0b718d1b3");
+        let truncated_digest = temp
+            .path()
+            .join("sha256:eebbf6457e46a7f63acdf9b97390f790ba443d60cfa44b607da7e5c40aa1cc1d");
+        let valid_release = temp.path().join("example:valid-1.0.0.json");
+        let truncated_release = temp.path().join("example:truncated-1.0.0.json");
+        let invalid_release = temp.path().join("example:invalid-1.0.0.json");
+        let missing_release = temp.path().join("example:missing-1.0.0.json");
+        tokio::fs::write(&valid_digest, b"valid").await.unwrap();
+        tokio::fs::write(&truncated_digest, b"partial")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            &valid_release,
+            br#"{"version":"1.0.0","content_digest":"sha256:ec654fac9599f62e79e2706abef23dfb7c07c08185aa86db4d8695f0b718d1b3"}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            &truncated_release,
+            br#"{"version":"1.0.0","content_digest":"sha256:eebbf6457e46a7f63acdf9b97390f790ba443d60cfa44b607da7e5c40aa1cc1d"}"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(&invalid_release, b"{").await.unwrap();
+        tokio::fs::write(
+            &missing_release,
+            br#"{"version":"1.0.0","content_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        )
+        .await
+        .unwrap();
+
+        fetcher.discard_invalid_cache_entries().await.unwrap();
+
+        assert!(valid_digest.exists());
+        assert!(valid_release.exists());
+        assert!(!truncated_digest.exists());
+        assert!(truncated_release.exists());
+        assert!(!invalid_release.exists());
+        assert!(missing_release.exists());
+    }
+
+    #[tokio::test]
+    async fn wit_fetch_discards_unreferenced_incomplete_blobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let fetcher = test_fetcher(temp.path()).await;
+        let orphan_digest = temp
+            .path()
+            .join("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        tokio::fs::write(&orphan_digest, b"partial").await.unwrap();
+
+        fetcher.discard_invalid_cache_entries().await.unwrap();
+
+        assert!(!orphan_digest.exists());
+    }
+
+    #[test]
+    fn test_detect_source_type() {
+        assert!(matches!(
+            detect_source_type("../shared-wit"),
+            RegistryPullSource::LocalPath(_)
+        ));
+        assert!(matches!(
+            detect_source_type("./local/path"),
+            RegistryPullSource::LocalPath(_)
+        ));
+        assert!(matches!(
+            detect_source_type("/absolute/path/wit"),
+            RegistryPullSource::LocalPath(_)
+        ));
+        assert!(matches!(
+            detect_source_type("https://example.com/archive.tar.gz"),
+            RegistryPullSource::RemoteHttp(_)
+        ));
+        assert!(matches!(
+            detect_source_type("git+https://github.com/user/repo.git"),
+            RegistryPullSource::RemoteGit(_)
+        ));
+        assert!(matches!(
+            detect_source_type("git@github.com:user/repo.git"),
+            RegistryPullSource::RemoteGit(_)
+        ));
+        assert!(matches!(
+            detect_source_type("https://github.com/user/repo.git"),
+            RegistryPullSource::RemoteGit(_)
+        ));
+        assert!(matches!(
+            detect_source_type("https://github.com/user/repo.git#main"),
+            RegistryPullSource::RemoteGit(_)
+        ));
+        assert!(matches!(
+            detect_source_type("ghcr.io/user/package"),
+            RegistryPullSource::RemoteOci(_)
+        ));
+        // Regression: OCI registries whose hostname contains `.git` must not be
+        // misclassified as Git sources (see wasmCloud/wasmCloud#5194).
+        assert!(matches!(
+            detect_source_type("registry.gitlab.com/group/project/wasm-component:1.0.0"),
+            RegistryPullSource::RemoteOci(_)
+        ));
+        assert!(matches!(
+            detect_source_type("registry.gitlab.com/group/project/wasm-component"),
+            RegistryPullSource::RemoteOci(_)
+        ));
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct OciMeta {
+        registry: Option<String>,
+        namespace_prefix: Option<String>,
+    }
+
+    fn oci_meta(mapping: &RegistryMapping) -> (String, OciMeta) {
+        match mapping {
+            RegistryMapping::Custom(custom) => (
+                custom.registry.to_string(),
+                custom
+                    .metadata
+                    .protocol_config("oci")
+                    .expect("oci protocol config should deserialize")
+                    .expect("oci protocol config should be present"),
+            ),
+            other => panic!("expected a custom OCI mapping, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oci_source_conventional_path_is_plain_registry() {
+        // The default `{registry}/{namespace}/{package}` layout needs no prefix, and the
+        // `:tag` is dropped since the tag comes from the resolved package version.
+        let mapping = oci_registry_mapping(
+            "ghcr.io/seamlezz/surrealdb:0.2.0",
+            "seamlezz",
+            Some("surrealdb"),
+        )
+        .unwrap();
+        match mapping {
+            RegistryMapping::Registry(reg) => assert_eq!(reg.to_string(), "ghcr.io"),
+            other => panic!("expected a plain registry mapping, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oci_source_strips_scheme() {
+        let mapping = oci_registry_mapping(
+            "oci://ghcr.io/seamlezz/surrealdb",
+            "seamlezz",
+            Some("surrealdb"),
+        )
+        .unwrap();
+        assert!(matches!(mapping, RegistryMapping::Registry(_)));
+    }
+
+    #[test]
+    fn oci_source_deep_path_sets_namespace_prefix() {
+        let mapping = oci_registry_mapping(
+            "ghcr.io/myorg/wit/seamlezz/surrealdb",
+            "seamlezz",
+            Some("surrealdb"),
+        )
+        .unwrap();
+        let (registry, oci) = oci_meta(&mapping);
+        assert_eq!(registry, "ghcr.io");
+        assert_eq!(oci.registry.as_deref(), Some("ghcr.io"));
+        assert_eq!(oci.namespace_prefix.as_deref(), Some("myorg/wit/"));
+    }
+
+    #[test]
+    fn oci_namespace_level_source() {
+        // A namespace-level override with the namespace as the trailing path segment.
+        let mapping = oci_registry_mapping("ghcr.io/seamlezz", "seamlezz", None).unwrap();
+        assert!(matches!(mapping, RegistryMapping::Registry(_)));
+
+        // A leading path becomes the namespace prefix.
+        let mapping = oci_registry_mapping("ghcr.io/myorg/seamlezz", "seamlezz", None).unwrap();
+        let (_, oci) = oci_meta(&mapping);
+        assert_eq!(oci.namespace_prefix.as_deref(), Some("myorg/"));
+    }
+
+    #[test]
+    fn oci_source_namespace_mismatch_is_err() {
+        // The WIT namespace `seamlezz` does not appear where wasm-pkg would reconstruct it.
+        let err = oci_registry_mapping("ghcr.io/other/pkg", "seamlezz", Some("surrealdb"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not resolve to the expected repository suffix"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_wit_package_name() {
+        let (ns, pkgs, ver) = parse_wit_package_name("wasmcloud:bus@1.0.0").unwrap();
+        assert_eq!(ns, "wasmcloud");
+        assert_eq!(pkgs, vec!["bus"]);
+        assert_eq!(ver, Some("1.0.0".to_string()));
+
+        let (ns, pkgs, ver) = parse_wit_package_name("wasi:config").unwrap();
+        assert_eq!(ns, "wasi");
+        assert_eq!(pkgs, vec!["config"]);
+        assert_eq!(ver, None);
+
+        let (ns, pkgs, ver) = parse_wit_package_name("wasmcloud@2.0.0").unwrap();
+        assert_eq!(ns, "wasmcloud");
+        assert_eq!(pkgs, Vec::<String>::new());
+        assert_eq!(ver, Some("2.0.0".to_string()));
+    }
+
+    #[test]
+    fn test_set_override_for_target() {
+        let mut overrides = HashMap::new();
+        let path = PathBuf::from("/tmp/test-wit");
+
+        // Test namespace-level override
+        set_override_for_target(&mut overrides, "wasmcloud", &[], path.clone());
+        assert!(overrides.contains_key("wasmcloud"));
+        assert_eq!(overrides["wasmcloud"].path, Some(path.clone()));
+
+        // Test package-level override
+        set_override_for_target(
+            &mut overrides,
+            "wasi",
+            &["config".to_string()],
+            path.clone(),
+        );
+        assert!(overrides.contains_key("wasi:config"));
+        assert_eq!(overrides["wasi:config"].path, Some(path));
+    }
+
+    #[test]
+    fn test_wit_config_deserialization() {
+        let json = r#"
+        {
+            "sources": {
+                "wasmcloud:bus": "../shared-wit",
+                "wasi:config": "https://example.com/config.tar.gz"
+            }
+        }
+        "#;
+
+        let config: WitConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.sources.len(), 2);
+        assert_eq!(config.sources["wasmcloud:bus"], "../shared-wit");
+        assert_eq!(
+            config.sources["wasi:config"],
+            "https://example.com/config.tar.gz"
+        );
+    }
+
+    fn empty_wit() -> WitConfig {
+        WitConfig {
+            registries: vec![],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn wit_default_with_no_sources_is_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(empty_wit().validate(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn wit_invalid_registry_url_is_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = WitConfig {
+            registries: vec![WitRegistry {
+                url: "not a url".to_string(),
+                username: None,
+                token: None,
+            }],
+            ..Default::default()
+        };
+        let err = cfg.validate(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("wit.registries"));
+    }
+
+    #[test]
+    fn wit_valid_registry_url_is_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = WitConfig {
+            registries: vec![WitRegistry {
+                url: "https://wasm.pkg".to_string(),
+                username: None,
+                token: None,
+            }],
+            ..Default::default()
+        };
+        assert!(cfg.validate(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn wit_empty_source_key_is_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = empty_wit();
+        cfg.sources
+            .insert("  ".to_string(), "./local/wit".to_string());
+        let err = cfg.validate(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("empty target key"));
+    }
+
+    #[test]
+    fn wit_empty_source_value_is_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = empty_wit();
+        cfg.sources
+            .insert("wasi:http".to_string(), "  ".to_string());
+        let err = cfg.validate(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("empty source value"));
+    }
+
+    #[test]
+    fn wit_local_path_missing_is_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = empty_wit();
+        cfg.sources
+            .insert("example:local".to_string(), "./does-not-exist".to_string());
+        let err = cfg.validate(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("does not exist"));
+    }
+
+    #[test]
+    fn wit_local_path_exists_is_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wit_dir = tmp.path().join("my-wit");
+        std::fs::create_dir_all(&wit_dir).unwrap();
+        let mut cfg = empty_wit();
+        cfg.sources
+            .insert("example:local".to_string(), "my-wit".to_string());
+        assert!(cfg.validate(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn wit_http_source_not_validated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = empty_wit();
+        cfg.sources.insert(
+            "example:http".to_string(),
+            "https://example.com/nonexistent.tar.gz".to_string(),
+        );
+        assert!(cfg.validate(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn wit_git_source_not_validated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = empty_wit();
+        cfg.sources.insert(
+            "example:git".to_string(),
+            "git+https://github.com/nonexistent/repo.git".to_string(),
+        );
+        assert!(cfg.validate(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn wit_oci_source_not_validated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = empty_wit();
+        cfg.sources.insert(
+            "example:oci".to_string(),
+            "ghcr.io/nonexistent/pkg".to_string(),
+        );
+        assert!(cfg.validate(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn wit_multiple_errors_are_all_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = WitConfig {
+            registries: vec![WitRegistry {
+                url: "bad url".to_string(),
+                username: None,
+                token: None,
+            }],
+            ..Default::default()
+        };
+        cfg.sources
+            .insert("wasi:http".to_string(), "./missing-path".to_string());
+        let err = cfg.validate(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("wit.registries"), "missing registry error");
+        assert!(err.contains("does not exist"), "missing path error");
+    }
+
+    #[test]
+    fn registry_authority_accepts_host_and_url() {
+        assert_eq!(
+            registry_authority("ghcr.io").unwrap().to_string(),
+            "ghcr.io"
+        );
+        assert_eq!(
+            registry_authority("https://ghcr.io").unwrap().to_string(),
+            "ghcr.io"
+        );
+        assert_eq!(
+            registry_authority("localhost:5000").unwrap().to_string(),
+            "localhost:5000"
+        );
+        assert_eq!(
+            registry_authority("http://localhost:5000")
+                .unwrap()
+                .to_string(),
+            "localhost:5000"
+        );
+        // A repository path is not a registry host.
+        assert!(registry_authority("ghcr.io/seamlezz").is_err());
+    }
+
+    #[test]
+    fn wit_registry_requires_username_and_token_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let only_token = WitConfig {
+            registries: vec![WitRegistry {
+                url: "ghcr.io".to_string(),
+                username: None,
+                token: Some("ghp_xxx".to_string()),
+            }],
+            ..Default::default()
+        };
+        let err = only_token.validate(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("both username and token"), "unexpected: {err}");
+
+        let both = WitConfig {
+            registries: vec![WitRegistry {
+                url: "ghcr.io".to_string(),
+                username: Some("me".to_string()),
+                token: Some("ghp_xxx".to_string()),
+            }],
+            ..Default::default()
+        };
+        assert!(both.validate(tmp.path()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn apply_registry_auth_configures_oci_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fetcher = test_fetcher(tmp.path()).await;
+        fetcher
+            .apply_registry_auth(&[WitRegistry {
+                url: "https://ghcr.io".to_string(),
+                username: Some("me".to_string()),
+                token: Some("ghp_xxx".to_string()),
+            }])
+            .unwrap();
+
+        let registry: Registry = "ghcr.io".parse().unwrap();
+        let registry_config = fetcher
+            .wkg_client_config
+            .registry_config(&registry)
+            .expect("registry config should be set for ghcr.io");
+        assert!(
+            registry_config
+                .configured_backend_types()
+                .any(|backend| backend == "oci"),
+            "oci backend auth should be configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_registry_auth_rejects_half_configured_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fetcher = test_fetcher(tmp.path()).await;
+        let err = fetcher
+            .apply_registry_auth(&[WitRegistry {
+                url: "ghcr.io".to_string(),
+                username: None,
+                token: Some("ghp_xxx".to_string()),
+            }])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("both username and token"), "unexpected: {err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_extended_pull_configs_wires_oci_sources() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut fetcher = test_fetcher(tmp.path()).await;
+
+        let sources = HashMap::from([
+            (
+                "seamlezz:surrealdb".to_string(),
+                "ghcr.io/seamlezz/surrealdb".to_string(),
+            ),
+            ("acme".to_string(), "ghcr.io/acme".to_string()),
+        ]);
+        fetcher
+            .resolve_extended_pull_configs(&sources, tmp.path())
+            .await
+            .unwrap();
+
+        // Package-level source becomes a package registry override.
+        let pkg = PackageRef::new(
+            "seamlezz".to_string().try_into().unwrap(),
+            "surrealdb".to_string().try_into().unwrap(),
+        );
+        assert!(
+            fetcher
+                .wkg_client_config
+                .package_registry_override(&pkg)
+                .is_some(),
+            "package-level OCI source should set a package registry override"
+        );
+
+        // Namespace-level source becomes a namespace registry mapping.
+        let ns_label = "acme".parse().unwrap();
+        assert!(
+            fetcher
+                .wkg_client_config
+                .namespace_registry(&ns_label)
+                .is_some(),
+            "namespace-level OCI source should set a namespace registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_extended_pull_configs_wires_local_path_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wit_dir = tmp.path().join("shared-wit");
+        std::fs::create_dir_all(&wit_dir).unwrap();
+        let mut fetcher = test_fetcher(tmp.path()).await;
+
+        let sources = HashMap::from([("local:shared".to_string(), "shared-wit".to_string())]);
+        fetcher
+            .resolve_extended_pull_configs(&sources, tmp.path())
+            .await
+            .unwrap();
+
+        let overrides = fetcher
+            .wkg_config
+            .overrides
+            .as_ref()
+            .expect("local path source should populate wkg overrides");
+        assert!(
+            overrides.contains_key("local:shared"),
+            "local path source should set an override for the target package"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_wkg_config_reads_project_overrides() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join(wasm_pkg_core::manifest::MANIFEST_FILE_NAME),
+            "[overrides]\n\"wasmcloud:app\" = { path = \"../wasmcloud-app\" }\n",
+        )
+        .await
+        .unwrap();
+
+        let config = load_wkg_config(tmp.path()).await.unwrap();
+        let overrides = config.overrides.expect("overrides should be loaded");
+        let app = overrides
+            .get("wasmcloud:app")
+            .expect("wasmcloud:app override should be present");
+        assert_eq!(app.path.as_deref(), Some(Path::new("../wasmcloud-app")));
+    }
+
+    #[tokio::test]
+    async fn load_wkg_config_defaults_without_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = load_wkg_config(tmp.path()).await.unwrap();
+        assert!(config.overrides.is_none());
+    }
+
+    #[tokio::test]
+    async fn wit_discovery_prefers_the_root_and_handles_nested_and_empty_sources() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        tokio::fs::create_dir_all(root.join("package/wit")).await?;
+        tokio::fs::create_dir(root.join("wit")).await?;
+        assert_eq!(find_wit_folder_in_path(root).await?, root.join("wit"));
+        tokio::fs::remove_dir(root.join("wit")).await?;
+        assert_eq!(
+            find_wit_folder_in_path(root).await?,
+            root.join("package/wit")
+        );
+        tokio::fs::remove_dir_all(root.join("package")).await?;
+        tokio::fs::write(root.join("package.wit"), "package acme:example;").await?;
+        assert_eq!(find_wit_folder_in_path(root).await?, root);
+        assert_eq!(find_wit_folder_in_path_internal(root, 11).await?, root);
+        assert!(
+            find_wit_folder_in_path(&root.join("missing"))
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lock_files_are_created_recovered_and_validated() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join(WKG_LOCK_FILE_NAME);
+        let mut lock = load_lock_file(temp.path()).await?;
+        lock.write().await?;
+        drop(lock);
+        let contents = tokio::fs::read_to_string(&path).await?;
+        assert!(contents.contains("version = 1"));
+        drop(load_lock_file(temp.path()).await?);
+        tokio::fs::write(&path, "").await?;
+        let mut recovered = load_lock_file(temp.path()).await?;
+        recovered.write().await?;
+        drop(recovered);
+        assert_eq!(tokio::fs::read_to_string(&path).await?, contents);
+        for invalid in ["[", "version = 999\npackages = []\n"] {
+            tokio::fs::write(&path, invalid).await?;
+            assert!(load_lock_file(temp.path()).await.is_err());
+            assert_eq!(tokio::fs::read_to_string(&path).await?, invalid);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_sources_extract_wit_from_a_package_archive() -> Result<()> {
+        use crate::cli::test_support::{HttpFixture, Response};
+        use std::io::Write as _;
+
+        wash_runtime::init_crypto();
+        let contents = b"package acme:example;";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let mut archive = tar::Builder::new(Vec::new());
+        archive.append_data(&mut header, "package/wit/example.wit", contents.as_slice())?;
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(&archive.into_inner()?)?;
+        let body = gzip.finish()?;
+        let mut server = HttpFixture::start(vec![Response::new(200, body)]).await?;
+        let wit = tokio::time::timeout(
+            Duration::from_secs(10),
+            download_and_extract_http(&format!("http://{}/source.tar.gz", server.address)),
+        )
+        .await??;
+        let requests = server.finish().await?;
+        assert_eq!(requests[0].target, "GET /source.tar.gz HTTP/1.1");
+        assert_eq!(tokio::fs::read(wit.join("example.wit")).await?, contents);
+        let unpacked = wit
+            .parent()
+            .and_then(Path::parent)
+            .context("missing archive root")?;
+        assert_eq!(
+            unpacked.file_name().and_then(|n| n.to_str()),
+            Some("unpacked")
+        );
+        let temporary = unpacked.parent().context("missing temporary directory")?;
+        tokio::fs::remove_dir_all(temporary).await?;
+        assert!(download_and_extract_http("invalid URL").await.is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod contract_tests;

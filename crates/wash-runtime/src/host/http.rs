@@ -20,18 +20,17 @@
 
 use std::sync::atomic::AtomicBool;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     net::SocketAddr,
     path::Path,
     sync::{Arc, OnceLock},
     time::Duration,
 };
 
-use arc_swap::ArcSwap;
-
 use crate::engine::abandon::{AbandonFlag, AbandonOnDrop, DispatchedCall};
 use crate::host::allowed_hosts::AllowedHost;
 use crate::host::trigger_service::{BrokerMessage, MessagingJob};
+use crate::observability::rate_limit::RateLimitedWarn;
 use crate::{
     engine::ctx::SharedCtx,
     observability::{MeterKind, Meters},
@@ -49,8 +48,9 @@ use hyper_util::{
 use opentelemetry::context::FutureExt;
 use opentelemetry::{KeyValue, trace::TraceContextExt as _};
 use opentelemetry_semantic_conventions::attribute::{
-    ERROR_TYPE, HTTP_REQUEST_METHOD, HTTP_RESPONSE_BODY_SIZE, HTTP_RESPONSE_STATUS_CODE,
-    OTEL_STATUS_CODE, RPC_RESPONSE_STATUS_CODE, SERVER_ADDRESS, SERVER_PORT, URL_FULL, URL_PATH,
+    ERROR_TYPE, FAAS_NAME, FAAS_TRIGGER, HTTP_REQUEST_METHOD, HTTP_RESPONSE_BODY_SIZE,
+    HTTP_RESPONSE_STATUS_CODE, OTEL_STATUS_CODE, RPC_RESPONSE_STATUS_CODE, SERVER_ADDRESS,
+    SERVER_PORT, URL_FULL, URL_PATH,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -497,33 +497,109 @@ pub trait Router: Send + Sync + 'static {
 }
 
 /// Router that routes requests by 'Host' header, configured via WitInterface config
-#[derive(Default)]
+///
+/// Requests read an ArcSwap snapshot without taking any of the writers' locks.
+/// Persistent maps and replica sets share unchanged nodes between snapshots,
+/// so an update copies paths through those structures instead of the entire
+/// touched shard or replica set. Path buckets remain a small ordered vector.
 pub struct DynamicRouter {
-    /// Routing tables behind a single [`ArcSwap`] so the per-request read in
-    /// [`Self::select_workload`] is lock-free — a concurrent register/unbind can
-    /// never make a request wait or 503. Register and unbind are copy-on-write
-    /// via `rcu`; they happen on workload start/stop (rare relative to requests),
-    /// so cloning the tables is cheap next to the hot read path.
-    routes: ArcSwap<Routes>,
-}
-
-/// The `DynamicRouter` routing tables, swapped atomically as one unit so a
-/// reader never sees the forward and reverse maps disagree.
-#[derive(Default, Clone)]
-struct Routes {
-    /// Maps a hostname to the path-scoped buckets registered under it, held
-    /// longest-prefix-first so a lookup is an ordered scan that stops at the
-    /// first match. One hostname carries few prefixes in practice, so this
-    /// stays cheaper than a trie and keeps the table clonable for `rcu`.
-    host_to_workload: HashMap<String, Vec<PathBucket>>,
+    /// Maps a hostname to the path-scoped buckets registered under it, split
+    /// across shards by hostname, each with the lock its writers take.
+    /// Updates copy persistent tree paths.
+    hosts: Box<[RouteShard; ROUTE_SHARDS]>,
     /// Maps workload_id -> every route (primary + aliases, each with its path
     /// prefix) registered for it, so `on_workload_unbind` can remove all
-    /// entries cleanly.
-    workload_to_host: HashMap<String, Vec<IngressRoute>>,
+    /// entries cleanly. Split across shards by workload id.
+    ///
+    /// Each workload has its own [`WorkloadRecord`]. A register or unregister
+    /// holds that record across its whole update, so a workload's record and
+    /// its routes change together, even when a restart's register and a
+    /// stop's unregister of it overlap. A shard's lock is held only to look
+    /// up or drop a record, never while waiting on a hostname's writer, so
+    /// starts of unrelated workloads do not wait on each other. Requests
+    /// never take either lock.
+    workload_to_host: Box<[WorkloadShard; ROUTE_SHARDS]>,
+}
+
+/// The routes one workload registered, or `None` before its first register.
+///
+/// Shared, so a writer can hold it without holding its workload map shard.
+/// An unregister drops it from the map only once its routes are gone, and a
+/// writer that then finds its record no longer in the map retries with a new
+/// one.
+type WorkloadRecord = Arc<std::sync::Mutex<Option<Vec<IngressRoute>>>>;
+
+/// A value on a cache line pair of its own.
+///
+/// The 128-byte alignment is there to avoid false sharing: two values that
+/// share a cache line contend whenever either is written, even though no
+/// thread touches the other's data. 128 rather than 64 because x86's
+/// adjacent-line prefetcher pulls lines in pairs, and Apple's M-series cores
+/// use 128-byte lines.
+#[repr(align(128))]
+#[derive(Default)]
+struct CacheAligned<T>(T);
+
+/// One shard of [`DynamicRouter`]'s workload map.
+///
+/// Every register and unregister writes its lock word and map, so it is
+/// [`CacheAligned`] to keep neighbouring shards' writers off one line.
+#[derive(Default)]
+struct WorkloadShard(CacheAligned<std::sync::Mutex<HashMap<String, WorkloadRecord>>>);
+
+/// One shard of [`DynamicRouter`]'s hostname table.
+///
+/// A hostname's buckets are held longest-prefix-first so a lookup is an
+/// ordered scan that stops at the first match. One hostname carries few
+/// prefixes in practice, so this stays cheaper than a trie.
+///
+/// Cloning a shard shares its root. Mutations copy tree paths and the edited
+/// hostname's bucket vector; replica sets share their unchanged tree nodes.
+type HostBuckets = imbl::HashMap<Arc<str>, Arc<Vec<PathBucket>>>;
+
+/// One shard of [`DynamicRouter`]'s hostname table, and its writer lock.
+///
+/// Each field is [`CacheAligned`], so the two never share a cache line with
+/// each other or with a neighbouring shard:
+/// - `routes` is what every request for these hostnames loads, so a writer
+///   storing a neighbouring shard must not invalidate its line.
+/// - `writer` has its lock word written by every writer that takes or waits
+///   on it, so a burst of writers to one hostname must not keep taking the
+///   line its requests load.
+#[derive(Default)]
+struct RouteShard {
+    routes: CacheAligned<arc_swap::ArcSwap<HostBuckets>>,
+    /// Held by a writer across its load-copy-store of `routes`, so two writers
+    /// to one shard never copy the same snapshot and lose an edit, and an
+    /// edit of one shard never takes another shard's lock. Requests never
+    /// take it.
+    writer: CacheAligned<std::sync::Mutex<()>>,
+}
+
+/// Bound each snapshot publication to one hostname shard.
+///
+/// An edit copies one persistent-tree path whatever the shard count, so the
+/// shards no longer bound how much a write copies. They keep a writer's store
+/// off the `ArcSwap` and cache lines that requests for other hostnames load,
+/// and keep each shard's tree a level or two shallower. 256 keeps an empty
+/// router small: 64 KiB of 256-byte shards (a 128-byte slot each for the
+/// table and its writer lock), plus one ~48-byte `Arc` per shard for its
+/// empty map (an empty `imbl::HashMap` allocates no root node). The workload
+/// map uses the same count of 128-byte slots and adds 32 KiB (an empty
+/// `HashMap` allocates nothing).
+const ROUTE_SHARDS: usize = 256;
+
+impl Default for DynamicRouter {
+    fn default() -> Self {
+        Self {
+            hosts: Box::new(std::array::from_fn(|_| RouteShard::default())),
+            workload_to_host: Box::new(std::array::from_fn(|_| WorkloadShard::default())),
+        }
+    }
 }
 
 /// Every workload replica serving one `(hostname, path_prefix, scope)` triple.
-/// A `BTreeSet` keeps membership ordered and deterministic; a request picks one
+/// A persistent ordered set keeps membership deterministic; a request picks one
 /// replica at random (see [`DynamicRouter::select_workload`]).
 ///
 /// `scope` is part of the key, not a property of the bucket: the same
@@ -533,7 +609,10 @@ struct Routes {
 struct PathBucket {
     prefix: NormalizedPathPrefix,
     scope: RouteScope,
-    workloads: BTreeSet<String>,
+    /// NOTE: we use imbl here on purpose; rpds's ordered set will heap-allocate
+    /// an iterator stack in every request's replica selection, which would
+    /// hurt performance.
+    workloads: imbl::OrdSet<String>,
 }
 
 /// Most-specific-first: a longer prefix sorts before a shorter one, and the
@@ -577,43 +656,289 @@ impl PartialEq for PathBucket {
 
 impl Eq for PathBucket {}
 
+/// Take one of the writers' locks whether or not a writer panicked holding it:
+/// snapshots already published remain valid. An interrupted multi-shard update
+/// can be partial; poisoning alone must not make unrelated routes unavailable.
+fn lock_routes<G>(result: std::sync::LockResult<G>) -> G {
+    result.unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The shard `key` lives in: a hostname's in [`DynamicRouter`]'s `hosts`, a
+/// workload id's in its `workload_to_host`. FNV-1a rather
+/// than the maps' SipHash: it runs on every request, the shard index needs
+/// spread rather than DoS resistance (a probe cannot change which shard a
+/// registered name lives in), and it folds ASCII case so a request's
+/// mixed-case Host needs no lowercased copy to pick its shard. For workload
+/// ids the folding only puts ids that differ in case in one shard.
+fn shard_index(key: &str) -> usize {
+    let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte.to_ascii_lowercase())).wrapping_mul(0x0100_0000_01b3)
+    });
+    // `usize` is at least 32 bits wide, plenty to pick one of 256 shards.
+    (hash % ROUTE_SHARDS as u64) as usize
+}
+
+/// Slot `index` of one of [`DynamicRouter`]'s per-shard arrays. A
+/// [`shard_index`] is always in range, so the first slot is only a fallback
+/// that keeps the lookup free of a panicking index.
+fn shard_slot<T>(slots: &[T; ROUTE_SHARDS], index: usize) -> &T {
+    let [first, ..] = slots;
+    slots.get(index).unwrap_or(first)
+}
+
+/// A writer holds the lock a test tried to take without waiting.
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+struct WouldBlock;
+
 impl DynamicRouter {
+    fn shard(&self, index: usize) -> &arc_swap::ArcSwap<HostBuckets> {
+        &shard_slot(&self.hosts, index).routes.0
+    }
+
+    /// The writer lock for `hosts` shard `index`.
+    fn route_writer(&self, index: usize) -> &std::sync::Mutex<()> {
+        &shard_slot(&self.hosts, index).writer.0
+    }
+
+    /// The workload map shard that records `workload_id`.
+    fn workload_shard(
+        &self,
+        workload_id: &str,
+    ) -> &std::sync::Mutex<HashMap<String, WorkloadRecord>> {
+        &shard_slot(&self.workload_to_host, shard_index(workload_id))
+            .0
+            .0
+    }
+
+    /// The record the workload map holds for `workload_id`, if any.
+    fn current_record(&self, workload_id: &str) -> Option<WorkloadRecord> {
+        lock_routes(self.workload_shard(workload_id).lock())
+            .get(workload_id)
+            .cloned()
+    }
+
+    /// Whether `record` is still the one the workload map holds for
+    /// `workload_id`. The caller holds `record`; the shard is taken only for
+    /// the lookup, so a record lock is never taken under a shard lock.
+    fn is_current(&self, workload_id: &str, record: &WorkloadRecord) -> bool {
+        self.current_record(workload_id)
+            .is_some_and(|current| Arc::ptr_eq(&current, record))
+    }
+
+    /// Apply `edit` to every route in `routes`, copying each touched shard
+    /// once and publishing it with one store. Each shard is copied and stored
+    /// under its own writer lock, so no other writer can store that shard
+    /// between this load and store, while writers to other shards carry on.
+    /// Only one shard's writer lock is held at a time, and nothing waits while
+    /// holding one, so writers cannot deadlock on these locks. `edit` runs
+    /// under that lock and must not take a workload map shard.
+    fn edit_shards(
+        &self,
+        routes: &[IngressRoute],
+        mut edit: impl FnMut(&mut HostBuckets, &IngressRoute),
+    ) {
+        let mut by_shard: Vec<(usize, &IngressRoute)> =
+            routes.iter().map(|r| (shard_index(&r.host), r)).collect();
+        by_shard.sort_by_key(|(index, _)| *index);
+        for group in by_shard.chunk_by(|(a, _), (b, _)| a == b) {
+            let Some((index, _)) = group.first() else {
+                continue;
+            };
+            let shard = self.shard(*index);
+            let writer = lock_routes(self.route_writer(*index).lock());
+            let mut table = HostBuckets::clone(&shard.load());
+            for (_, route) in group {
+                edit(&mut table, route);
+            }
+            let replaced = shard.swap(Arc::new(table));
+            // Free the replaced snapshot, if this was its last reference, once
+            // the next writer to this shard no longer waits on it.
+            drop(writer);
+            drop(replaced);
+        }
+    }
+
     /// Register `workload_id` under every route in `routes`, updating both the
     /// forward (host -> path buckets -> replicas) and reverse (workload ->
     /// routes) maps so [`Router::on_workload_unbind`] can later remove every
     /// entry cleanly. Idempotent: re-registering the same workload (e.g. a
-    /// service restart) leaves the tables unchanged.
+    /// service restart) with the same routes leaves the tables unchanged. A
+    /// re-register with other routes first drops the workload from every
+    /// route it no longer lists, so none outlives its record.
+    ///
+    /// Holds `workload_id`'s [`WorkloadRecord`] for the whole update, so its
+    /// record and its routes change together (see `workload_to_host`).
     fn register_routes(&self, workload_id: &str, routes: &[IngressRoute]) {
-        self.routes.rcu(|cur| {
-            let mut table = (**cur).clone();
-            table
-                .workload_to_host
-                .insert(workload_id.to_string(), routes.to_vec());
-            for route in routes {
-                let buckets = table
-                    .host_to_workload
-                    .entry(route.host.clone())
-                    .or_default();
-                match buckets
-                    .iter_mut()
-                    .find(|b| b.prefix == route.path_prefix && b.scope == route.scope)
-                {
-                    Some(bucket) => {
-                        bucket.workloads.insert(workload_id.to_string());
-                    }
-                    None => {
-                        buckets.push(PathBucket {
-                            prefix: route.path_prefix.clone(),
-                            scope: route.scope,
-                            workloads: BTreeSet::from([workload_id.to_string()]),
-                        });
-                        // Most specific first — see `PathBucket`'s `Ord`.
-                        buckets.sort();
-                    }
+        self.with_record(workload_id, true, |recorded| {
+            if let Some(previous) = recorded.replace(routes.to_vec()) {
+                let stale: Vec<IngressRoute> = previous
+                    .into_iter()
+                    .filter(|route| !routes.contains(route))
+                    .collect();
+                self.remove_from_routes(workload_id, &stale);
+            }
+            self.add_to_routes(workload_id, routes);
+        });
+    }
+
+    /// Run `update` on `workload_id`'s record while holding it, creating the
+    /// record first when `create` is set. `None`, without running `update`,
+    /// when there is no record and `create` is unset.
+    ///
+    /// Lock order: a record first; while holding it, either its workload map
+    /// shard (briefly) or one hostname shard's writer at a time, never both.
+    /// A workload map shard is never held while waiting on anything else, so
+    /// a writer stuck behind a busy hostname holds up only writers of its own
+    /// workload.
+    fn with_record<R>(
+        &self,
+        workload_id: &str,
+        create: bool,
+        update: impl FnOnce(&mut Option<Vec<IngressRoute>>) -> R,
+    ) -> Option<R> {
+        loop {
+            let record = if create {
+                Arc::clone(
+                    lock_routes(self.workload_shard(workload_id).lock())
+                        .entry(workload_id.to_string())
+                        .or_default(),
+                )
+            } else {
+                self.current_record(workload_id)?
+            };
+            let mut recorded = lock_routes(record.lock());
+            // An unregister may have dropped this record while we waited for
+            // it; then look up (or create) the one that replaced it.
+            if self.is_current(workload_id, &record) {
+                return Some(update(&mut recorded));
+            }
+        }
+    }
+
+    /// Add `workload_id` to the replica set of every route in `routes`.
+    fn add_to_routes(&self, workload_id: &str, routes: &[IngressRoute]) {
+        self.edit_shards(routes, |table, route| {
+            let buckets = Arc::make_mut(table.entry(Arc::from(route.host.as_str())).or_default());
+            match buckets
+                .iter_mut()
+                .find(|b| b.prefix == route.path_prefix && b.scope == route.scope)
+            {
+                Some(bucket) => {
+                    bucket.workloads.insert(workload_id.to_string());
+                }
+                None => {
+                    buckets.push(PathBucket {
+                        prefix: route.path_prefix.clone(),
+                        scope: route.scope,
+                        workloads: imbl::OrdSet::unit(workload_id.to_string()),
+                    });
+                    // Most specific first — see `PathBucket`'s `Ord`.
+                    buckets.sort();
                 }
             }
-            table
         });
+    }
+
+    /// Remove every route `workload_id` registered, dropping emptied buckets
+    /// and hostnames. A no-op for a workload that registered none. Holds
+    /// `workload_id`'s [`WorkloadRecord`] for the whole update, as
+    /// [`Self::register_routes`] does, and drops it from the workload map
+    /// only once its routes are gone.
+    fn unregister_routes(&self, workload_id: &str) {
+        self.with_record(workload_id, false, |recorded| {
+            if let Some(routes) = recorded.take() {
+                self.remove_from_routes(workload_id, &routes);
+            }
+            // Still this record: replacing it takes the record lock we hold.
+            lock_routes(self.workload_shard(workload_id).lock()).remove(workload_id);
+        });
+    }
+
+    /// Remove `workload_id` from the replica set of every route in `routes`,
+    /// dropping emptied buckets and hostnames.
+    fn remove_from_routes(&self, workload_id: &str, routes: &[IngressRoute]) {
+        self.edit_shards(routes, |table, route| {
+            let Some(buckets) = table.get_mut(route.host.as_str()) else {
+                return;
+            };
+            let buckets = Arc::make_mut(buckets);
+            if let Some(bucket) = buckets
+                .iter_mut()
+                .find(|b| b.prefix == route.path_prefix && b.scope == route.scope)
+            {
+                bucket.workloads.remove(workload_id);
+            }
+            // Drop emptied buckets, and the hostname itself once its last
+            // route is gone, so an unbound workload leaves nothing behind for
+            // `select_workload` to walk past.
+            buckets.retain(|b| !b.workloads.is_empty());
+            if buckets.is_empty() {
+                table.remove(route.host.as_str());
+            }
+        });
+    }
+
+    /// The buckets registered under `host`, as a snapshot that outlives later
+    /// writes.
+    #[cfg(test)]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn host_buckets(&self, host: &str) -> Option<Arc<Vec<PathBucket>>> {
+        self.shard(shard_index(host)).load().get(host).cloned()
+    }
+
+    /// Whether no hostname and no workload is registered. Panics on a
+    /// poisoned lock, so a writer that panicked fails the test that asks.
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.hosts
+            .iter()
+            .all(|shard| shard.routes.0.load().is_empty())
+            && self
+                .workload_to_host
+                .iter()
+                .all(|shard| shard.0.0.lock().unwrap().is_empty())
+    }
+
+    /// How many workloads the workload map records. Panics on a poisoned
+    /// lock, as [`Self::is_empty`] does.
+    #[cfg(test)]
+    fn recorded_workloads(&self) -> usize {
+        self.workload_to_host
+            .iter()
+            .map(|shard| shard.0.0.lock().unwrap().len())
+            .sum()
+    }
+
+    /// The routes the workload map records for `workload_id`.
+    #[cfg(test)]
+    fn recorded_routes(&self, workload_id: &str) -> Option<Vec<IngressRoute>> {
+        self.with_record(workload_id, false, |recorded| recorded.clone())
+            .flatten()
+    }
+
+    /// [`Self::recorded_routes`] without waiting: [`WouldBlock`] while a
+    /// writer holds `workload_id`'s record.
+    #[cfg(test)]
+    fn try_recorded_routes(
+        &self,
+        workload_id: &str,
+    ) -> Result<Option<Vec<IngressRoute>>, WouldBlock> {
+        let Some(record) = self.current_record(workload_id) else {
+            return Ok(None);
+        };
+        match record.try_lock() {
+            Ok(recorded) => Ok(recorded.clone()),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner().clone()),
+            Err(std::sync::TryLockError::WouldBlock) => Err(WouldBlock),
+        }
+    }
+
+    /// The writer lock of `host`'s shard alone, as an edit of that shard
+    /// holds it.
+    #[cfg(test)]
+    fn hold_route_writer(&self, host: &str) -> std::sync::MutexGuard<'_, ()> {
+        lock_routes(self.route_writer(shard_index(host)).lock())
     }
 
     /// Resolve `(host, path)` to one workload reachable at `scope`, spreading
@@ -657,11 +982,20 @@ impl DynamicRouter {
         // rather than making callers register every port they might be reached
         // on. Hostnames are also case-insensitive per RFC 1123. Registration
         // normalizes both the same way (see [`IngressRoute::new`]).
-        let host = split_host_port(host).0.to_ascii_lowercase();
-        // Lock-free read of a routing-table snapshot.
-        let routes = self.routes.load();
-        let Some(buckets) = routes.host_to_workload.get(&host) else {
-            return Err(RouteError::NoWorkloadForHost(host));
+        //
+        // Lowercase only when needed: nearly every client sends a lowercase
+        // Host, and the copy would be the lookup's only allocation.
+        let host = split_host_port(host).0;
+        let host: std::borrow::Cow<'_, str> = if host.bytes().any(|b| b.is_ascii_uppercase()) {
+            host.to_ascii_lowercase().into()
+        } else {
+            host.into()
+        };
+        // Keep the ArcSwap guard while matching to avoid an explicit Arc clone
+        // for the common lookup path.
+        let table = self.shard(shard_index(&host)).load();
+        let Some(buckets) = table.get(&*host) else {
+            return Err(RouteError::NoWorkloadForHost(host.into_owned()));
         };
         // Only buckets this caller may see. A hostname serving `localRoute`
         // entries is invisible to the network, and vice versa, so "visible"
@@ -671,7 +1005,7 @@ impl DynamicRouter {
             .filter(|b| b.scope == scope && !b.workloads.is_empty())
             .peekable();
         if visible.peek().is_none() {
-            return Err(RouteError::NoWorkloadForHost(host));
+            return Err(RouteError::NoWorkloadForHost(host.into_owned()));
         }
         // Buckets are sorted longest-prefix-first, so the first match is the
         // most specific one.
@@ -680,7 +1014,7 @@ impl DynamicRouter {
             // do not cover this path — a routing-config mistake worth naming
             // separately from an entirely unserved hostname.
             return Err(RouteError::NoWorkloadForPath {
-                host,
+                host: host.into_owned(),
                 path: path.to_string(),
             });
         };
@@ -692,7 +1026,7 @@ impl DynamicRouter {
             .chain(bucket.workloads.iter().take(start))
             .find(|id| can_serve(id))
             .cloned()
-            .ok_or(RouteError::NoWorkloadForHost(host))
+            .ok_or_else(|| RouteError::NoWorkloadForHost(host.into_owned()))
     }
 }
 
@@ -718,7 +1052,7 @@ impl Router for DynamicRouter {
         let primary_host = http_iface
             .config
             .get("host")
-            .cloned()
+            .map(str::to_string)
             .context("no host header found")?;
 
         anyhow::ensure!(
@@ -763,30 +1097,7 @@ impl Router for DynamicRouter {
     }
 
     async fn on_workload_unbind(&self, workload_id: &str) -> anyhow::Result<()> {
-        self.routes.rcu(|cur| {
-            let mut table = (**cur).clone();
-            if let Some(routes) = table.workload_to_host.remove(workload_id) {
-                for route in &routes {
-                    let Some(buckets) = table.host_to_workload.get_mut(&route.host) else {
-                        continue;
-                    };
-                    if let Some(bucket) = buckets
-                        .iter_mut()
-                        .find(|b| b.prefix == route.path_prefix && b.scope == route.scope)
-                    {
-                        bucket.workloads.remove(workload_id);
-                    }
-                    // Drop emptied buckets, and the hostname itself once its
-                    // last route is gone, so an unbound workload leaves nothing
-                    // behind for `select_workload` to walk past.
-                    buckets.retain(|b| !b.workloads.is_empty());
-                    if buckets.is_empty() {
-                        table.host_to_workload.remove(&route.host);
-                    }
-                }
-            }
-            table
-        });
+        self.unregister_routes(workload_id);
         Ok(())
     }
 
@@ -813,9 +1124,9 @@ impl Router for DynamicRouter {
             .and_then(|h| h.to_str().ok())
             .or_else(|| req.uri().authority().map(|a| a.as_str()))
             .ok_or(RouteError::MissingHost)?;
-        // `select_workload` does a lock-free `ArcSwap` load and an in-memory
-        // lookup, so it runs inline on the async worker — no `block_in_place`
-        // needed (and routing works on any runtime flavor).
+        // `select_workload` takes no lock and never awaits, so it runs inline
+        // on the async worker — no `block_in_place` needed (and routing works
+        // on any runtime flavor).
         self.select_workload(workload_host, req.uri().path(), RouteScope::Ingress)
     }
 
@@ -878,9 +1189,8 @@ pub type SendFuture = Box<dyn std::future::Future<Output = SendResult> + Send>;
 /// identifier of the workload instance making the request — never empty, never
 /// derived from guest-controllable data, and never shared between workloads.
 /// Implementations (the default one included) key per-workload state on it:
-/// connection pools, TLS session-resumption stores, and connection quotas. Two
-/// callers presenting the same `workload_id` collapse into one identity and
-/// inherit each other's keep-alive connections and TLS session tickets.
+/// connection pools and connection quotas. Callers sharing a `workload_id`
+/// inherit each other's keep-alive connections.
 pub trait OutgoingHandler: Send + Sync + 'static {
     /// Send an outgoing HTTP request for the given `workload_id`, from a
     /// `wasi:http` 0.2 or 0.3 guest.
@@ -1228,7 +1538,9 @@ pub trait HostHandler: Send + Sync + 'static {
     ) -> anyhow::Result<()>;
     /// Unregister a workload. Called once for every workload that stops,
     /// including one that never registered here, so an unknown id is not an
-    /// error.
+    /// error. A start that fails or is cancelled calls it too, without knowing
+    /// how far registration got, and holds the workload's id until it succeeds:
+    /// an error here is retried rather than skipped.
     async fn on_workload_unbind(&self, workload_id: &str) -> anyhow::Result<()>;
 
     /// Register a long-lived service instance that serves HTTP ingress: inbound
@@ -1245,7 +1557,9 @@ pub trait HostHandler: Send + Sync + 'static {
     ) -> anyhow::Result<()> {
         Ok(())
     }
-    /// Unregister a service HTTP instance. Default: no-op.
+    /// Unregister a service HTTP instance. As with
+    /// [`HostHandler::on_workload_unbind`], an unknown id is not an error.
+    /// Default: no-op.
     async fn on_service_http_unbind(&self, _workload_id: &str) -> anyhow::Result<()> {
         Ok(())
     }
@@ -1260,7 +1574,9 @@ pub trait HostHandler: Send + Sync + 'static {
     ) -> anyhow::Result<()> {
         Ok(())
     }
-    /// Unregister a trigger service messaging instance. Default: no-op.
+    /// Unregister a trigger service messaging instance. As with
+    /// [`HostHandler::on_workload_unbind`], an unknown id is not an error.
+    /// Default: no-op.
     async fn on_trigger_service_messaging_unbind(&self, _workload_id: &str) -> anyhow::Result<()> {
         Ok(())
     }
@@ -1347,6 +1663,33 @@ impl HostHandler for NullServer {
     }
 }
 
+/// How the response's consumer recognizes completion.
+#[derive(Clone, Copy, Default)]
+pub(crate) enum ResponseBodyCompletion {
+    #[default]
+    Stream,
+    Http1,
+}
+
+impl ResponseBodyCompletion {
+    fn for_network(version: hyper::Version) -> Self {
+        match version {
+            hyper::Version::HTTP_09 | hyper::Version::HTTP_10 | hyper::Version::HTTP_11 => {
+                Self::Http1
+            }
+            _ => Self::Stream,
+        }
+    }
+
+    pub(crate) fn for_request<B>(req: &hyper::Request<B>) -> Self {
+        req.extensions().get::<Self>().copied().unwrap_or_default()
+    }
+
+    pub(crate) fn is_complete<B: hyper::body::Body>(self, body: &B) -> bool {
+        body.is_end_stream() || matches!(self, Self::Http1) && body.size_hint().exact() == Some(0)
+    }
+}
+
 /// An HTTP response body that keeps its dispatched call condemned-on-drop while
 /// it streams: dropped mid-stream (the client disconnected), the wrapped
 /// [`AbandonOnDrop`] abandons the call; ended cleanly, it disarms. Extends the
@@ -1355,6 +1698,7 @@ impl HostHandler for NullServer {
 /// reachable.
 struct WatchedBody<B> {
     inner: B,
+    completion: ResponseBodyCompletion,
     /// `None` once end-of-stream disarmed it.
     watch: Option<AbandonOnDrop>,
 }
@@ -1369,14 +1713,14 @@ impl<B: hyper::body::Body + Unpin> hyper::body::Body for WatchedBody<B> {
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
         let poll = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
-        // Clean end of stream: the response was delivered whole, so nothing is
-        // abandoned. An *error* frame deliberately does not disarm — the
-        // exchange broke off, and if the guest is wedged behind it, the armed
-        // flag is what ends it (a completed call deregisters, so arming a
-        // healthy one is harmless).
-        // `is_end_stream` too, since hyper stops polling once a declared
-        // `content-length` is written and never delivers that final `None`.
-        let ended = matches!(poll, std::task::Poll::Ready(None)) || this.inner.is_end_stream();
+        // Errors keep abandonment armed on drop. Only HTTP/1 can finish
+        // at its declared length while trailers are still pending.
+        let ended = match &poll {
+            std::task::Poll::Ready(None) => true,
+            std::task::Poll::Ready(Some(Err(_))) => false,
+            std::task::Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => true,
+            _ => this.completion.is_complete(&this.inner),
+        };
         if ended && let Some(watch) = this.watch.take() {
             watch.disarm();
         }
@@ -1401,35 +1745,49 @@ impl<B: hyper::body::Body + Unpin> hyper::body::Body for WatchedBody<B> {
 /// An already-complete body is left unwrapped and disarmed: hyper never polls
 /// one, so a wrapper would be dropped un-disarmed and arm the flag on a
 /// response that was delivered whole.
-fn watch_body(resp: hyper::Response<WasiBody>, watch: AbandonOnDrop) -> hyper::Response<WasiBody> {
-    if hyper::body::Body::is_end_stream(resp.body()) {
+fn watch_body(
+    resp: hyper::Response<WasiBody>,
+    watch: AbandonOnDrop,
+    completion: ResponseBodyCompletion,
+) -> hyper::Response<WasiBody> {
+    if completion.is_complete(resp.body()) {
         watch.disarm();
         return resp;
     }
     resp.map(|inner| {
         WatchedBody {
             inner,
+            completion,
             watch: Some(watch),
         }
         .boxed_unsync()
     })
 }
 
-/// A map from host header to resolved workload handles, their associated
-/// component id, and the identity that component's calls are measured under.
-pub type WorkloadHandles = Arc<
-    RwLock<
-        HashMap<
-            String,
-            (
-                ResolvedWorkload,
-                InstancePre<SharedCtx>,
-                String,
-                crate::observability::WorkloadIdentity,
-            ),
-        >,
-    >,
->;
+/// A map from workload id to the component serving its HTTP requests. A sync
+/// lock: no critical section awaits, and every request takes it. Poison is
+/// ignored: every write is a single step.
+// NOTE: a std lock, formerly a tokio one. Never hold its guard across an
+// `.await`: drop it first, or the worker thread blocks under contention.
+pub(crate) type WorkloadHandles = Arc<std::sync::RwLock<HashMap<String, Arc<ComponentHandle>>>>;
+
+/// What serving a request on a workload's HTTP component needs, settled when
+/// the component is bound so a request only reads it: the pre-linked
+/// component, the identity its calls are measured under, which `wasi:http`
+/// it speaks and the warm set it runs on. Behind an `Arc` in
+/// [`WorkloadHandles`], so a request takes it with one reference count.
+pub struct ComponentHandle {
+    workload: ResolvedWorkload,
+    instance_pre: InstancePre<SharedCtx>,
+    component_id: String,
+    identity: crate::observability::WorkloadIdentity,
+    /// Whether the component targets `wasi:http@0.3`, which walks its imports
+    /// and exports to answer.
+    targets_p3: bool,
+    /// The warm set its calls run on, if it keeps one. See
+    /// [`crate::engine::instance_pool::poolable`].
+    pool: Option<Arc<crate::engine::instance_pool::InstancePool>>,
+}
 
 /// An inbound HTTP request routed to a long-lived service instance, paired with
 /// a oneshot for its response and the abandonment flag of the [`DispatchedCall`]
@@ -1561,7 +1919,10 @@ pub struct Ingress<T: Router, O: OutgoingHandler = DefaultOutgoingHandler> {
     /// Workloads whose long-lived trigger service serves messaging ingress directly.
     messaging_handlers: MessagingHandlers,
     shutdown_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
-    shutdown_result: Arc<std::sync::Mutex<Option<Result<(), String>>>>,
+    /// Set by [`HostHandler::stop`]: every connection finishes the request it
+    /// is serving and then closes, so the drain ends rather than waiting on
+    /// idle keep alive connections.
+    connection_shutdown: Arc<tokio::sync::watch::Sender<bool>>,
     tls_acceptor: Option<TlsAcceptor>,
     listener: Arc<tokio::sync::Mutex<Option<TcpListener>>>,
     /// Ceiling on the TCP connections this ingress holds at once, and the
@@ -1768,7 +2129,7 @@ impl<T: Router, O: OutgoingHandler> IngressBuilder<T, O> {
             service_handlers: Arc::default(),
             messaging_handlers: Arc::default(),
             shutdown_tx: Arc::new(RwLock::new(None)),
-            shutdown_result: Arc::new(std::sync::Mutex::new(None)),
+            connection_shutdown: Arc::new(tokio::sync::watch::Sender::new(false)),
             tls_acceptor,
             listener: Arc::new(tokio::sync::Mutex::new(Some(listener))),
             connections: ConnectionLimit::new(max_connections),
@@ -1803,6 +2164,23 @@ impl<T: Router> Ingress<T, DefaultOutgoingHandler> {
 }
 
 impl<T: Router, O: OutgoingHandler> Ingress<T, O> {
+    /// Empty the routing tables, so a stopped host that is still held lets go
+    /// of the workloads it routed. Called once the drain has ended, because
+    /// connections already established are served from their own handles on
+    /// these tables.
+    async fn release_routes(&self) {
+        // Dropped after the lock is released.
+        let cleared = std::mem::take(
+            &mut *self
+                .workload_handles
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        drop(cleared);
+        self.service_handlers.write().await.clear();
+        self.messaging_handlers.write().await.clear();
+    }
+
     /// How many workloads this ingress can currently route an inbound message
     /// or request to. Zero once [`HostHandler::stop`] has drained, and what an
     /// embedder without a probe listener can report about routing state.
@@ -1812,7 +2190,12 @@ impl<T: Router, O: OutgoingHandler> Ingress<T, O> {
     /// [`HostHandler::on_service_http_resolved`] and never appears among the
     /// component handles.
     pub async fn routed_workloads(&self) -> usize {
-        self.workload_handles.read().await.len()
+        let handles = self
+            .workload_handles
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        handles
             + self.service_handlers.read().await.len()
             + self.messaging_handlers.read().await.len()
     }
@@ -1911,10 +2294,10 @@ impl<T: Router, O: OutgoingHandler> Ingress<T, O> {
     /// existed; a handle still present under a withdrawn route is simply never
     /// reached from here.
     ///
-    /// `try_read`, not `read`: this runs on the sync egress path. The maps are
-    /// written only on workload start/stop, so contention is rare; treating it
-    /// as "not resolvable" costs one request the short-circuit and never
-    /// correctness.
+    /// `try_read`, not `read`: this runs on the sync egress path, where waiting
+    /// out a burst of binds would park the calling thread. The maps are written
+    /// only on workload start/stop, so contention is rare; treating it as "not
+    /// resolvable" costs one request the short-circuit and never correctness.
     fn resolve_local_target(&self, target: &str) -> Option<LocalTarget> {
         if let Ok(handlers) = self.service_handlers.try_read()
             && let Some(sender) = handlers.get(target)
@@ -1923,11 +2306,12 @@ impl<T: Router, O: OutgoingHandler> Ingress<T, O> {
             // and then fail the send; skip it while the body can still egress.
             return (!sender.is_closed()).then(|| LocalTarget::Service(sender.clone()));
         }
-        let handles = self.workload_handles.try_read().ok()?;
-        handles
-            .get(target)
-            .cloned()
-            .map(|handle| LocalTarget::Component(Box::new(handle)))
+        let handles = match self.workload_handles.try_read() {
+            Ok(handles) => handles,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        handles.get(target).cloned().map(LocalTarget::Component)
     }
 
     /// The co-located workload to serve `uri` in-memory and where to dispatch
@@ -2023,9 +2407,10 @@ impl<T: Router, O: OutgoingHandler> Ingress<T, O> {
     }
 }
 
-/// Derive the h2 (ALPN) variant of a client TLS configuration for gRPC egress.
+/// Derive the h2 (ALPN) variant of a client TLS configuration for gRPC egress,
+/// without session resumption so new connections consult the current identity.
 fn h2_client_config(base: &rustls::ClientConfig) -> Arc<rustls::ClientConfig> {
-    let mut config = base.clone();
+    let mut config = crate::host::http_client::without_resumption(base);
     config.alpn_protocols = vec![b"h2".to_vec()];
     Arc::new(config)
 }
@@ -2305,16 +2690,8 @@ enum LocalTarget {
     /// the instance it already keeps warm.
     Service(tokio::sync::mpsc::Sender<ServiceHttpJob>),
     /// The workload's registered component handle, from which a per-request
-    /// instance is built. Boxed because it is much the larger of the two and
-    /// this enum is moved into the dispatch future.
-    Component(
-        Box<(
-            ResolvedWorkload,
-            InstancePre<SharedCtx>,
-            String,
-            crate::observability::WorkloadIdentity,
-        )>,
-    ),
+    /// instance is built.
+    Component(Arc<ComponentHandle>),
 }
 
 /// Dispatch a locally routed request to `workload_id` through the destination
@@ -2325,6 +2702,9 @@ async fn dispatch_local(
     target: LocalTarget,
     guest_meter: GuestMeter,
 ) -> anyhow::Result<hyper::Response<WasiBody>> {
+    request
+        .extensions_mut()
+        .insert(ResponseBodyCompletion::Stream);
     // Mirror the wire: a network send would carry the request authority as its
     // `Host` header, and handlers routinely read it.
     if !request.headers().contains_key(hyper::header::HOST)
@@ -2334,7 +2714,7 @@ async fn dispatch_local(
         request.headers_mut().insert(hyper::header::HOST, value);
     }
 
-    let (handle, instance_pre, component_id, identity) = match target {
+    let handle = match target {
         LocalTarget::Service(sender) => {
             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
             // The deadline is enforced out here, outside the service's store,
@@ -2357,32 +2737,25 @@ async fn dispatch_local(
                 anyhow::bail!("service HTTP instance for workload {workload_id} is not running");
             }
             return match call.await_head(resp_rx).await {
-                Some((Ok(resp), watch)) => resp.map(|resp| watch_body(resp, watch)),
+                Some((Ok(resp), watch)) => {
+                    resp.map(|resp| watch_body(resp, watch, ResponseBodyCompletion::Stream))
+                }
                 Some((Err(_), _)) => {
                     anyhow::bail!("service HTTP instance dropped the response")
                 }
                 None => anyhow::bail!("service HTTP instance produced no response"),
             };
         }
-        LocalTarget::Component(handle) => *handle,
+        LocalTarget::Component(handle) => handle,
     };
-    let req_span = tracing::span!(
-        tracing::Level::INFO,
-        "invoke_component_handler",
-        workload.name = handle.name(),
-        workload.namespace = handle.namespace(),
-        workload.id = handle.id(),
+    let req_span = component_handler_span(
+        handle.workload.name(),
+        handle.workload.namespace(),
+        handle.workload.id(),
     );
-    invoke_component_handler(
-        handle,
-        instance_pre,
-        &component_id,
-        request,
-        guest_meter,
-        &identity,
-    )
-    .instrument(req_span)
-    .await
+    invoke_component_handler(&handle, request, guest_meter)
+        .instrument(req_span)
+        .await
 }
 
 #[async_trait::async_trait]
@@ -2420,9 +2793,9 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
         let guest_meter = self.meters.read().await.guest();
         let connections = self.connections.clone();
         let stopped = AcceptingGuard(connections.clone());
-        let shutdown_result = self.shutdown_result.clone();
+        let connection_shutdown = Arc::clone(&self.connection_shutdown);
         tokio::spawn(async move {
-            let result = run_http_server(
+            if let Err(e) = run_http_server(
                 listener,
                 handler,
                 workload_handles,
@@ -2431,43 +2804,46 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
                 tls_acceptor,
                 guest_meter,
                 connections,
+                connection_shutdown,
             )
-            .await;
-            if let Err(error) = &result {
-                error!(%error, ?addr, "HTTP server error");
+            .await
+            {
+                error!(err = ?e, addr = ?addr, "HTTP server error");
             }
-            *shutdown_result
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) =
-                Some(result.map_err(|error| error.to_string()));
             drop(stopped);
         });
         Ok(())
     }
 
-    /// Drain owned connections before releasing the workload routing tables.
+    /// Ends the accept loop, lets every established connection finish the
+    /// request it is serving and close, and releases the routing tables once
+    /// they have. Returns only after the drain, so a caller that awaited it
+    /// knows the listener and the routed workloads are let go.
+    ///
+    /// # Errors
+    ///
+    /// When connections are still open at the end of
+    /// [`crate::timeouts::ingress_drain`]. The routes are released anyway.
     async fn stop(&self) -> anyhow::Result<()> {
-        if self.listener.lock().await.is_some() {
+        info!(addr = ?self.addr, "HTTP server stopping");
+        // An ingress that never started, or already stopped, has no drain to
+        // wait on, and waiting would be forever: nothing will mark an accept
+        // loop stopped that never ran.
+        let Some(tx) = self.shutdown_tx.write().await.take() else {
             return Ok(());
-        }
-        if let Some(tx) = self.shutdown_tx.write().await.take() {
-            let _ = tx.send(()).await;
-        }
-        tokio::time::timeout(
-            crate::timeouts::ingress_drain() + Duration::from_secs(1),
-            self.connections.stopped(),
-        )
-        .await
-        .context("timed out stopping HTTP ingress")?;
-        self.workload_handles.write().await.clear();
-        self.service_handlers.write().await.clear();
-        self.messaging_handlers.write().await.clear();
-        self.shutdown_result
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone()
-            .unwrap_or_else(|| Err("HTTP ingress task terminated without a result".into()))
-            .map_err(anyhow::Error::msg)
+        };
+        let _ = tx.send(()).await;
+        self.connection_shutdown.send_replace(true);
+        let budget = crate::timeouts::ingress_drain();
+        let drained = tokio::time::timeout(budget, self.connections.drained()).await;
+        self.release_routes().await;
+        drained.map_err(|_| {
+            anyhow::anyhow!(
+                "HTTP ingress on {} still had connections after its {}s drain",
+                self.addr,
+                budget.as_secs()
+            )
+        })
     }
 
     async fn stopped(&self) {
@@ -2500,19 +2876,53 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
         // Only components that export wasi:http are routable HTTP entrypoints.
         // Anything else stays unregistered and routes to a 404.
         if crate::engine::exports_wasi_http(instance_pre.component()) {
-            // Resolved before the write lock is taken: it awaits a read of the
+            // Resolved before the write lock is taken: they await a read of the
             // component map, and holding the handles' writer across that stalls
             // every inbound request, which reads the same lock to route.
             let identity = resolved_handle.component_identity(component_id).await;
-            self.workload_handles.write().await.insert(
-                resolved_handle.id().to_string(),
-                (
-                    resolved_handle.clone(),
-                    instance_pre,
-                    component_id.to_string(),
-                    identity,
-                ),
-            );
+            let pool = resolved_handle
+                .instance_pool_for_component(component_id)
+                .await;
+            let targets_p3 = crate::engine::targets_wasip3_http(instance_pre.component());
+            // A wasip2 incoming-handler instance serves one request, so HTTP
+            // never reuses one; asking for a pool there would otherwise look
+            // like it worked while every request still paid for a cold store.
+            // Rate-limited at `warn` across workloads, and logged at `debug`
+            // when suppressed, so every workload that does this is named.
+            if pool.is_some() && !targets_p3 {
+                match P2_POOL_WARN.admit() {
+                    Some(suppressed) => warn!(
+                        workload_id = resolved_handle.id(),
+                        component_id,
+                        suppressed,
+                        "poolSize is set on a wasip2 HTTP handler, which serves one request per \
+                         instance: HTTP requests to it are not pooled. Build it for wasip3 to \
+                         keep instances warm"
+                    ),
+                    None => debug!(
+                        workload_id = resolved_handle.id(),
+                        component_id,
+                        "poolSize is set on a wasip2 HTTP handler, which serves one request per \
+                         instance: HTTP requests to it are not pooled (warning rate-limited)"
+                    ),
+                }
+            }
+            let handle = ComponentHandle {
+                workload: resolved_handle.clone(),
+                targets_p3,
+                instance_pre,
+                component_id: component_id.to_string(),
+                identity,
+                pool,
+            };
+            let (key, handle) = (resolved_handle.id().to_string(), Arc::new(handle));
+            // Bound, so a replaced handle drops after the lock is released.
+            let replaced = self
+                .workload_handles
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key, handle);
+            drop(replaced);
         }
 
         Ok(())
@@ -2523,12 +2933,16 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
         // its state alive too.
         let routed = self.router.on_workload_unbind(workload_id).await;
 
-        self.workload_handles.write().await.remove(workload_id);
+        // Bound, so the handle drops after the lock is released.
+        let removed = self
+            .workload_handles
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(workload_id);
+        drop(removed);
         self.service_handlers.write().await.remove(workload_id);
         self.messaging_handlers.write().await.remove(workload_id);
-        // Drop the stopped workload's egress state (pooled connections, TLS
-        // session store, pinned connection permits) instead of letting it
-        // linger until idle expiry.
+        // Release pooled connections and their permits when the workload stops.
         self.outgoing_handler.on_workload_unbind(workload_id);
 
         routed
@@ -2915,6 +3329,27 @@ fn prepare_accepted_conn(stream: &TcpStream) {
     }
 }
 
+/// Serves a connection until it ends, or until the ingress stops: it then
+/// finishes the request in flight and closes, which is what lets
+/// [`ConnectionLimit::drained`] resolve instead of waiting on idle keep alive
+/// connections. A macro because plain and TLS connections are different types
+/// behind the same hyper bounds.
+macro_rules! serve_until_stopped {
+    ($connection:expr, $stopping:expr) => {{
+        let connection = $connection;
+        tokio::pin!(connection);
+        let mut stopping = $stopping;
+        tokio::select! {
+            result = &mut connection => result,
+            // The guard `wait_for` returns is not `Send`; drop it here.
+            () = async { let _ = stopping.wait_for(|stopping| *stopping).await; } => {
+                connection.as_mut().graceful_shutdown();
+                connection.await
+            }
+        }
+    }};
+}
+
 /// HTTP server implementation that routes to workload components
 #[allow(clippy::too_many_arguments)]
 async fn run_http_server<T: Router>(
@@ -2926,9 +3361,8 @@ async fn run_http_server<T: Router>(
     tls_acceptor: Option<TlsAcceptor>,
     guest_meter: GuestMeter,
     connections: ConnectionLimit,
+    connection_shutdown: Arc<tokio::sync::watch::Sender<bool>>,
 ) -> anyhow::Result<()> {
-    let mut active_connections = tokio::task::JoinSet::new();
-    let (connection_shutdown_tx, _) = tokio::sync::watch::channel(false);
     let mut backoff = crate::host::accept::AcceptBackoff::default();
     let mut shed = 0u64;
     let mut shed_reported: Option<std::time::Instant> = None;
@@ -2937,9 +3371,6 @@ async fn run_http_server<T: Router>(
         // shutdown branch instead of needing a second copy of it.
         let pause = backoff.pause();
         tokio::select! {
-            Some(result) = active_connections.join_next(), if !active_connections.is_empty() => {
-                if let Err(error) = result { warn!(%error, "HTTP connection task failed"); }
-            }
             // Handle shutdown signal
             _ = shutdown_rx.recv() => {
                 info!("HTTP server received shutdown signal");
@@ -2989,8 +3420,8 @@ async fn run_http_server<T: Router>(
                         } else {
                             hyper::http::uri::Scheme::HTTP
                         };
-                        let mut connection_shutdown = connection_shutdown_tx.subscribe();
-                        active_connections.spawn(async move {
+                        let stopping = connection_shutdown.subscribe();
+                        tokio::spawn(async move {
                             // Held for the connection's life: its descriptor is
                             // only given back once hyper is done with it.
                             let _slot = slot;
@@ -3008,7 +3439,12 @@ async fn run_http_server<T: Router>(
                                     let remote_context =
                                         opentelemetry::global::get_text_map_propagator(|propagator| propagator.extract(&extractor));
 
-                                    handle_http_request(handler, req, scheme, handles, service_handlers, guest_meter).with_context(remote_context).await
+                                    // Defer `#[instrument]` until the propagated parent is active.
+                                    async move {
+                                        handle_http_request(handler, req, scheme, handles, service_handlers, guest_meter).await
+                                    }
+                                    .with_context(remote_context)
+                                    .await
                                 }
                             });
 
@@ -3041,17 +3477,10 @@ async fn run_http_server<T: Router>(
                                         Ok(())
                                     }
                                     Ok(Ok(tls_stream)) => {
-                                        {
-                                            let connection = builder.serve_connection_with_upgrades(TokioIo::new(tls_stream), service);
-                                            tokio::pin!(connection);
-                                            tokio::select! {
-                                                result = &mut connection => result,
-                                                _ = async { let _ = connection_shutdown.wait_for(|stopping| *stopping).await; } => {
-                                                    connection.as_mut().graceful_shutdown();
-                                                    connection.await
-                                                }
-                                            }
-                                        }
+                                        serve_until_stopped!(
+                                            builder.serve_connection_with_upgrades(TokioIo::new(tls_stream), service),
+                                            stopping
+                                        )
                                     }
                                     Ok(Err(e)) => {
                                         error!(addr = ?client_addr, err = ?e, "TLS handshake failed");
@@ -3060,17 +3489,10 @@ async fn run_http_server<T: Router>(
                                 }
                             } else {
                                 // Handle HTTP/h2c connection
-                                {
-                                            let connection = builder.serve_connection_with_upgrades(TokioIo::new(client), service);
-                                            tokio::pin!(connection);
-                                            tokio::select! {
-                                                result = &mut connection => result,
-                                                _ = async { let _ = connection_shutdown.wait_for(|stopping| *stopping).await; } => {
-                                                    connection.as_mut().graceful_shutdown();
-                                                    connection.await
-                                                }
-                                            }
-                                        }
+                                serve_until_stopped!(
+                                    builder.serve_connection_with_upgrades(TokioIo::new(client), service),
+                                    stopping
+                                )
                             }
                             };
 
@@ -3135,17 +3557,6 @@ async fn run_http_server<T: Router>(
         }
     }
 
-    drop(listener);
-    connection_shutdown_tx.send_replace(true);
-    let drained = tokio::time::timeout(crate::timeouts::ingress_drain(), async {
-        while active_connections.join_next().await.is_some() {}
-    })
-    .await;
-    if drained.is_err() {
-        active_connections.abort_all();
-        while active_connections.join_next().await.is_some() {}
-        anyhow::bail!("timed out draining HTTP connections");
-    }
     Ok(())
 }
 
@@ -3159,6 +3570,15 @@ fn ended_in_timeout(e: &(dyn std::error::Error + 'static)) -> bool {
     }
     e.source().is_some_and(ended_in_timeout)
 }
+
+/// How often each per-request ingress warning may be logged.
+const INGRESS_WARN_INTERVAL: Duration = Duration::from_secs(10);
+static INVALID_AUTHORITY_WARN: RateLimitedWarn = RateLimitedWarn::new(INGRESS_WARN_INTERVAL);
+static ROUTE_FAILURE_WARN: RateLimitedWarn = RateLimitedWarn::new(INGRESS_WARN_INTERVAL);
+/// `poolSize` on a wasip2 HTTP handler at `warn`, once per interval however
+/// many bind; the rest are logged at `debug`.
+static P2_POOL_WARN: RateLimitedWarn = RateLimitedWarn::new(INGRESS_WARN_INTERVAL);
+static UNBOUND_HOST_WARN: RateLimitedWarn = RateLimitedWarn::new(INGRESS_WARN_INTERVAL);
 
 /// Build an error response with the given status code.
 /// Building HTTP responses with valid status codes is infallible.
@@ -3182,6 +3602,11 @@ fn error_response(status: u16) -> hyper::Response<WasiBody> {
 ///   collectors can break down requests by 2xx/4xx/5xx.
 /// - `otel.status_code` is set to `ERROR` for 5xx; 4xx stays UNSET per semconv.
 #[instrument(skip_all, fields(
+    // There are no path-based route templates, so the OTel HTTP server span
+    // name falls back to the request method. Keep the static tracing name for
+    // human-readable runtime logs while overriding the exported span name.
+    otel.name = %req.method(),
+    otel.kind = "server",
     // Legacy (pre-semconv) attribute names retained so dashboards built against
     // them keep resolving.
     http.method = %req.method(),
@@ -3207,10 +3632,22 @@ async fn handle_http_request<T: Router>(
     service_handlers: ServiceHandlers,
     guest_meter: GuestMeter,
 ) -> Result<hyper::Response<WasiBody>, hyper::Error> {
+    let completion = ResponseBodyCompletion::for_network(req.version());
+    req.extensions_mut().insert(completion);
     // Every guest reads its scheme and authority off the URI, so they are put
     // there once, here, from this listener rather than from any header.
     if !normalize_ingress_uri(&mut req, &scheme) {
-        warn!(host = %host_header(&req), "rejecting a request whose Host is not a valid authority");
+        let host = host_header(&req);
+        match INVALID_AUTHORITY_WARN.admit() {
+            Some(suppressed) => warn!(
+                host,
+                suppressed, "rejecting a request whose Host is not a valid authority"
+            ),
+            None => debug!(
+                host,
+                "rejecting a request whose Host is not a valid authority"
+            ),
+        }
         let resp = error_response(400);
         record_response_status(&resp);
         return Ok(resp);
@@ -3227,7 +3664,12 @@ async fn handle_http_request<T: Router>(
     let workload_id = match handler.route_incoming_request(&req) {
         Ok(id) => id,
         Err(e) => {
-            warn!(err = %e, "failed to route incoming request");
+            match ROUTE_FAILURE_WARN.admit() {
+                Some(suppressed) => {
+                    warn!(err = %e, suppressed, "failed to route incoming request")
+                }
+                None => debug!(err = %e, "failed to route incoming request"),
+            }
             let resp = error_response(e.status());
             record_response_status(&resp);
             return Ok(resp);
@@ -3266,7 +3708,7 @@ async fn handle_http_request<T: Router>(
             error_response(503)
         } else {
             match call.await_head(resp_rx).await {
-                Some((Ok(Ok(resp)), watch)) => watch_body(resp, watch),
+                Some((Ok(Ok(resp)), watch)) => watch_body(resp, watch, completion),
                 Some((Ok(Err(e)), _)) => {
                     error!(err = ?e, "service HTTP handler failed");
                     error_response(500)
@@ -3288,31 +3730,23 @@ async fn handle_http_request<T: Router>(
     // NOTE(lxf): Separate HTTP / GRPC handling
 
     // Look up workload handle for this host, with wildcard fallback
-    let workload_handle = {
-        let handles = workload_handles.read().await;
-        debug!(host = %workload_id, "looking up workload handle for host header");
-        handles.get(&workload_id).cloned()
-    };
+    debug!(host = %workload_id, "looking up workload handle for host header");
+    let workload_handle = workload_handles
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&workload_id)
+        .cloned();
 
     let response = match workload_handle {
-        Some((handle, instance_pre, component_id, identity)) => {
-            let req_span = tracing::span!(
-                tracing::Level::INFO,
-                "invoke_component_handler",
-                workload.name = handle.name(),
-                workload.namespace = handle.namespace(),
-                workload.id = handle.id(),
+        Some(handle) => {
+            let req_span = component_handler_span(
+                handle.workload.name(),
+                handle.workload.namespace(),
+                handle.workload.id(),
             );
-            match invoke_component_handler(
-                handle,
-                instance_pre,
-                &component_id,
-                req,
-                guest_meter,
-                &identity,
-            )
-            .instrument(req_span)
-            .await
+            match invoke_component_handler(&handle, req, guest_meter)
+                .instrument(req_span)
+                .await
             {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -3322,7 +3756,17 @@ async fn handle_http_request<T: Router>(
             }
         }
         None => {
-            warn!(host = %workload_id, "No workload bound to host header or wildcard '*'");
+            match UNBOUND_HOST_WARN.admit() {
+                Some(suppressed) => warn!(
+                    host = %workload_id,
+                    suppressed,
+                    "No workload bound to host header or wildcard '*'"
+                ),
+                None => debug!(
+                    host = %workload_id,
+                    "No workload bound to host header or wildcard '*'"
+                ),
+            }
             error_response(404)
         }
     };
@@ -3336,6 +3780,25 @@ async fn handle_http_request<T: Router>(
     let response =
         response.map(|body| MeteredBody::new(body, tracing::Span::current()).boxed_unsync());
     Ok(response)
+}
+
+/// The internal span around one component invocation. It keeps its tracing
+/// name as the exported name so it can be queried apart from the server and
+/// client spans, which semconv names by HTTP method. One host serves many
+/// workloads, so `faas.name` is a span attribute rather than a resource one.
+fn component_handler_span(
+    workload_name: &str,
+    workload_namespace: &str,
+    workload_id: &str,
+) -> tracing::Span {
+    tracing::info_span!(
+        "invoke_component_handler",
+        workload.name = workload_name,
+        workload.namespace = workload_namespace,
+        workload.id = workload_id,
+        { FAAS_NAME } = workload_name,
+        { FAAS_TRIGGER } = "http",
+    )
 }
 
 /// Record the response's status on the current span as the OTel HTTP semconv
@@ -3361,6 +3824,7 @@ fn record_response_status<B>(response: &hyper::Response<B>) {
 fn outbound_client_span<B>(request: &mut hyper::Request<B>) -> tracing::Span {
     let span = tracing::info_span!(
         "outbound_http_request",
+        otel.name = %request.method(),
         otel.kind = "client",
         otel.propagation.error = tracing::field::Empty,
         exception.slug = tracing::field::Empty,
@@ -3427,37 +3891,45 @@ fn record_outbound_error() {
     tracing::Span::current().record(OTEL_STATUS_CODE, "ERROR");
 }
 
-/// Record gRPC response status from headers. Streaming trailers are not read here.
+/// Record the gRPC status as `rpc.response.status_code` on the current span when
+/// the response carries a `grpc-status` header. gRPC errors are typically
+/// trailers-only responses that put the status in headers, so this captures
+/// them; a status delivered in actual trailers (the streaming-success case) is
+/// not read here.
 fn record_grpc_status(headers: &hyper::HeaderMap) {
     if let Some(code) = headers
         .get("grpc-status")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<i64>().ok())
     {
-        tracing::Span::current().record(
-            RPC_RESPONSE_STATUS_CODE,
-            match code {
-                0 => "OK",
-                1 => "CANCELLED",
-                2 => "UNKNOWN",
-                3 => "INVALID_ARGUMENT",
-                4 => "DEADLINE_EXCEEDED",
-                5 => "NOT_FOUND",
-                6 => "ALREADY_EXISTS",
-                7 => "PERMISSION_DENIED",
-                8 => "RESOURCE_EXHAUSTED",
-                9 => "FAILED_PRECONDITION",
-                10 => "ABORTED",
-                11 => "OUT_OF_RANGE",
-                12 => "UNIMPLEMENTED",
-                13 => "INTERNAL",
-                14 => "UNAVAILABLE",
-                15 => "DATA_LOSS",
-                16 => "UNAUTHENTICATED",
-                _ => "UNKNOWN",
-            },
-        );
+        tracing::Span::current().record(RPC_RESPONSE_STATUS_CODE, &*grpc_status_code_name(code));
     }
+}
+
+/// The `rpc.response.status_code` value for a numeric gRPC status: the code's
+/// name, or its decimal string for a code outside the gRPC set.
+fn grpc_status_code_name(code: i64) -> std::borrow::Cow<'static, str> {
+    let name = match code {
+        0 => "OK",
+        1 => "CANCELLED",
+        2 => "UNKNOWN",
+        3 => "INVALID_ARGUMENT",
+        4 => "DEADLINE_EXCEEDED",
+        5 => "NOT_FOUND",
+        6 => "ALREADY_EXISTS",
+        7 => "PERMISSION_DENIED",
+        8 => "RESOURCE_EXHAUSTED",
+        9 => "FAILED_PRECONDITION",
+        10 => "ABORTED",
+        11 => "OUT_OF_RANGE",
+        12 => "UNIMPLEMENTED",
+        13 => "INTERNAL",
+        14 => "UNAVAILABLE",
+        15 => "DATA_LOSS",
+        16 => "UNAUTHENTICATED",
+        _ => return code.to_string().into(),
+    };
+    name.into()
 }
 
 /// Response-body wrapper that tallies streamed bytes and records
@@ -3557,10 +4029,9 @@ fn host_header<B>(req: &hyper::Request<B>) -> &str {
 /// `example.com`.
 /// The port a scheme implies when a URI does not spell one out.
 fn default_port_for_scheme(scheme: Option<&str>) -> u16 {
-    match scheme {
-        Some("https") => 443,
-        _ => 80,
-    }
+    scheme
+        .and_then(crate::host::allowed_hosts::default_port)
+        .unwrap_or(80)
 }
 
 fn split_host_port(host: &str) -> (&str, Option<u16>) {
@@ -3580,19 +4051,22 @@ fn split_host_port(host: &str) -> (&str, Option<u16>) {
 
 /// Invoke the component handler for the given workload
 async fn invoke_component_handler(
-    workload_handle: ResolvedWorkload,
-    instance_pre: InstancePre<SharedCtx>,
-    component_id: &str,
+    // Resolved once when the route was registered: this runs per request.
+    handle: &ComponentHandle,
     req: hyper::Request<WasiBody>,
     guest_meter: GuestMeter,
-    // Resolved once when the route was registered: this runs per request.
-    identity: &crate::observability::WorkloadIdentity,
 ) -> anyhow::Result<hyper::Response<WasiBody>> {
-    if crate::engine::targets_wasip3_http(instance_pre.component()) {
-        let pool = workload_handle
-            .instance_pool_for_component(component_id)
-            .await;
-
+    let completion = ResponseBodyCompletion::for_request(&req);
+    let ComponentHandle {
+        workload: workload_handle,
+        instance_pre,
+        component_id,
+        identity,
+        targets_p3,
+        pool,
+    } = handle;
+    let component_id = component_id.as_str();
+    if *targets_p3 {
         // A component that keeps instances warm serves this on one of them,
         // alongside whatever else that instance already has in flight. Only
         // when every warm instance is full and the pool is at `pool_size` does
@@ -3610,8 +4084,8 @@ async fn invoke_component_handler(
                 abandoned: call.flag(),
             }));
             let outcome =
-                crate::engine::instance_pool::offer_or_install(pool, &instance_pre, job, || {
-                    workload_handle.new_store(component_id)
+                crate::engine::instance_pool::offer_or_install(pool, instance_pre, job, || {
+                    workload_handle.new_store_as(component_id, Some(identity))
                 })
                 .await?;
             match outcome {
@@ -3622,7 +4096,7 @@ async fn invoke_component_handler(
                         .ok_or_else(|| anyhow::anyhow!("pooled instance produced no response"))?;
                     let resp =
                         resp.map_err(|_| anyhow::anyhow!("pooled instance dropped the request"))??;
-                    return Ok(watch_body(resp, watch));
+                    return Ok(watch_body(resp, watch, completion));
                 }
                 // Every warm instance was busy; serve it cold below.
                 Err(Declined {
@@ -3654,8 +4128,15 @@ async fn invoke_component_handler(
         let cold = match reclaimed {
             Some(built) => built,
             None => {
-                let mut store = workload_handle.new_store(component_id).await?;
-                let instance = instance_pre.instantiate_async(&mut store).await?;
+                let mut store = workload_handle
+                    .new_store_as(component_id, Some(identity))
+                    .await?;
+                let instance = instance_pre
+                    .instantiate_async(&mut store)
+                    .await
+                    .map_err(|e| {
+                        crate::engine::pool_usage::explain_instantiate_failure(store.data(), e)
+                    })?;
                 crate::engine::instance_pool::ComponentInstance { store, instance }
             }
         };
@@ -3667,14 +4148,16 @@ async fn invoke_component_handler(
             ))
             .await
             .ok_or_else(|| anyhow::anyhow!("cold instance produced no response"))?;
-        return Ok(watch_body(resp?, watch));
+        return Ok(watch_body(resp?, watch, completion));
     }
 
     // The p2 path still builds and instantiates per request: its store is
     // owned by a detached task that outlives the response head, so recovering
     // it for reuse needs a restructure the p3 path did not.
-    let store = workload_handle.new_store(component_id).await?;
-    handle_component_request(store, instance_pre, req, guest_meter, identity).await
+    let store = workload_handle
+        .new_store_as(component_id, Some(identity))
+        .await?;
+    handle_component_request(store, instance_pre.clone(), req, guest_meter, identity).await
 }
 
 /// Handle a component request using WASI HTTP (copied from wash/crates/src/cli/dev.rs)
@@ -3685,6 +4168,7 @@ pub async fn handle_component_request(
     guest_meter: GuestMeter,
     identity: &crate::observability::WorkloadIdentity,
 ) -> anyhow::Result<hyper::Response<WasiBody>> {
+    let completion = ResponseBodyCompletion::for_request(&req);
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let scheme = match req.uri().scheme() {
         Some(scheme) if scheme == &hyper::http::uri::Scheme::HTTP => Scheme::Http,
@@ -3716,7 +4200,9 @@ pub async fn handle_component_request(
             // Watched for as long as the store runs guest code.
             let _abandoned = watch_guard;
             // Run the http request itself by instantiating and calling the component
-            let proxy = pre.instantiate_async(&mut store).await?;
+            let proxy = pre.instantiate_async(&mut store).await.map_err(|e| {
+                crate::engine::pool_usage::explain_instantiate_failure(store.data(), e)
+            })?;
 
             guest_meter
                 .observe(&attributes, &mut store, async move |store| {
@@ -3737,7 +4223,7 @@ pub async fn handle_component_request(
     match call.await_head(receiver).await {
         // If the client calls `response-outparam::set` then one of these
         // methods will be called.
-        Some((Ok(Ok(resp)), watch)) => Ok(watch_body(resp, watch)),
+        Some((Ok(Ok(resp)), watch)) => Ok(watch_body(resp, watch, completion)),
         Some((Ok(Err(e)), _)) => Err(e.into()),
 
         // Otherwise the `sender` will get dropped along with the `Store`
@@ -4105,7 +4591,7 @@ impl IntoBodyError for wasmtime_wasi_http::Error {
 }
 
 /// Send a gRPC request over its own HTTP/2 connection. `tls` must already carry
-/// the h2 ALPN (see [`h2_client_config`]).
+/// the h2 ALPN and have session resumption disabled (see [`h2_client_config`]).
 async fn send_grpc_request(
     mut request: hyper::Request<WasiBody>,
     options: Option<RequestOptions>,
@@ -4133,11 +4619,7 @@ async fn send_grpc_request(
     let tcp_stream = connect_http_tcp(&authority, connect_timeout).await?;
 
     let (mut sender, conn_worker) = if use_tls {
-        // The cached gRPC TLS configuration is shared across workloads; give
-        // this connection its own session store so TLS session tickets never
-        // resume across workloads.
-        let config = crate::host::http_client::isolated_resumption(&tls);
-        let stream = connect_http_tls(Arc::new(config), &authority, tcp_stream).await?;
+        let stream = connect_http_tls(tls, &authority, tcp_stream).await?;
         let (sender, conn) = timeout(
             connect_timeout,
             http2::handshake(TokioExecutor::new(), TokioIo::new(stream)),
@@ -4172,6 +4654,7 @@ async fn send_grpc_request(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     #[test]
     fn outbound_http_preserves_guest_parent_and_injects_client_span() {
@@ -4233,6 +4716,32 @@ mod tests {
     }
 
     use super::*;
+    use opentelemetry::trace::{SpanKind, TracerProvider as _};
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{SdkTracerProvider, SpanData, SpanExporter},
+    };
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct RecordingSpanExporter {
+        spans: Arc<Mutex<Vec<SpanData>>>,
+    }
+
+    impl SpanExporter for RecordingSpanExporter {
+        fn export(
+            &self,
+            batch: Vec<SpanData>,
+        ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+            self.spans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(batch);
+            std::future::ready(Ok(()))
+        }
+    }
 
     fn build_request(uri: &str) -> hyper::Request<WasiBody> {
         hyper::Request::builder()
@@ -4267,6 +4776,128 @@ mod tests {
             &mut req,
             &hyper::http::uri::Scheme::HTTP
         ));
+    }
+
+    #[test]
+    fn component_handler_span_exports_a_stable_name() {
+        let exporter = RecordingSpanExporter::default();
+        let spans = exporter.spans.clone();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter)
+            .build();
+        let tracer = provider.tracer("http-span-name-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            // A parallel test may have reached these callsites first with no
+            // subscriber, caching them as disabled.
+            tracing::callsite::rebuild_interest_cache();
+            drop(component_handler_span("workload", "namespace", "id"));
+            let mut request = hyper::Request::builder()
+                .method(hyper::Method::PATCH)
+                .uri("http://example.test/path")
+                .body(())
+                .unwrap();
+            drop(outbound_client_span(&mut request));
+        });
+
+        provider.force_flush().unwrap();
+        let spans = spans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let exported: Vec<_> = spans
+            .iter()
+            .map(|span| (span.name.as_ref(), span.span_kind.clone()))
+            .collect();
+        assert_eq!(
+            exported,
+            [
+                ("invoke_component_handler", SpanKind::Internal),
+                ("PATCH", SpanKind::Client),
+            ]
+        );
+        let attribute = |key: &str| {
+            spans[0]
+                .attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.to_string())
+        };
+        assert_eq!(attribute("workload.name").as_deref(), Some("workload"));
+        assert_eq!(attribute(FAAS_NAME).as_deref(), Some("workload"));
+        assert_eq!(attribute(FAAS_TRIGGER).as_deref(), Some("http"));
+    }
+
+    #[test]
+    fn grpc_status_codes_map_to_names() {
+        let names: Vec<_> = (0..=16).map(grpc_status_code_name).collect();
+        assert_eq!(
+            names,
+            [
+                "OK",
+                "CANCELLED",
+                "UNKNOWN",
+                "INVALID_ARGUMENT",
+                "DEADLINE_EXCEEDED",
+                "NOT_FOUND",
+                "ALREADY_EXISTS",
+                "PERMISSION_DENIED",
+                "RESOURCE_EXHAUSTED",
+                "FAILED_PRECONDITION",
+                "ABORTED",
+                "OUT_OF_RANGE",
+                "UNIMPLEMENTED",
+                "INTERNAL",
+                "UNAVAILABLE",
+                "DATA_LOSS",
+                "UNAUTHENTICATED",
+            ]
+        );
+        assert_eq!(grpc_status_code_name(17), "17");
+        assert_eq!(grpc_status_code_name(-1), "-1");
+    }
+
+    #[test]
+    fn outbound_span_records_grpc_status_name() {
+        let exporter = RecordingSpanExporter::default();
+        let spans = exporter.spans.clone();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter)
+            .build();
+        let tracer = provider.tracer("grpc-status-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut request = hyper::Request::builder()
+                .method(hyper::Method::POST)
+                .uri("http://grpc.test/svc.Echo/Echo")
+                .body(())
+                .unwrap();
+            let span = outbound_client_span(&mut request);
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert("grpc-status", hyper::header::HeaderValue::from_static("4"));
+            span.in_scope(|| record_grpc_status(&headers));
+        });
+
+        provider.force_flush().unwrap();
+        let spans = spans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(spans.len(), 1, "exported spans: {spans:#?}");
+        let attribute = |key: &str| {
+            spans[0]
+                .attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.clone())
+        };
+        assert_eq!(
+            attribute(RPC_RESPONSE_STATUS_CODE),
+            Some(opentelemetry::Value::from("DEADLINE_EXCEEDED"))
+        );
+        assert_eq!(attribute("rpc.grpc.status_code"), None);
     }
 
     /// `with_quotas` rebuilds an eagerly-configured client cache and must
@@ -4502,6 +5133,7 @@ mod tests {
                 None,
                 Meters::default().guest(),
                 ConnectionLimit::new(1),
+                Arc::default(),
             )
             .await
         });
@@ -4664,6 +5296,7 @@ mod tests {
                 None,
                 Meters::default().guest(),
                 served,
+                Arc::default(),
             )
             .await
         });
@@ -5661,7 +6294,7 @@ mod tests {
     /// a comma-separated `host-aliases` config — mirrors what the wash config
     /// layer injects.
     fn http_iface(host: Option<&str>, aliases: Option<&str>) -> crate::wit::WitInterface {
-        let mut config = HashMap::new();
+        let mut config = crate::wit::Config::new();
         if let Some(host) = host {
             config.insert("host".to_string(), host.to_string());
         }
@@ -5749,9 +6382,7 @@ mod tests {
         let (callee_host, callee_url) = (value("host"), value("CALLEE_URL"));
 
         let mut iface = http_iface(Some(callee_host), None);
-        iface
-            .config
-            .insert("localRoute".to_string(), value("localRoute").into());
+        iface.config.insert("localRoute", value("localRoute"));
 
         let router = DynamicRouter::default();
         router.register_routes("callee", &http_ingress_routes(&[iface]).unwrap());
@@ -5861,7 +6492,7 @@ mod tests {
         let bucket = |prefix: &str| PathBucket {
             prefix: NormalizedPathPrefix::new(prefix),
             scope: RouteScope::Local,
-            workloads: BTreeSet::new(),
+            workloads: imbl::OrdSet::new(),
         };
         let mut buckets = [
             bucket(""),
@@ -5965,7 +6596,7 @@ mod tests {
             package: "keyvalue".to_string(),
             interfaces: ["store".to_string()].into_iter().collect(),
             version: None,
-            config: HashMap::new(),
+            config: Default::default(),
             name: None,
         };
         assert!(http_ingress_routes(&[kv]).unwrap().is_empty());
@@ -6239,6 +6870,411 @@ mod tests {
             None,
             "unbind must drop the workload's local routes too"
         );
+    }
+
+    /// Writes edit only what they touch: unbinding one workload leaves every
+    /// other workload's routes, on its hostname and on others, as they were,
+    /// and unbinding all of them leaves nothing behind.
+    #[tokio::test]
+    async fn unbind_touches_only_the_unbound_workloads_routes() {
+        let router = DynamicRouter::default();
+        for i in 0..100 {
+            router.register_routes(
+                &format!("w{i}"),
+                &[IngressRoute::ingress(format!("host{i}.example.com"))],
+            );
+        }
+        router.register_routes("w0-replica", &[IngressRoute::ingress("host0.example.com")]);
+
+        router.on_workload_unbind("w0").await.unwrap();
+        assert_eq!(
+            router
+                .select_workload("host0.example.com", "/", RouteScope::Ingress)
+                .ok(),
+            Some("w0-replica".to_string()),
+            "the remaining replica keeps the hostname"
+        );
+        assert_eq!(
+            router
+                .select_workload("host7.example.com", "/", RouteScope::Ingress)
+                .ok(),
+            Some("w7".to_string())
+        );
+
+        router.on_workload_unbind("w0-replica").await.unwrap();
+        for i in 1..100 {
+            router.on_workload_unbind(&format!("w{i}")).await.unwrap();
+        }
+        assert!(router.is_empty());
+    }
+
+    /// A request matches against the snapshot it loaded from the table, so a
+    /// write landing mid-request neither blocks it nor changes what it sees.
+    #[test]
+    fn a_held_snapshot_is_unaffected_by_later_writes() {
+        let router = DynamicRouter::default();
+        router.register_routes("a", &[IngressRoute::ingress("svc.example.com")]);
+        let snapshot = router.host_buckets("svc.example.com").unwrap();
+
+        router.register_routes("b", &[IngressRoute::ingress("svc.example.com")]);
+        router.unregister_routes("a");
+
+        let held: Vec<_> = snapshot
+            .iter()
+            .flat_map(|b| b.workloads.iter().cloned())
+            .collect();
+        assert_eq!(held, ["a"]);
+        let now: Vec<_> = router
+            .host_buckets("svc.example.com")
+            .unwrap()
+            .iter()
+            .flat_map(|b| b.workloads.iter().cloned())
+            .collect();
+        assert_eq!(now, ["b"]);
+    }
+
+    #[test]
+    fn concurrent_route_churn_preserves_shared_replicas_and_held_snapshots() {
+        let router = Arc::new(DynamicRouter::default());
+        let shared = IngressRoute::ingress("shared.example.com");
+        router.register_routes("anchor", std::slice::from_ref(&shared));
+        let held = router.host_buckets("shared.example.com").unwrap();
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let router = &router;
+                let shared = &shared;
+                scope.spawn(move || {
+                    for index in 0..1000 {
+                        let id = format!("worker-{worker}-{index}");
+                        let distinct =
+                            IngressRoute::ingress(format!("w{worker}-{index}.example.com"));
+                        router.register_routes(&id, &[shared.clone(), distinct.clone()]);
+                        assert_eq!(
+                            router
+                                .select_workload(&distinct.host, "/", RouteScope::Ingress)
+                                .unwrap(),
+                            id
+                        );
+                        assert!(
+                            router
+                                .select_workload(&shared.host, "/", RouteScope::Ingress)
+                                .is_ok()
+                        );
+                        router.unregister_routes(&id);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            held[0].workloads.iter().cloned().collect::<Vec<_>>(),
+            ["anchor"]
+        );
+        assert_eq!(
+            router
+                .select_workload(&shared.host, "/", RouteScope::Ingress)
+                .unwrap(),
+            "anchor"
+        );
+    }
+
+    /// How many routes the write probes register: 100k in a release build,
+    /// where their timings mean something. CI runs ignored tests in a debug
+    /// build, where only their checks do, so it registers far fewer.
+    const WRITE_PROBE_ROUTES: usize = if cfg!(debug_assertions) {
+        5_000
+    } else {
+        100_000
+    };
+
+    #[test]
+    #[ignore = "100k-route scaling probe; run explicitly with --release --ignored --nocapture"]
+    fn routing_write_scaling() {
+        for replicas in [false, true] {
+            let router = DynamicRouter::default();
+            let began = std::time::Instant::now();
+            for index in 0..WRITE_PROBE_ROUTES {
+                let host = if replicas {
+                    "shared.scale.test".to_string()
+                } else {
+                    format!("w{index}.scale.test")
+                };
+                router.register_routes(&format!("w{index}"), &[IngressRoute::ingress(host)]);
+            }
+            let registered = began.elapsed();
+            for index in 0..WRITE_PROBE_ROUTES {
+                router.unregister_routes(&format!("w{index}"));
+            }
+            assert!(router.is_empty());
+            eprintln!(
+                "replicas={replicas}: register={registered:?}, register+remove={:?}",
+                began.elapsed()
+            );
+        }
+    }
+
+    /// A writer waits only for writers on its own hostname's shard. With the
+    /// writer lock of `w1.scale.test`'s shard taken, a register on
+    /// `w1.scale.test` waits inside its update until the lock is released,
+    /// while a register on `w2.scale.test` (another shard) finishes, even
+    /// though its workload id shares a workload map shard with the waiter.
+    #[test]
+    fn a_writer_waits_only_for_writers_on_its_own_shard() {
+        use std::sync::mpsc::{self, TryRecvError};
+        use std::time::{Duration, Instant};
+
+        assert_ne!(shard_index("w1.scale.test"), shard_index("w2.scale.test"));
+        let free = (0..)
+            .map(|i| format!("free{i}"))
+            .find(|id| shard_index(id) == shard_index("other"))
+            .unwrap();
+        let router = Arc::new(DynamicRouter::default());
+        let register = |workload_id: String, host: &'static str| {
+            let router = Arc::clone(&router);
+            let (done, finished) = mpsc::channel();
+            // Not a scoped thread: a register that never returns must fail
+            // this test, not hang it at the join.
+            std::thread::spawn(move || {
+                router.register_routes(&workload_id, &[IngressRoute::ingress(host)]);
+                let _ = done.send(());
+            });
+            finished
+        };
+
+        let held = router.hold_route_writer("w1.scale.test");
+        let same_shard = register("other".to_string(), "w1.scale.test");
+        // Judge only once the register is inside its update: there it holds
+        // its own record while it waits on `w1.scale.test`'s writer, so its
+        // record stops reading as absent.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while router.try_recorded_routes("other") == Ok(None) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let other_shard =
+            register(free.clone(), "w2.scale.test").recv_timeout(Duration::from_secs(10));
+        // A register that does not wait for the writer is done well within this.
+        std::thread::sleep(Duration::from_millis(50));
+        let while_held = (router.try_recorded_routes("other"), same_shard.try_recv());
+        drop(held);
+        let after_release = same_shard.recv_timeout(Duration::from_secs(10));
+
+        assert_eq!(
+            other_shard,
+            Ok(()),
+            "a register on another shard waited for the held writer, or for \
+             a waiting register whose workload id shares its map shard"
+        );
+        assert_eq!(
+            while_held,
+            (Err(WouldBlock), Err(TryRecvError::Empty)),
+            "a register on the held writer's shard did not wait inside its update"
+        );
+        assert_eq!(after_release, Ok(()));
+        assert_eq!(
+            router
+                .select_workload("w2.scale.test", "/", RouteScope::Ingress)
+                .unwrap(),
+            free
+        );
+        assert_eq!(
+            router
+                .select_workload("w1.scale.test", "/", RouteScope::Ingress)
+                .unwrap(),
+            "other"
+        );
+    }
+
+    /// A workload's record and its routes change together: an unregister that
+    /// waits on the first hostname shard it edits still holds the workload's
+    /// record, so no one can see the record gone while its routes still serve
+    /// it, or register the workload again in between.
+    #[test]
+    fn a_workloads_record_and_routes_change_together() {
+        use std::time::{Duration, Instant};
+
+        let routes: Vec<_> = (0..8)
+            .map(|i| IngressRoute::ingress(format!("r{i}.race.test")))
+            .collect();
+        // `edit_shards` edits shards in index order, so the lowest is first.
+        let first = routes
+            .iter()
+            .min_by_key(|route| shard_index(&route.host))
+            .unwrap();
+        let router = Arc::new(DynamicRouter::default());
+        router.register_routes("w", &routes);
+
+        let writer = router.hold_route_writer(&first.host);
+        let (done, unregistered) = std::sync::mpsc::channel();
+        {
+            let router = Arc::clone(&router);
+            // Not joined: an unregister that never returns must fail this
+            // test, not hang it.
+            std::thread::spawn(move || {
+                router.unregister_routes("w");
+                let _ = done.send(());
+            });
+        }
+        // Wait for the unregister to take the record (or, in a design that
+        // releases it early, to drop it).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while matches!(router.try_recorded_routes("w"), Ok(Some(_))) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        // Give a design that frees the record before its shard edits the
+        // time to do so; the right one keeps it until `writer` is dropped.
+        std::thread::sleep(Duration::from_millis(50));
+        let mid_edit = router.try_recorded_routes("w");
+        drop(writer);
+        let finished = unregistered.recv_timeout(Duration::from_secs(10));
+
+        assert_eq!(
+            mid_edit,
+            Err(WouldBlock),
+            "the workload's record was free while its unregister was mid-edit"
+        );
+        assert_eq!(finished, Ok(()), "the unregister never finished");
+        assert!(router.is_empty());
+    }
+
+    /// Writers on one hostname's shard take turns: none of 4000 replicas
+    /// registered at once from 8 threads is lost to another writer's store.
+    #[test]
+    fn concurrent_registers_on_one_hostname_lose_no_replica() {
+        let router = DynamicRouter::default();
+        let route = IngressRoute::ingress("shared.race.test");
+        std::thread::scope(|scope| {
+            for thread in 0..8 {
+                let (router, route) = (&router, &route);
+                scope.spawn(move || {
+                    for index in 0..500 {
+                        router.register_routes(
+                            &format!("t{thread}-{index}"),
+                            std::slice::from_ref(route),
+                        );
+                    }
+                });
+            }
+        });
+        let buckets = router.host_buckets("shared.race.test").unwrap();
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].workloads.len(), 4000);
+    }
+
+    /// Registering a workload again with other routes drops it from the
+    /// routes it no longer lists, so an unbind leaves none of them behind.
+    #[test]
+    fn re_registering_with_other_routes_drops_the_old_ones() {
+        let router = DynamicRouter::default();
+        router.register_routes(
+            "w",
+            &[
+                IngressRoute::ingress("kept.reregister.test"),
+                IngressRoute::ingress("dropped.reregister.test"),
+            ],
+        );
+        router.register_routes(
+            "w",
+            &[
+                IngressRoute::ingress("kept.reregister.test"),
+                IngressRoute::ingress("added.reregister.test"),
+            ],
+        );
+
+        assert!(router.host_buckets("dropped.reregister.test").is_none());
+        for host in ["kept.reregister.test", "added.reregister.test"] {
+            assert_eq!(
+                router
+                    .select_workload(host, "/", RouteScope::Ingress)
+                    .unwrap(),
+                "w"
+            );
+        }
+        router.unregister_routes("w");
+        assert!(router.is_empty());
+    }
+
+    /// A register and an unregister of one workload that overlap, as when a
+    /// service restart races a stop, leave the workload map and the shards
+    /// agreeing: every route serves the workload exactly when the map still
+    /// records it.
+    #[test]
+    fn racing_register_and_unregister_of_one_workload_agree() {
+        let routes: Vec<_> = (0..8)
+            .map(|i| IngressRoute::ingress(format!("r{i}.race.test")))
+            .collect();
+        for _ in 0..500 {
+            let router = DynamicRouter::default();
+            router.register_routes("w", &routes);
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    start.wait();
+                    router.unregister_routes("w");
+                });
+                scope.spawn(|| {
+                    start.wait();
+                    router.register_routes("w", &routes);
+                });
+            });
+            let recorded = router.recorded_routes("w").is_some();
+            for route in &routes {
+                assert_eq!(
+                    router
+                        .select_workload(&route.host, "/", RouteScope::Ingress)
+                        .is_ok(),
+                    recorded,
+                    "{} disagrees with the workload map",
+                    route.host
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "prints route write throughput by thread count; run with --release --ignored --nocapture"]
+    fn routing_write_scaling_across_threads() {
+        const REGISTERS: usize = WRITE_PROBE_ROUTES;
+        for replicas in [false, true] {
+            for threads in [1, 2, 4, 8] {
+                let router = DynamicRouter::default();
+                let began = std::time::Instant::now();
+                std::thread::scope(|scope| {
+                    for thread in 0..threads {
+                        let router = &router;
+                        scope.spawn(move || {
+                            for index in 0..REGISTERS / threads {
+                                let host = if replicas {
+                                    "shared.scale.test".to_string()
+                                } else {
+                                    format!("t{thread}-w{index}.scale.test")
+                                };
+                                router.register_routes(
+                                    &format!("t{thread}-w{index}"),
+                                    &[IngressRoute::ingress(host)],
+                                );
+                            }
+                        });
+                    }
+                });
+                let rate = REGISTERS as f64 / began.elapsed().as_secs_f64();
+                eprintln!("replicas={replicas} threads={threads}: {rate:.0} registers/s");
+
+                // CI runs ignored tests, so check that no registration was lost.
+                let recorded = router.recorded_workloads();
+                let routed: usize = if replicas {
+                    router
+                        .host_buckets("shared.scale.test")
+                        .map_or(0, |buckets| buckets.iter().map(|b| b.workloads.len()).sum())
+                } else {
+                    router
+                        .hosts
+                        .iter()
+                        .map(|shard| shard.routes.0.load().len())
+                        .sum()
+                };
+                assert_eq!(recorded, REGISTERS, "a registration left no record");
+                assert_eq!(routed, REGISTERS, "a registration left no route");
+            }
+        }
     }
 
     /// A body error a local dispatch already produced reaches the guest as
@@ -6643,5 +7679,112 @@ mod tests {
             None,
             "paths are case-sensitive even though hostnames are not"
         );
+    }
+
+    /// A fixed-length body: yields `data` once, then waits on trailers that
+    /// never come, reporting how much of its declared length is left.
+    struct FixedLength {
+        data: Option<bytes::Bytes>,
+        remaining: u64,
+    }
+
+    impl hyper::body::Body for FixedLength {
+        type Data = bytes::Bytes;
+        type Error = wasmtime_wasi_http::Error;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            match self.data.take() {
+                Some(data) => {
+                    self.remaining -= data.len() as u64;
+                    std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(data))))
+                }
+                None => std::task::Poll::Pending,
+            }
+        }
+
+        fn size_hint(&self) -> hyper::body::SizeHint {
+            hyper::body::SizeHint::with_exact(self.remaining)
+        }
+    }
+
+    /// Dropped with `polls` frames read, as hyper drops a body; whether the
+    /// call was left abandoned.
+    async fn abandoned_after(
+        completion: ResponseBodyCompletion,
+        polls: usize,
+        data: &'static [u8],
+        declared: u64,
+    ) -> bool {
+        let call = DispatchedCall::new("test", Duration::from_secs(60));
+        let flag = call.flag();
+        let ((), watch) = call.await_head(async {}).await.expect("a reply");
+        let inner = FixedLength {
+            data: Some(bytes::Bytes::from_static(data)),
+            remaining: declared,
+        }
+        .boxed_unsync();
+        let mut body = watch_body(hyper::Response::new(inner), watch, completion).into_body();
+        for _ in 0..polls {
+            let _ = body.frame().await;
+        }
+        drop(body);
+        flag.is_armed()
+    }
+
+    /// hyper stops polling a fixed-length body once its declared length is
+    /// written, before its trailers resolve: that response was delivered.
+    #[tokio::test]
+    async fn a_spent_fixed_length_body_is_not_abandoned() {
+        assert!(!abandoned_after(ResponseBodyCompletion::Http1, 1, b"hello", 5).await);
+    }
+
+    /// Dropped with bytes still owed, the exchange broke off.
+    #[tokio::test]
+    async fn a_fixed_length_body_dropped_short_is_abandoned() {
+        assert!(abandoned_after(ResponseBodyCompletion::Http1, 0, b"hello", 5).await);
+    }
+
+    #[tokio::test]
+    async fn an_empty_http1_body_is_not_abandoned_without_polling() {
+        assert!(!abandoned_after(ResponseBodyCompletion::Http1, 0, b"", 0).await);
+    }
+
+    #[tokio::test]
+    async fn http2_pending_trailers_keep_abandonment_armed() {
+        let completion = ResponseBodyCompletion::for_network(hyper::Version::HTTP_2);
+        assert!(abandoned_after(completion, 1, b"hello", 5).await);
+        assert!(abandoned_after(completion, 0, b"", 0).await);
+    }
+
+    #[tokio::test]
+    async fn local_pending_trailers_keep_abandonment_armed() {
+        let request = hyper::Request::new(());
+        let completion = ResponseBodyCompletion::for_request(&request);
+        assert!(abandoned_after(completion, 1, b"hello", 5).await);
+    }
+
+    #[tokio::test]
+    async fn completed_trailers_disarm_abandonment() {
+        let call = DispatchedCall::new("test", Duration::from_secs(60));
+        let flag = call.flag();
+        let ((), watch) = call.await_head(async {}).await.expect("a reply");
+        let inner = http_body_util::Full::new(bytes::Bytes::from_static(b"hello"))
+            .map_err(|never| match never {})
+            .with_trailers(std::future::ready(Some(Ok(hyper::HeaderMap::new()))))
+            .boxed_unsync();
+        let mut body = watch_body(
+            hyper::Response::new(inner),
+            watch,
+            ResponseBodyCompletion::Stream,
+        )
+        .into_body();
+        body.frame().await.expect("data").expect("valid frame");
+        let frame = body.frame().await.expect("trailers").expect("valid frame");
+        assert!(frame.is_trailers());
+        drop(body);
+        assert!(!flag.is_armed());
     }
 }

@@ -41,7 +41,7 @@ on:
       build-cache:
         type: boolean
         required: false
-        description: "Enables Github Actions Image cache. Default=true"
+        description: "Read the GitHub Actions buildx cache, and write it on pushes to main. Default=true"
         default: true
     outputs:
       image_digest:
@@ -78,7 +78,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Login to ghcr.io
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -109,11 +109,11 @@ jobs:
           build-contexts: ${{ inputs.build-contexts }}
           outputs: type=image,push-by-digest=${{ inputs.push-by-digest }},name-canonical=true,push=${{ inputs.push-by-digest }}
           build-args: ${{ inputs.build-args }}
-          cache-from: |
-            type=gha,scope=buildx-${{ steps.meta.outputs.artifact_prefix }}-${{ matrix.arch }}-${{ github.ref_name }}
-            type=gha,scope=buildx-${{ steps.meta.outputs.artifact_prefix }}-${{ matrix.arch }}-main
-          cache-to: |
-            type=gha,scope=buildx-${{ steps.meta.outputs.artifact_prefix }}-${{ matrix.arch }}-${{ github.ref_name }},mode=max
+          # Only the caller's push to main writes the cache; every other run
+          # reads `-main`. Per-PR scopes would compete for the repo's 10 GB
+          # Actions cache, which also holds the Rust caches.
+          cache-from: ${{ inputs.build-cache && format('type=gha,scope=buildx-{0}-{1}-main', steps.meta.outputs.artifact_prefix, matrix.arch) || '' }}
+          cache-to: ${{ inputs.build-cache && github.event_name == 'push' && github.ref == 'refs/heads/main' && format('type=gha,scope=buildx-{0}-{1}-main,mode=max', steps.meta.outputs.artifact_prefix, matrix.arch) || '' }}
 
       - name: Export digest
         id: export
@@ -127,7 +127,7 @@ jobs:
 
       - name: Upload digest
         if: ${{ inputs.push-by-digest }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: digests-${{ steps.meta.outputs.artifact_prefix }}-${{ github.run_id }}-linux-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/*
@@ -147,14 +147,14 @@ jobs:
         with:
           persist-credentials: false
       - name: Download digests
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: ${{ runner.temp }}/digests
           pattern: digests-${{ needs.build.outputs.artifact_prefix }}-${{ github.run_id }}-*
           merge-multiple: true
 
       - name: Login to ghcr.io
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}

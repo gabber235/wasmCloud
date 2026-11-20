@@ -47,6 +47,9 @@
 //! submodule; this module drives it from `ComponentHostPlugin`'s `HostPlugin`
 //! impl.
 //!
+//! Nonempty imports containing only structural types need no provider and do
+//! not become workload callbacks. Empty marker interfaces remain capabilities.
+//!
 //! Calls also run the other way. A plugin that imports
 //! `wasmcloud:host/workload-call` may *import* an interface no host built-in
 //! provides, in which case a workload that exports it satisfies it — the
@@ -66,6 +69,7 @@
 //! to the workload whose capability call is being served.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -73,6 +77,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
+use futures::FutureExt as _;
 use tracing::{debug, error, warn};
 use wasmtime::AsContextMut;
 use wasmtime::component::types::Type;
@@ -82,33 +87,41 @@ use wasmtime::component::{
 use wasmtime::{Store, StoreContextMut};
 
 use crate::engine::Engine;
-use crate::engine::ctx::{CallerIdentity, Ctx, SharedCtx};
+use crate::engine::ctx::{CallerIdentity, Ctx, SharedCtx, WorkloadCaller};
 use crate::engine::instance_pool::InstancePolicy;
 use crate::engine::store::relocate::{self, Relocated};
 use crate::engine::store::resource_bridge::{self, ProxyResource};
+use crate::engine::volumes::{HostPathPolicy, ResolvedVolumeMount};
 use crate::engine::workload::{
     ResolvedWorkload, UnresolvedWorkload, WorkloadComponent, WorkloadItem,
 };
 use crate::host::job_registry::JobRegistry;
 use crate::host::trigger_service::{
-    CapabilityCall, CapabilityFunc, CapabilityJob, Ingress, LifecycleReplay, TriggerService,
-    decode_bind_reply,
+    CapabilityCall, CapabilityFunc, CapabilityJob, CliRunError, Ingress, LifecycleReplay,
+    decode_bind_reply, run_trigger_driver,
 };
 use crate::oci::OciConfig;
 use crate::plugin::binding_of;
 use crate::plugin::component_plugin_spec::ComponentPluginSpec;
+use crate::plugin::wasmcloud_secrets::secret_handle;
 use crate::plugin::{HostPlugin, WitInterfaces};
 use crate::sockets::loopback;
-use crate::types::LocalResources;
+use crate::types::{LocalResources, Volume, VolumeMount};
 use crate::wit::{WitInterface, WitWorld, versions_compatible};
 
 mod lifecycle;
+mod secret_source;
 mod workload_call;
 
 use lifecycle::{
-    BindReply, HOST_LIFECYCLE_EXPORT, LifecycleFuncs, POISON_EVICT_STRIKES, attribute_replay_fault,
-    await_bind_reply, evict_workload, lifecycle_funcs, remove_and_unbind, replay_snapshot,
-    report_workload_failed, send_lifecycle_job, spawn_deferred_unbind, workload_info_val,
+    BindInfo, BindLease, BindReply, HOST_LIFECYCLE_EXPORT, LifecycleFuncs, POISON_EVICT_STRIKES,
+    attribute_replay_fault, await_bind_reply, bind_info, evict_workload, lifecycle_funcs,
+    remove_and_unbind, replay_snapshot, report_workload_failed, send_lifecycle_job,
+    spawn_deferred_unbind,
+};
+use secret_source::{ComponentSecretSource, HOST_SECRET_SOURCE_EXPORT, check_secret_source_export};
+pub(crate) use secret_source::{
+    SecretSourceRequest, SecretSourceResolve, SourceError, secret_source_resolve, secret_value,
 };
 use workload_call::{WorkloadCalls, add_workload_calls_to_linker, install_host_workload};
 
@@ -186,10 +199,12 @@ struct ComponentHostPluginState {
     /// registry. Lock-free reads for the same reason as `tx`.
     registry: ArcSwapOption<JobRegistry>,
     /// Workloads currently bound to this plugin, as workload id → the
-    /// `workload-info` value delivered to `on-workload-bind`. The supervisor
+    /// `workload-info` delivered to `on-workload-bind`. The supervisor
     /// snapshots it on each (re)start to replay binds into the fresh
     /// incarnation. Empty unless the plugin exports the lifecycle interface.
-    bound: Mutex<BTreeMap<Arc<str>, Val>>,
+    bound: Mutex<BTreeMap<Arc<str>, BindInfo>>,
+    /// Workload IDs reserved until their bind and rollback finish.
+    binding: Mutex<std::collections::BTreeSet<Arc<str>>>,
     /// Consecutive `on-workload-bind` traps attributed to each workload since it
     /// last bound cleanly — the quarantine strike count. Harvested from the
     /// faulted incarnation's registry after each fault; a workload reaching
@@ -232,10 +247,7 @@ impl ComponentHostPluginState {
         self.tx.load_full().map(|tx| (*tx).clone())
     }
 
-    /// The current incarnation's sender as a shared handle, whose `Arc` identity
-    /// names the incarnation: a restart publishes a new `Arc`, so
-    /// [`Arc::ptr_eq`] against a captured handle tells a deferred task whether
-    /// the incarnation it spoke to is still the live one.
+    /// A shared handle to the current incarnation's sender.
     fn sender_arc(&self) -> Option<Arc<CapabilitySender>> {
         self.tx.load_full()
     }
@@ -244,10 +256,14 @@ impl ComponentHostPluginState {
     /// unbind. Used when a bind never reached the guest (its enqueue failed) or
     /// when its unbind is being deferred separately.
     fn forget_workload(&self, workload_id: &str) {
-        self.bound
+        if let Some(info) = self
+            .bound
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(workload_id);
+            .remove(workload_id)
+        {
+            info.generation.revoke();
+        }
     }
 
     /// The current incarnation's job registry, or `None` if the plugin is not
@@ -272,6 +288,13 @@ struct PluginStoreContext {
     host_ref: Option<crate::host::HostRef>,
     network: crate::host::ports::NetworkHandle,
     socket_policy: Arc<crate::sockets::policy::SocketPolicy>,
+    /// The plugin's volumes, opened once at load. Every incarnation's store
+    /// gets the same directory handles.
+    volumes: Arc<[ResolvedVolumeMount]>,
+    /// Keeps workloads out of the directories in `volumes`. It sits beside the
+    /// handles so it lives as long as any copy of them does, including the
+    /// one a running supervisor holds.
+    _volume_registration: Arc<crate::engine::volumes::PluginVolumeRegistration>,
 }
 
 #[derive(Clone)]
@@ -291,6 +314,9 @@ pub struct ComponentHostPlugin {
     capability_funcs: Vec<CapabilityFunc>,
     /// The plugin's `wasmcloud:host/workload-lifecycle` export, if it has one.
     lifecycle: Option<Arc<LifecycleFuncs>>,
+    /// Name of the plugin's `wasmcloud:host/secret-source` export, if it has
+    /// one. Called through its typed `resolve`, not the capability path.
+    secret_source: Option<Arc<str>>,
     max_restarts: u32,
     state: Arc<ComponentHostPluginState>,
     /// This plugin's claim on the real addresses its `ports` declared, held so
@@ -326,8 +352,12 @@ impl ComponentHostPlugin {
     /// omitted, the default keeps host loopback closed; a non-empty loopback
     /// grant then warns and remains denied.
     ///
-    /// Egress lists default to empty. `native_plugins`, `config`, and
-    /// `host_ref` also defaults to `None`.
+    /// `volumes` are named host directories, and `volume_mounts` preopen them
+    /// into the plugin's store, as a workload's volumes and mounts do. A
+    /// declaration that cannot work fails here.
+    ///
+    /// Egress lists, `volumes` and `volume_mounts` default to empty. `native_plugins`, `config`,
+    /// and `host_ref` also defaults to `None`.
     #[builder(finish_fn = build)]
     pub async fn new(
         id: &'static str,
@@ -344,9 +374,15 @@ impl ComponentHostPlugin {
         >,
         host_ref: Option<crate::host::HostRef>,
         #[builder(default)] ports: Arc<[crate::host::declared_port::DeclaredPort]>,
+        #[builder(default)] volumes: Arc<[crate::types::Volume]>,
+        #[builder(default)] volume_mounts: Arc<[crate::types::VolumeMount]>,
         socket_policy: Option<Arc<crate::sockets::policy::SocketPolicy>>,
     ) -> anyhow::Result<Self> {
         crate::host::declared_port::validate_plugin_ports(&ports, &format!("host plugin '{id}'"))?;
+        let ResolvedPluginVolumes {
+            mounts: volumes,
+            registration: volume_registration,
+        } = resolve_plugin_volumes(id, &volumes, &volume_mounts, engine.host_paths()).await?;
         let socket_policy = socket_policy.unwrap_or_default();
         let egress_policy = crate::plugin::PluginEgressPolicy::new(
             Arc::clone(&allowed_hosts),
@@ -354,13 +390,6 @@ impl ComponentHostPlugin {
             Arc::clone(&allowed_host_loopback_ports),
             &socket_policy,
         );
-        if egress_policy.disabled_loopback_grants() {
-            warn!(
-                plugin_id = id,
-                "host component plugin declares allowedHostLoopbackPorts, but host-loopback \
-                 access is disabled; enable the host socket policy"
-            );
-        }
         // Each direct bind is claimed from the host's one port table as it is
         // collected, so two plugins declaring the same real address fail here,
         // with both holders named, rather than at the second plugin's bind with
@@ -403,16 +432,23 @@ impl ComponentHostPlugin {
         // hold by construction here too, not just at the caller.
         let native_plugins = native_only(&native_plugins);
         let (component, base_linker) = engine.prepare_host_component(wasm)?;
-        let (exports, lifecycle) = introspect_capability_exports(id, &component)?;
-        let workload_imports =
-            classify_workload_imports(id, &component, &exports, &native_plugins)?;
-        // A plugin has to participate in one direction or the other: serve a
-        // capability a workload imports, or call an interface a workload
-        // exports. A plugin doing only the latter is a legitimate shape — a
+        let (exports, (lifecycle, secret_source)) = introspect_capability_exports(id, &component)?;
+        let workload_imports = classify_workload_imports(
+            id,
+            &component,
+            &exports,
+            &native_plugins,
+            engine.stream_payloads(),
+        )?;
+        // A plugin has to participate somehow: serve a capability a workload
+        // imports, call an interface a workload exports, or serve the host
+        // secrets. A plugin doing only the second is a legitimate shape — a
         // trigger that dispatches from its own `wasi:cli/run` and exports no
         // capability at all.
         anyhow::ensure!(
-            exports.iter().any(|e| !e.funcs.is_empty()) || !workload_imports.is_empty(),
+            exports.iter().any(|e| !e.funcs.is_empty())
+                || !workload_imports.is_empty()
+                || secret_source.is_some(),
             "host component plugin '{id}' exports no capability functions to serve and imports \
              no interface for a workload to export"
         );
@@ -423,6 +459,7 @@ impl ComponentHostPlugin {
             supervisor: Mutex::new(None),
             registry: ArcSwapOption::empty(),
             bound: Mutex::new(BTreeMap::new()),
+            binding: Mutex::new(Default::default()),
             poison: Mutex::new(BTreeMap::new()),
             bind_trap_log: Mutex::new(Vec::new()),
             failure_sink: ArcSwapOption::empty(),
@@ -490,6 +527,8 @@ impl ComponentHostPlugin {
                     host_ref,
                     network: crate::host::ports::NetworkHandle::new(),
                     socket_policy,
+                    volumes,
+                    _volume_registration: Arc::new(volume_registration),
                 },
             },
             egress_policy,
@@ -497,6 +536,7 @@ impl ComponentHostPlugin {
             exports: Arc::new(exports),
             capability_funcs,
             lifecycle: lifecycle.map(Arc::new),
+            secret_source,
             max_restarts: DEFAULT_MAX_RESTARTS,
             state,
             _port_reservations: port_reservations,
@@ -590,7 +630,7 @@ impl ComponentHostPlugin {
             );
         }
 
-        let linker = item.linker();
+        let linker = item.linker()?;
         for exported in self.exports.iter() {
             let iface_names: Vec<&str> =
                 exported.wit.interfaces.iter().map(String::as_str).collect();
@@ -745,6 +785,8 @@ pub async fn load_component_plugin(
         .allowed_ip_name_lookups(Arc::clone(&spec.allowed_ip_name_lookups))
         .allowed_host_loopback_ports(Arc::clone(&spec.allowed_host_loopback_ports))
         .ports(Arc::clone(&spec.ports))
+        .volumes(Arc::clone(&spec.volumes))
+        .volume_mounts(Arc::clone(&spec.volume_mounts))
         .maybe_host_ref(host_ref)
         .socket_policy(socket_policy)
         .build()
@@ -800,6 +842,19 @@ impl HostPlugin for ComponentHostPlugin {
         self.state.failure_sink.store(Some(Arc::new(sink)));
     }
 
+    fn takes_plugin_secrets(&self) -> bool {
+        self.lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.takes_secrets)
+    }
+
+    fn secret_source(&self) -> Option<Arc<dyn crate::plugin::HostSecretSource>> {
+        self.secret_source.as_ref()?;
+        Some(Arc::new(ComponentSecretSource {
+            state: Arc::clone(&self.state),
+        }))
+    }
+
     async fn start(&self) -> anyhow::Result<()> {
         let (tx, rx) = tokio::sync::mpsc::channel(CAPABILITY_CHANNEL_CAPACITY);
         // Publish the sender and snapshot the bound workloads atomically (see
@@ -819,6 +874,7 @@ impl HostPlugin for ComponentHostPlugin {
             self.runtime.clone(),
             self.capability_funcs.clone(),
             self.lifecycle.clone(),
+            self.secret_source.clone(),
             Arc::clone(&self.state),
             self.max_restarts,
             replay,
@@ -839,10 +895,22 @@ impl HostPlugin for ComponentHostPlugin {
         interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
         let Some(lifecycle) = &self.lifecycle else {
+            if let Some(key) = interfaces
+                .iter()
+                .flat_map(|iface| &iface.config)
+                .find_map(|(key, value)| value.is_secret().then_some(key))
+            {
+                anyhow::bail!(
+                    "host component plugin '{}' exports no workload-lifecycle, so it cannot read \
+                     the secret in `{key}`",
+                    self.id
+                );
+            }
             return Ok(());
         };
-        let info = workload_info_val(workload, &interfaces);
+        let info = bind_info(self.id, workload, &interfaces, lifecycle.takes_secrets)?;
         let workload_id: Arc<str> = Arc::from(workload.id());
+        let lease = BindLease::acquire(&self.state, &workload_id)?;
         // Record the workload and read the current sender (as an incarnation
         // handle) under one `bound` lock: the supervisor swaps incarnations
         // under the same lock (see [`replay_snapshot`]), so this bind is either
@@ -877,8 +945,9 @@ impl HostPlugin for ComponentHostPlugin {
             &self.state,
             lifecycle,
             &lifecycle.bind,
-            info,
+            info.relocate(),
             &workload_id,
+            Some(info.generation.clone()),
         )
         .await
         {
@@ -898,14 +967,23 @@ impl HostPlugin for ComponentHostPlugin {
         // hook actually returns — guaranteeing bind-then-unbind ordering so
         // whatever it provisions late is still reclaimed (see
         // [`spawn_deferred_unbind`]).
-        let failure = match await_bind_reply(reply_rx, call, &self.state).await {
+        let failure = match await_bind_reply(reply_rx, call, &self.state, &info.generation).await {
             BindReply::Completed(Ok(results)) => match decode_bind_reply(&results) {
                 Ok(Ok(())) => {
                     debug!(id = self.id, %workload_id, "workload bound to host component plugin");
                     return Ok(());
                 }
-                Ok(Err(msg)) => anyhow::anyhow!(
-                    "host component plugin '{}' rejected workload '{workload_id}': {msg}",
+                Ok(Err(msg)) => {
+                    let msg = info.rejection_message(msg);
+                    anyhow::anyhow!(
+                        "host component plugin '{}' rejected workload '{workload_id}': {msg}",
+                        self.id
+                    )
+                }
+                // The error quotes the guest's payload.
+                Err(_) if info.has_secrets() => anyhow::anyhow!(
+                    "host component plugin '{}' returned a malformed on-workload-bind reply; \
+                     its payload is withheld because the bind carried secrets",
                     self.id
                 ),
                 Err(e) => anyhow::Error::from(e).context(format!(
@@ -919,12 +997,12 @@ impl HostPlugin for ComponentHostPlugin {
             )),
             BindReply::TimedOut(pending) => {
                 self.state.forget_workload(&workload_id);
-                spawn_deferred_unbind(
-                    sender_arc,
+                let _cleanup = spawn_deferred_unbind(
                     pending,
                     Arc::clone(&workload_id),
                     Arc::clone(lifecycle),
                     Arc::clone(&self.state),
+                    lease,
                 );
                 return Err(anyhow::anyhow!(
                     "on-workload-bind to host component plugin '{}' timed out; deploy failed, \
@@ -938,9 +1016,10 @@ impl HostPlugin for ComponentHostPlugin {
         // after the hook ran): the hook is no longer in flight, so roll back
         // immediately with a best-effort unbind.
         if let Err(e) = remove_and_unbind(&self.state, lifecycle, &workload_id).await {
-            warn!(id = self.id, %workload_id, err = %e, "post-failure unbind not delivered");
+            let err = info.scrub(e);
+            warn!(id = self.id, %workload_id, err = %format!("{err:#}"), "post-failure unbind not delivered");
         }
-        Err(failure)
+        Err(info.scrub(failure))
     }
 
     async fn on_workload_item_bind<'a>(
@@ -1047,10 +1126,7 @@ impl HostPlugin for ComponentHostPlugin {
                 .await
                 .is_err()
         {
-            // The supervisor is wedged (e.g. a driver hung on an in-flight call
-            // whose shim still holds a channel sender). Abort it so it cannot
-            // survive `stop()` and later — after a fresh `start()` — mistake the
-            // new incarnation for a fault and restart a duplicate store.
+            // The supervisor owns the driver, so aborting it also cancels the store.
             warn!(
                 id = self.id,
                 "host component plugin supervisor did not stop in time; aborting it"
@@ -1079,6 +1155,11 @@ fn is_base_wasi(wit: &WitInterface) -> bool {
 /// hook a workload gets, by representing the plugin as a synthetic
 /// single-component workload purely to reuse `bind_plugins`'s matching and
 /// rollback logic — never by writing `config` to a file the plugin reads.
+///
+/// Natives file that bind-time state under the synthetic workload's id, which
+/// is the plugin id. It cannot collide with a real workload's state because
+/// the host refuses to start a workload whose id is a registered plugin id
+/// (`Host::workload_reserve`).
 ///
 /// `native_plugins` must already exclude every [`ComponentHostPlugin`] (this
 /// plugin's own natural self-imports are handled separately, before this
@@ -1119,7 +1200,7 @@ async fn link_native_imports(
     let native_imports: Vec<WitInterface> = merged
         .into_values()
         .map(|mut wit| {
-            wit.config = config.clone();
+            wit.config = config.clone().into();
             wit
         })
         .collect();
@@ -1154,9 +1235,13 @@ async fn link_native_imports(
         UnresolvedWorkload::new(id, id, id, None, [plugin_component], native_imports);
     // No operator bindings: a plugin's own native imports are configured by the
     // plugin entry's `config`, delivered through `on-workload-bind`, not by a
-    // workload naming a binding.
+    // workload naming a binding. That config is the operator's, so it may set
+    // the keys a native plugin keeps from workloads under `deny`. It is also
+    // shared by every import, so no one native's closed schema can judge it.
+    let operator_config = crate::plugin::PluginBindings::new()
+        .with_default_workload_config(crate::plugin::WorkloadConfigPolicy::Allow);
     synthetic
-        .bind_plugins(native_plugins, &crate::plugin::PluginBindings::new())
+        .bind_plugins(native_plugins, &operator_config)
         .await
         .with_context(|| {
             format!("failed to resolve native capability imports for plugin '{id}'")
@@ -1166,38 +1251,47 @@ async fn link_native_imports(
         .take_component(&component_id)
         .context("plugin's own synthetic workload component vanished during binding")?;
     Ok(std::mem::replace(
-        plugin_component.metadata.linker(),
+        plugin_component.metadata.linker()?,
         Linker::new(engine.inner()),
     ))
 }
 
+/// The host-invoked exports a plugin may provide besides its capabilities.
+type HostInvokedExports = (Option<LifecycleFuncs>, Option<Arc<str>>);
+
 /// Partition a plugin component's exports: the reserved `wasmcloud:host`
-/// lifecycle interface is a host-invoked contract, while everything else is a
-/// capability workloads may import.
+/// lifecycle and secret-source interfaces are host-invoked contracts, while
+/// everything else is a capability workloads may import.
 fn introspect_capability_exports(
     id: &str,
     component: &Component,
-) -> anyhow::Result<(Vec<ExportedInterface>, Option<LifecycleFuncs>)> {
+) -> anyhow::Result<(Vec<ExportedInterface>, HostInvokedExports)> {
     let mut lifecycle = None;
+    let mut secret_source = None;
     let mut exports = Vec::new();
     for export in introspect_exports(component)? {
         if is_reserved(&export.wit) {
             // Matched by interface name, not the exact `export.name` string —
             // `wasmcloud:host` is versioned as one package, so a patch bump
             // anywhere in it must not break a plugin built against the
-            // previous patch version of `workload-lifecycle` it already
-            // exports.
-            anyhow::ensure!(
-                export.wit.interfaces.contains(HOST_LIFECYCLE_EXPORT),
-                "host component plugin '{id}' exports reserved host interface {}",
-                export.name
-            );
-            lifecycle = Some(lifecycle_funcs(id, export)?);
+            // previous patch version of an interface it already exports.
+            if export.wit.interfaces.contains(HOST_LIFECYCLE_EXPORT) {
+                let takes_secrets = imports_binding_secrets(component);
+                lifecycle = Some(lifecycle_funcs(id, export, takes_secrets)?);
+            } else if export.wit.interfaces.contains(HOST_SECRET_SOURCE_EXPORT) {
+                check_secret_source_export(id, &export)?;
+                secret_source = Some(export.name);
+            } else {
+                anyhow::bail!(
+                    "host component plugin '{id}' exports reserved host interface {}",
+                    export.name
+                );
+            }
         } else {
             exports.push(export);
         }
     }
-    Ok((exports, lifecycle))
+    Ok((exports, (lifecycle, secret_source)))
 }
 
 /// Whether an import is already accounted for by something other than a
@@ -1248,6 +1342,7 @@ fn classify_workload_imports(
     component: &Component,
     exports: &[ExportedInterface],
     native_plugins: &HashMap<&'static str, Arc<dyn HostPlugin>>,
+    payloads: &crate::engine::stream_payload::StreamPayloads,
 ) -> anyhow::Result<Vec<ExportedInterface>> {
     let imports = introspect_imports(component)?;
     if !declares_workload_calls(&imports) {
@@ -1286,11 +1381,16 @@ fn classify_workload_imports(
         // that exports the interface.
         for func in &imported.funcs {
             anyhow::ensure!(
-                crate::engine::linked_call::types_are_bridge_safe(&func.param_tys)
-                    && crate::engine::linked_call::types_are_bridge_safe(&func.result_tys),
+                crate::engine::linked_call::types_are_bridge_safe(&func.param_tys, payloads)
+                    && crate::engine::linked_call::types_are_bridge_safe(
+                        &func.result_tys,
+                        payloads
+                    ),
                 "host component plugin '{id}' imports {}#{} for a workload to export, but its \
                  signature carries a handle that cannot cross the boundary between a plugin's \
-                 store and a workload's; only plain values, `stream<T>`, and `future<T>` can",
+                 store and a workload's; only plain values, `stream<T>`, and `future<T>` can; \
+                 a `stream<T>`/`future<T>` of an application-defined payload needs \
+                 `Engine::stream_payloads().register`",
                 imported.name,
                 func.name
             );
@@ -1322,8 +1422,8 @@ fn classify_workload_imports(
 /// This is the single place that declares the plugin's whole import surface:
 ///
 /// - the WASI (and `wasi:http`) base, from [`Engine::prepare_host_component`];
-/// - the `wasmcloud:host` identity/cancel/workload imports (unused unless the
-///   plugin imports them);
+/// - the `wasmcloud:host` identity/cancel/workload/binding-secrets imports
+///   (unused unless the plugin imports them);
 /// - a route back to the plugin's own capability channel for any interface it
 ///   both imports and exports (a self-import);
 /// - a route out to a workload's export for every import
@@ -1348,6 +1448,8 @@ async fn build_plugin_linker(
         .with_context(|| format!("failed to install host cancel on plugin '{id}'"))?;
     install_host_workload(&mut linker, state)
         .with_context(|| format!("failed to install host workload targeting on plugin '{id}'"))?;
+    install_host_binding_secrets(&mut linker, state)
+        .with_context(|| format!("failed to install host binding secrets on plugin '{id}'"))?;
 
     let mut linked = std::collections::HashSet::new();
     for imported in introspect_imports(component)? {
@@ -1418,9 +1520,9 @@ fn caller_root_task(store: &mut StoreContextMut<'_, SharedCtx>) -> Option<GuestT
     }
 }
 
-/// Install the `wasmcloud:host/identity` import on the plugin's own linker: two
-/// no-argument funcs returning the workload/component id of the caller whose
-/// capability call is currently running. Each walks its async call stack back to
+/// Install the `wasmcloud:host/identity` import on the plugin's own linker:
+/// no-argument funcs describing the caller whose capability call is currently
+/// running (its workload, component and binding). Each walks its async call stack back to
 /// the root export task and looks that task up in the current incarnation's
 /// [`JobRegistry`], so the answer is exact even while calls from other workloads
 /// interleave. A plugin that imports the interface can thereby partition its state
@@ -1441,7 +1543,7 @@ fn install_host_identity(
                 let root = caller_root_task(&mut store);
                 let id = root
                     .and_then(|task| workload_state.registry()?.caller_for_task(task))
-                    .map(|c| c.workload_id.to_string())
+                    .and_then(|c| Some(c.workload()?.workload_id.to_string()))
                     .unwrap_or_default();
                 if let Some(slot) = results.first_mut() {
                     *slot = Val::String(id);
@@ -1466,7 +1568,7 @@ fn install_host_identity(
                 // ask who is calling.
                 let id = root
                     .and_then(|task| component_state.registry()?.caller_for_task(task))
-                    .and_then(|c| c.component_id.clone())
+                    .and_then(|c| c.workload()?.component_id.clone())
                     .map(|id| id.to_string())
                     .unwrap_or_default();
                 if let Some(slot) = results.first_mut() {
@@ -1486,7 +1588,7 @@ fn install_host_identity(
                 // and that is the common case rather than a degradation.
                 let binding = root
                     .and_then(|task| binding_state.registry()?.caller_for_task(task))
-                    .and_then(|c| c.binding)
+                    .and_then(|c| c.workload()?.binding.clone())
                     .map(|name| Box::new(Val::String(name.to_string())));
                 if let Some(slot) = results.first_mut() {
                     *slot = Val::Option(binding);
@@ -1496,6 +1598,137 @@ fn install_host_identity(
         )
         .map_err(|e| e.context("failed to define wasmcloud:host/identity#get-binding-name"))?;
     Ok(())
+}
+
+/// Interface name of the host import a plugin reads its bindings' secrets
+/// through, and its bare name, matched against the plugin's imports.
+const HOST_BINDING_SECRETS_INTERFACE: &str = "wasmcloud:host/binding-secrets@0.1.6";
+const HOST_BINDING_SECRETS: &str = "binding-secrets";
+
+/// Whether the plugin imports `wasmcloud:host/binding-secrets`, read from its
+/// import names alone.
+fn imports_binding_secrets(component: &Component) -> bool {
+    component
+        .component_type()
+        .imports(component.engine())
+        .any(|(name, _)| {
+            let wit = WitInterface::from(name);
+            is_reserved(&wit) && wit.interfaces.contains(HOST_BINDING_SECRETS)
+        })
+}
+
+/// Install the `wasmcloud:host/binding-secrets` import on the plugin's own
+/// linker. `get` answers only inside `on-workload-bind`: the caller's root
+/// task must be a lifecycle call, which carries no component, for a workload
+/// still in `bound`. A plugin that does not import it leaves it unused.
+fn install_host_binding_secrets(
+    linker: &mut Linker<SharedCtx>,
+    state: &Arc<ComponentHostPluginState>,
+) -> anyhow::Result<()> {
+    let mut instance = linker
+        .instance(HOST_BINDING_SECRETS_INTERFACE)
+        .map_err(|e| e.context("failed to open the host binding-secrets linker instance"))?;
+    let state = Arc::clone(state);
+    instance
+        .func_new("get", move |mut store, _ty, params, results| {
+            let (namespace, package, name) = match params {
+                [
+                    Val::String(namespace),
+                    Val::String(package),
+                    Val::Option(name),
+                ] => {
+                    let name = match name.as_deref() {
+                        None => None,
+                        Some(Val::String(name)) => Some(name.as_str()),
+                        Some(_) => wasmtime::bail!("binding-secrets#get expects an option<string>"),
+                    };
+                    (namespace.as_str(), package.as_str(), name)
+                }
+                _ => wasmtime::bail!("binding-secrets#get expects a namespace, package and name"),
+            };
+            let caller = caller_root_task(&mut store)
+                .and_then(|task| state.registry()?.caller_for_task(task));
+            let result = bound_secrets_for_caller(
+                &state,
+                caller.as_ref(),
+                namespace,
+                package,
+                name,
+                |secrets| binding_secret_handles(&mut store, secrets),
+            )
+            .map(|handles| Some(Box::new(Val::List(handles))))
+            .map_err(|message| Some(Box::new(Val::String(message))));
+            if let Some(slot) = results.first_mut() {
+                *slot = Val::Result(result);
+            }
+            Ok(())
+        })
+        .map_err(|e| e.context("failed to define wasmcloud:host/binding-secrets#get"))?;
+    Ok(())
+}
+
+fn binding_secret_handles(
+    store: &mut StoreContextMut<'_, SharedCtx>,
+    secrets: &[(String, crate::plugin::SecretValue)],
+) -> Result<Vec<Val>, String> {
+    let mut handles = Vec::with_capacity(secrets.len());
+    for (key, value) in secrets {
+        match secret_handle(store.as_context_mut(), value) {
+            Ok(handle) => handles.push((key.clone(), handle)),
+            Err(_) => {
+                for (_, value) in handles {
+                    if let Val::Resource(handle) = value
+                        && let Ok(resource) = handle
+                            .try_into_resource::<crate::plugin::wasmcloud_secrets::SecretState>(
+                                store.as_context_mut(),
+                            )
+                    {
+                        let _ = store.data_mut().table.delete(resource);
+                    }
+                }
+                return Err("unable to allocate binding secret handles".to_string());
+            }
+        }
+    }
+    Ok(handles
+        .into_iter()
+        .map(|(key, handle)| Val::Tuple(vec![Val::String(key), handle]))
+        .collect())
+}
+
+/// `read` applied, under the `bound` lock, to the secrets of `caller`'s
+/// binding of `namespace:package` labeled `name`, or why there are none to
+/// hand over.
+fn bound_secrets_for_caller<T>(
+    state: &ComponentHostPluginState,
+    caller: Option<&CallerIdentity>,
+    namespace: &str,
+    package: &str,
+    name: Option<&str>,
+    read: impl FnOnce(&[(String, crate::plugin::SecretValue)]) -> Result<T, String>,
+) -> Result<T, String> {
+    let (workload_id, generation) = match caller.and_then(CallerIdentity::workload) {
+        Some(workload) if workload.bind_generation.is_some() => {
+            (&workload.workload_id, workload.bind_generation.as_ref())
+        }
+        _ => return Err("binding-secrets answers only inside on-workload-bind".to_string()),
+    };
+    let bound = state
+        .bound
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(info) = bound.get(workload_id).filter(|info| {
+        generation.is_some_and(|generation| generation.authorizes(&info.generation))
+    }) else {
+        return Err(format!("workload {workload_id} is not being bound"));
+    };
+    let Some(secrets) = info.secrets(namespace, package, name) else {
+        let label = name.map(|n| format!(" labeled {n}")).unwrap_or_default();
+        return Err(format!(
+            "workload {workload_id} has no binding of {namespace}:{package}{label}"
+        ));
+    };
+    read(secrets)
 }
 
 /// Interface name of the host cancel import a plugin may use to cancel one of its
@@ -1716,13 +1949,14 @@ async fn route_capability_call(
         |mut access| -> wasmtime::Result<(CallerIdentity, Vec<Relocated>)> {
             let caller = {
                 let ctx = &access.data_mut().active_ctx;
-                CallerIdentity {
+                CallerIdentity::Workload(WorkloadCaller {
+                    bind_generation: None,
                     workload_id: Arc::clone(&ctx.workload_id),
                     component_id: Some(Arc::clone(&ctx.component_id)),
                     // Fixed when the shim was installed, not read from the
                     // call, so nothing the guest passes can influence it.
                     binding,
-                }
+                })
             };
             let mut dones = Vec::new();
             let mut out = Vec::with_capacity(params.len());
@@ -1792,10 +2026,12 @@ async fn route_capability_call(
 /// TriggerService, and await the driver. A clean shutdown (the sender cleared by
 /// `stop()`) exits; a fault restarts up to `max_restarts` times, handing each
 /// new incarnation a fresh channel whose sender the installed shims pick up.
+#[allow(clippy::too_many_arguments)]
 async fn run_supervisor(
     runtime: PluginRuntime,
     funcs: Vec<CapabilityFunc>,
     lifecycle: Option<Arc<LifecycleFuncs>>,
+    secret_source: Option<Arc<str>>,
     state: Arc<ComponentHostPluginState>,
     max_restarts: u32,
     mut replay: Vec<LifecycleReplay>,
@@ -1805,7 +2041,7 @@ async fn run_supervisor(
     loop {
         // Installs this incarnation's virtual network on the handle, which is
         // how a listener published before this incarnation existed finds it.
-        let store = build_plugin_store(
+        let mut store = build_plugin_store(
             &runtime.engine,
             state.id,
             &state.native_plugins,
@@ -1833,13 +2069,24 @@ async fn run_supervisor(
             rx,
             registry,
             replay: std::mem::take(&mut replay),
+            secret_source: secret_source.clone(),
         };
-        let trigger_service = TriggerService::spawn(store, runtime.pre.clone(), vec![ingress]);
-
-        // The driver runs until the capability channel closes (clean shutdown)
-        // or the store faults (e.g. a guest trap).
+        // The supervisor owns the store through driver shutdown and cancellation.
         let started = tokio::time::Instant::now();
-        let _ = trigger_service.driver.await;
+        match AssertUnwindSafe(run_trigger_driver(
+            &mut store,
+            &runtime.pre,
+            vec![ingress],
+            CliRunError::Logged,
+        ))
+        .catch_unwind()
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!(id = state.id, err = ?e, "trigger service driver faulted"),
+            Err(_) => error!(id = state.id, "trigger service driver panicked"),
+        }
+        drop(store);
         let uptime = started.elapsed();
 
         // `stop()` clears the sender; if it is gone, this was a clean shutdown.
@@ -1987,14 +2234,13 @@ fn build_plugin_store(
     // its sockets registered, so reusing one would fail the next incarnation's
     // bind with `AddressInUse`.
     let loopback = store_context.network.replace();
-    let sockets_ctx = crate::sockets::WasiSocketsCtx {
-        socket_addr_check: crate::sockets::SocketAddrCheck::new(move |addr, reason| {
-            policy.decide(reason, addr)
-        }),
+    // The policy is reused by every incarnation; the lookup history
+    // `for_store` allocates is this incarnation's alone.
+    let sockets_ctx = crate::sockets::WasiSocketsCtx::for_store(
+        policy,
         loopback,
-        allowed_ip_name_lookups: Arc::clone(&store_context.allowed_ip_name_lookups),
-        ..Default::default()
-    };
+        Arc::clone(&store_context.allowed_ip_name_lookups),
+    );
 
     let mut ctx_builder = Ctx::builder(id, id)
         .with_plugins(
@@ -2008,7 +2254,10 @@ fn build_plugin_store(
     if let Some(host) = &store_context.host_ref {
         ctx_builder = ctx_builder.with_host(host);
     }
-    let ctx = ctx_builder.build();
+    let mut ctx = ctx_builder.build();
+    // The handles pinned at load, handed over the way a workload's store gets
+    // its volume mounts.
+    ctx.volume_mounts = store_context.volumes.to_vec();
     // The registry marks this as the plugin (real) side of the resource bridge
     // and keeps the resources it hands out across the boundary alive.
     // A host component plugin is a guest too: its linear memory is charged to
@@ -2019,21 +2268,77 @@ fn build_plugin_store(
             .with_resource_registry()
             .with_guest_memory(engine.guest_memory()),
     );
-    // The other half of the same requirement: on a fuel-metering engine a store
-    // starts with no fuel, and calling a guest without fuel traps. See
-    // `new_store_from_templates`, which does this for every workload store.
-    let _ = store.set_fuel(u64::MAX);
-    // Required, not optional: the engine enables `epoch_interruption`, and a
-    // store that never sets a deadline traps the moment it runs any guest code.
+    store.data_mut().stream_payloads = engine.stream_payloads().clone();
     // `WarnThenTrap` because this one store serves every workload that imports
     // the plugin's capability: an abandoned call gets a long runway to finish
     // on its own before ending it costs every tenant a supervised restart.
-    crate::engine::abandon::arm_epoch_deadline(
+    crate::engine::store_settings::configure_store(
         &mut store,
+        engine.store_settings,
         crate::engine::abandon::AbandonedCallPolicy::WarnThenTrap,
     );
-    crate::engine::guest_memory::install_memory_limiter(&mut store);
     store
+}
+
+/// A plugin's volumes, resolved at load.
+struct ResolvedPluginVolumes {
+    /// What each incarnation of the plugin mounts.
+    mounts: Arc<[ResolvedVolumeMount]>,
+    /// Keeps workloads out while the plugin loads or uses the mounts.
+    registration: crate::engine::volumes::PluginVolumeRegistration,
+}
+
+/// Resolve a plugin's declared volumes once, at load: a declaration that cannot
+/// work fails the host's start naming the plugin, rather than failing every
+/// incarnation the supervisor starts. Each mounted directory is opened here and
+/// its handle kept, so what was checked is what every incarnation mounts.
+///
+/// A volume no mount uses is not opened: the plugin cannot see it.
+async fn resolve_plugin_volumes(
+    id: &str,
+    volumes: &[Volume],
+    volume_mounts: &[VolumeMount],
+    host_paths: &HostPathPolicy,
+) -> anyhow::Result<ResolvedPluginVolumes> {
+    let owner = format!("host component plugin '{id}'");
+    crate::plugin::component_plugin_spec::validate_plugin_volumes(volumes, volume_mounts, &owner)?;
+
+    let mounted: BTreeSet<&str> = volume_mounts.iter().map(|m| m.name.as_str()).collect();
+    let mut to_open = Vec::with_capacity(mounted.len());
+    for volume in volumes {
+        let local_path = crate::plugin::component_plugin_spec::plugin_host_path(volume, &owner)?;
+        if mounted.contains(volume.name.as_str()) {
+            to_open.push((volume.name.clone(), std::path::PathBuf::from(local_path)));
+        } else {
+            warn!(
+                plugin = id,
+                volume = %volume.name,
+                "host component plugin declares a volume no volumeMount uses; it is not opened"
+            );
+        }
+    }
+
+    let policy = host_paths.clone();
+    let open_owner = owner.clone();
+    let (opened, registration) =
+        tokio::task::spawn_blocking(move || policy.open_plugin_volumes(to_open, &open_owner))
+            .await??;
+
+    let mounts = volume_mounts
+        .iter()
+        .map(|mount| {
+            // Validation checked every mount names a declared volume, and every
+            // mounted volume was opened, so this does not fail.
+            let dir = opened.get(mount.name.as_str()).ok_or_else(|| {
+                anyhow::anyhow!("{owner}: volume '{}' was not opened", mount.name)
+            })?;
+            ResolvedVolumeMount::from_opened(dir, mount)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(ResolvedPluginVolumes {
+        mounts: mounts.into(),
+        registration,
+    })
 }
 
 fn component_plugin_socket_policy(
@@ -2063,9 +2368,38 @@ fn introspect_exports(component: &Component) -> anyhow::Result<Vec<ExportedInter
 /// Introspect a plugin component's *imported* interfaces and their functions.
 /// Used to wire self-imports (an interface the plugin both imports and exports)
 /// back to the plugin's own capability channel.
+///
+/// Imports that define only types are left out (see [`is_type_only`]),
+/// so no caller mistakes one for a capability or a workload callback.
 fn introspect_imports(component: &Component) -> anyhow::Result<Vec<ExportedInterface>> {
+    let engine = component.engine();
     let ty = component.component_type();
-    introspect_interfaces(component, ty.imports(component.engine()))
+    introspect_interfaces(
+        component,
+        ty.imports(engine)
+            .filter(|(_, item)| !is_type_only(engine, item)),
+    )
+}
+
+/// Whether an imported instance defines types and nothing else.
+///
+/// Wasmtime needs no definition for such an import,
+/// so it needs no provider either.
+/// Linking an empty instance for it anyway could shadow
+/// a native's semver-compatible version of the same interface
+/// that another import needs functions from.
+///
+/// An empty instance is not type-only:
+/// a marker interface still names a capability.
+fn is_type_only(
+    engine: &wasmtime::Engine,
+    item: &wasmtime::component::types::ComponentExtern<'_>,
+) -> bool {
+    let ComponentItem::ComponentInstance(instance) = &item.ty else {
+        return false;
+    };
+    let mut exports = instance.exports(engine).peekable();
+    exports.peek().is_some() && exports.all(|(_, item)| matches!(item.ty, ComponentItem::Type(_)))
 }
 
 /// Collect the capability interfaces (and their functions and resource types)
@@ -2128,6 +2462,11 @@ fn introspect_interfaces<'a>(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod type_import_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -2137,6 +2476,63 @@ mod tests {
     use super::*;
     use crate::host::allowed_loopback::AllowedLoopbackPort;
     use crate::sockets::{AddrDecision, DenyReason, Plane, SocketAddrUse};
+    use crate::types::{HostPathVolume, VolumeType};
+
+    /// A registration that keeps no directory closed, for stores built by hand.
+    fn no_volume_registration() -> Arc<crate::engine::volumes::PluginVolumeRegistration> {
+        let (_, registration) = HostPathPolicy::default()
+            .open_plugin_volumes(Vec::new(), "test plugin")
+            .unwrap();
+        Arc::new(registration)
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_plugin_stop_releases_its_store() -> anyhow::Result<()> {
+        let wasm = wat::parse_str(
+            r#"(component
+          (core module $m
+            (func (export "f") (result i32) i32.const 0)
+            (func (export "callback") (param i32 i32 i32) (result i32) i32.const 0))
+          (core instance $m (instantiate $m))
+          (func $f async (canon lift (core func $m "f") async
+            (callback (core func $m "callback"))))
+          (instance $api (export "f" (func $f)))
+          (export "test:probe/api@0.1.0" (instance $api)))"#,
+        )?;
+        let plugin = ComponentHostPlugin::builder()
+            .id("supervisor-cancellation")
+            .wasm(&wasm)
+            .engine(Engine::builder().with_pooling_allocator(false).build()?)
+            .build()
+            .await?;
+        plugin.start().await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while plugin.state.registry.load_full().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let network = Arc::downgrade(
+            &plugin
+                .runtime
+                .store
+                .network
+                .current()
+                .context("plugin network missing")?,
+        );
+        // An in-flight caller can keep the driver's channel open during stop.
+        let _incarnation = plugin.state.sender_arc().context("plugin sender missing")?;
+        plugin.stop().await?;
+        drop(plugin);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while network.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("a detached driver retained the plugin store")?;
+        Ok(())
+    }
 
     #[test]
     fn plugin_loopback_grant_is_applied_without_widening_the_host_gate() {
@@ -2185,6 +2581,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugin_store_applies_the_engine_hostcall_fuel() {
+        let engine = Engine::builder()
+            .with_hostcall_fuel(std::num::NonZeroUsize::new(4096).unwrap())
+            .build()
+            .unwrap();
+        let store_context = PluginStoreContext {
+            allowed_hosts: Arc::from([]),
+            allowed_ip_name_lookups: Arc::from([]),
+            host_ref: None,
+            network: crate::host::ports::NetworkHandle::new(),
+            socket_policy: Arc::default(),
+            volumes: Arc::from([]),
+            _volume_registration: no_volume_registration(),
+        };
+        let store = build_plugin_store(
+            &engine,
+            "hostcall-fuel-plugin",
+            &HashMap::new(),
+            &store_context,
+        );
+        assert_eq!(store.hostcall_fuel(), 4096);
+        assert_eq!(store.data().store_settings, engine.store_settings);
+    }
+
+    #[tokio::test]
     async fn plugin_store_enforces_its_loopback_and_udp_policy() {
         let engine = Engine::builder().build().unwrap();
         let allowed_hosts = Arc::from([]);
@@ -2207,6 +2628,8 @@ mod tests {
             host_ref: None,
             network: crate::host::ports::NetworkHandle::new(),
             socket_policy: policy,
+            volumes: Arc::from([]),
+            _volume_registration: no_volume_registration(),
         };
         let mut store = build_plugin_store(
             &engine,
@@ -2297,11 +2720,14 @@ mod tests {
             bind: Some("192.0.2.10".parse().unwrap()),
         }]);
 
+        // kv-plugin reads its bindings' secrets as `wasmcloud:secrets` handles.
+        let secrets: Arc<dyn HostPlugin> =
+            Arc::new(crate::plugin::wasmcloud_secrets::WasmcloudSecrets::new());
         let plugin = load_component_plugin(
             &spec,
             &engine,
             crate::oci::OciConfig::default(),
-            &HashMap::new(),
+            &HashMap::from([(secrets.id(), secrets)]),
             None,
             Some(host_policy),
         )
@@ -2395,6 +2821,40 @@ mod tests {
             _interfaces: WitInterfaces<'_>,
         ) -> anyhow::Result<()> {
             *self.seen_id.lock().unwrap() = Some(item.id().to_string());
+            Ok(())
+        }
+    }
+
+    /// Claims `url` for the operator, as the multiplexed builtins do, and
+    /// records the config it was bound with.
+    #[derive(Default)]
+    struct HostOwnedUrlPlugin {
+        seen_config: Mutex<Option<crate::wit::Config>>,
+    }
+
+    #[async_trait]
+    impl HostPlugin for HostOwnedUrlPlugin {
+        fn id(&self) -> &'static str {
+            "host-owned-url-test-plugin"
+        }
+
+        fn world(&self) -> WitWorld {
+            WitWorld {
+                imports: HashSet::from([WitInterface::from("test:probe/marker@0.1.0")]),
+                exports: HashSet::new(),
+            }
+        }
+
+        fn binding_schema(&self) -> crate::plugin::BindingSchema {
+            crate::plugin::BindingSchema::with_host_owned_keys(["url"])
+        }
+
+        async fn on_workload_item_bind<'a>(
+            &self,
+            _item: &mut WorkloadItem<'a>,
+            interfaces: WitInterfaces<'_>,
+        ) -> anyhow::Result<()> {
+            *self.seen_config.lock().unwrap() = interfaces.iter().next().map(|i| i.config.clone());
             Ok(())
         }
     }
@@ -2519,12 +2979,16 @@ mod tests {
         let recorder = Arc::new(IdRecordingPlugin::default());
         let native_plugins: HashMap<&'static str, Arc<dyn HostPlugin>> =
             HashMap::from([(recorder.id(), recorder as Arc<dyn HostPlugin>)]);
-        Ok(
-            classify_workload_imports("test-plugin", &component, exports, &native_plugins)?
-                .into_iter()
-                .map(|imported| imported.name.to_string())
-                .collect(),
-        )
+        Ok(classify_workload_imports(
+            "test-plugin",
+            &component,
+            exports,
+            &native_plugins,
+            &Default::default(),
+        )?
+        .into_iter()
+        .map(|imported| imported.name.to_string())
+        .collect())
     }
 
     /// The `wasmcloud:host/workload-call` import every opted-in plugin
@@ -2718,6 +3182,167 @@ mod tests {
         );
     }
 
+    fn secret_bind_info(value: &str) -> BindInfo {
+        let workload = UnresolvedWorkload::new(
+            "same-workload",
+            "test",
+            "test",
+            None,
+            std::iter::empty::<crate::engine::workload::WorkloadComponent>(),
+            Vec::new(),
+        );
+        let mut interface = WitInterface::from("acme:kv/store@0.1.0");
+        interface
+            .config
+            .insert("password", crate::plugin::SecretValue::new(value));
+        let interfaces = HashSet::from([interface]);
+        bind_info("test", &workload, &WitInterfaces::new(&interfaces), true).unwrap()
+    }
+
+    #[test]
+    fn binding_secrets_reject_a_stale_generation_for_the_same_workload() {
+        let state = idle_state("test");
+        let old = secret_bind_info("old-password");
+        let current = secret_bind_info("new-password");
+        let caller = |info: &BindInfo| {
+            CallerIdentity::Workload(WorkloadCaller {
+                workload_id: Arc::from("same-workload"),
+                component_id: None,
+                binding: None,
+                bind_generation: Some(info.generation.clone()),
+            })
+        };
+        state
+            .bound
+            .lock()
+            .unwrap()
+            .insert(Arc::from("same-workload"), old.clone());
+        let read = |caller: &CallerIdentity| {
+            bound_secrets_for_caller(&state, Some(caller), "acme", "kv", None, |s| Ok(s.to_vec()))
+        };
+        assert!(read(&caller(&old)).is_ok());
+        let mut expired = caller(&old);
+        if let CallerIdentity::Workload(caller) = &mut expired {
+            caller.bind_generation = Some(old.generation.for_call(Duration::ZERO));
+        }
+        assert!(read(&expired).is_err());
+        old.generation.revoke();
+        assert!(read(&caller(&old)).is_err());
+        state
+            .bound
+            .lock()
+            .unwrap()
+            .insert(Arc::from("same-workload"), current.clone());
+        assert!(read(&caller(&old)).is_err());
+        let secrets = read(&caller(&current)).unwrap();
+        assert_eq!(secrets.first().unwrap().1.expose(), Some("new-password"));
+        let mut unbind = caller(&current);
+        if let CallerIdentity::Workload(caller) = &mut unbind {
+            caller.bind_generation = None;
+        }
+        assert!(read(&unbind).is_err());
+    }
+
+    #[tokio::test]
+    async fn deferred_cleanup_reserves_the_workload_until_unbind_returns() {
+        let state = idle_state("test");
+        let workload_id = Arc::from("same-workload");
+        let (sender, mut jobs) = tokio::sync::mpsc::channel(1);
+        state.tx.store(Some(Arc::new(sender)));
+        let lease = BindLease::acquire(&state, &workload_id).unwrap();
+        let lifecycle = Arc::new(LifecycleFuncs {
+            interface: Arc::from("wasmcloud:host/workload-lifecycle@0.1.6"),
+            bind: one_func_interface("lifecycle", "on-workload-bind", true)
+                .funcs
+                .remove(0),
+            unbind: one_func_interface("lifecycle", "on-workload-unbind", true)
+                .funcs
+                .remove(0),
+            takes_secrets: true,
+        });
+        let (reply, pending) = tokio::sync::oneshot::channel();
+        let cleanup = spawn_deferred_unbind(
+            pending,
+            Arc::clone(&workload_id),
+            lifecycle,
+            Arc::clone(&state),
+            lease,
+        );
+        assert!(BindLease::acquire(&state, &workload_id).is_err());
+        assert!(jobs.try_recv().is_err());
+        assert!(reply.send(Ok(Vec::new())).is_ok());
+        let job = tokio::time::timeout(Duration::from_secs(1), jobs.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let CapabilityJob::Call(call) = job else {
+            panic!("expected an unbind");
+        };
+        assert_eq!(call.func.as_ref(), "on-workload-unbind");
+        assert!(BindLease::acquire(&state, &workload_id).is_err());
+        assert!(call.reply.send(Ok(Vec::new())).is_ok());
+        cleanup.await.unwrap();
+        assert!(BindLease::acquire(&state, &workload_id).is_ok());
+    }
+
+    #[test]
+    fn revoked_bind_is_excluded_from_replay() {
+        let state = idle_state("test");
+        let info = secret_bind_info("password");
+        let lifecycle = LifecycleFuncs {
+            interface: Arc::from("lifecycle"),
+            bind: one_func_interface("lifecycle", "on-workload-bind", true)
+                .funcs
+                .remove(0),
+            unbind: one_func_interface("lifecycle", "on-workload-unbind", true)
+                .funcs
+                .remove(0),
+            takes_secrets: true,
+        };
+        state
+            .bound
+            .lock()
+            .unwrap()
+            .insert(Arc::from("same-workload"), info.clone());
+        assert_eq!(
+            replay_snapshot(&state.bound.lock().unwrap(), Some(&lifecycle)).len(),
+            1
+        );
+        info.generation.revoke();
+        assert!(replay_snapshot(&state.bound.lock().unwrap(), Some(&lifecycle)).is_empty());
+        assert!(
+            !info
+                .rejection_message("password".to_string())
+                .contains("password")
+        );
+    }
+
+    #[test]
+    fn binding_secret_allocation_failure_releases_partial_handles() {
+        let engine = Engine::builder().build().unwrap();
+        let mut store = Store::new(
+            engine.inner(),
+            SharedCtx::new(Ctx::builder("test", "test").build()),
+        );
+        store.data_mut().table.set_max_capacity(1);
+        let secrets = vec![
+            (
+                "first".to_string(),
+                crate::plugin::SecretValue::new("first-password"),
+            ),
+            (
+                "second".to_string(),
+                crate::plugin::SecretValue::new("second-password"),
+            ),
+        ];
+        let error = binding_secret_handles(&mut store.as_context_mut(), &secrets).unwrap_err();
+        assert!(!error.contains("password"));
+        assert!(
+            store.data_mut().table.push(()).is_ok(),
+            "partial handles must be released"
+        );
+    }
+
     /// A plugin's own state, with nothing running — enough to install linker
     /// shims, which is all the workload-facing import tests need.
     pub(super) fn idle_state(id: &'static str) -> Arc<ComponentHostPluginState> {
@@ -2727,6 +3352,7 @@ mod tests {
             supervisor: Mutex::new(None),
             registry: ArcSwapOption::empty(),
             bound: Mutex::new(BTreeMap::new()),
+            binding: Mutex::new(Default::default()),
             poison: Mutex::new(BTreeMap::new()),
             bind_trap_log: Mutex::new(Vec::new()),
             failure_sink: ArcSwapOption::empty(),
@@ -2835,5 +3461,380 @@ mod tests {
             Some(plugin_id),
             "native plugin must see the plugin's own id, not a synthetic bind-time UUID"
         );
+    }
+
+    /// A plugin entry's `config` is the operator's, so it reaches a native
+    /// import even where that native keeps the key from workloads.
+    #[tokio::test]
+    async fn a_plugins_own_config_sets_keys_a_native_keeps_from_workloads() {
+        let wat = r#"
+            (component
+                (import "test:probe/marker@0.1.0" (instance))
+            )
+        "#;
+        let wasm = wat::parse_str(wat).expect("failed to parse WAT");
+        let engine = Engine::builder().build().expect("failed to build engine");
+        let component = Component::new(engine.inner(), &wasm).expect("failed to compile");
+
+        let native = Arc::new(HostOwnedUrlPlugin::default());
+        let native_plugins: HashMap<&'static str, Arc<dyn HostPlugin>> =
+            HashMap::from([(native.id(), Arc::clone(&native) as Arc<dyn HostPlugin>)]);
+        let config = HashMap::from([("url".to_string(), "redis://cache:6379".to_string())]);
+
+        link_native_imports(
+            &engine,
+            "host-owned-url-test-plugin-instance",
+            &component,
+            Linker::new(engine.inner()),
+            &HashSet::new(),
+            &native_plugins,
+            &config,
+        )
+        .await
+        .expect("the plugin's own config is operator config");
+
+        assert_eq!(
+            native.seen_config.lock().unwrap().clone(),
+            Some(config.into())
+        );
+    }
+
+    fn host_path(name: &str, path: &std::path::Path) -> Volume {
+        Volume {
+            name: name.to_string(),
+            volume_type: VolumeType::HostPath(HostPathVolume {
+                local_path: path.to_string_lossy().into_owned(),
+            }),
+        }
+    }
+
+    fn mount(name: &str, mount_path: &str, read_only: bool) -> VolumeMount {
+        VolumeMount {
+            name: name.to_string(),
+            mount_path: mount_path.to_string(),
+            read_only,
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_volumes_resolve_to_one_mount_each() {
+        let models = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let resolved = resolve_plugin_volumes(
+            "vol",
+            &[
+                host_path("models", models.path()),
+                host_path("cache", cache.path()),
+            ],
+            &[
+                mount("models", "/models", true),
+                mount("cache", "/cache/", false),
+            ],
+            &HostPathPolicy::default(),
+        )
+        .await
+        .expect("both volumes resolve")
+        .mounts;
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].mount_path(), "/models");
+        assert_eq!(resolved[1].mount_path(), "/cache");
+    }
+
+    #[tokio::test]
+    async fn a_plugin_volume_mounts_at_two_paths_or_none() {
+        let models = tempfile::tempdir().unwrap();
+        let unused = tempfile::tempdir().unwrap();
+        let resolved = resolve_plugin_volumes(
+            "vol",
+            &[
+                host_path("models", models.path()),
+                host_path("unused", unused.path()),
+            ],
+            &[
+                mount("models", "/models", true),
+                mount("models", "/rw", false),
+            ],
+            &HostPathPolicy::default(),
+        )
+        .await
+        .expect("one volume at two paths, and a volume nothing mounts, both resolve")
+        .mounts;
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].mount_path(), "/models");
+        assert_eq!(resolved[1].mount_path(), "/rw");
+    }
+
+    #[tokio::test]
+    async fn plugin_volumes_skip_the_allowlist_but_not_reserved_paths() {
+        let scratch = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let meters = Arc::new(crate::host::quota::PolicyMeters::default());
+        // No allowed directories, so this policy refuses every workload hostPath.
+        let policy = HostPathPolicy::new(
+            [],
+            [],
+            Some(scratch.path().to_path_buf()),
+            Some(Arc::clone(&meters)),
+        );
+
+        resolve_plugin_volumes(
+            "vol",
+            &[host_path("data", data.path())],
+            &[mount("data", "/data", false)],
+            &policy,
+        )
+        .await
+        .expect("the allowlist does not apply to a plugin volume");
+        let err = resolve_plugin_volumes(
+            "vol",
+            &[host_path("scratch", scratch.path())],
+            &[mount("scratch", "/scratch", false)],
+            &policy,
+        )
+        .await
+        .err()
+        .expect("the scratch root is reserved");
+        let err = format!("{err:#}");
+        assert!(err.contains("reserves"), "{err}");
+        assert!(err.contains("'vol'"), "error should name the plugin: {err}");
+        // A plugin's config error is not a workload denied by policy.
+        assert_eq!(meters.host_path_denied(), 0);
+    }
+
+    #[tokio::test]
+    async fn plugin_volumes_close_their_directories_to_workloads() {
+        let data = tempfile::tempdir().unwrap();
+        let inside = data.path().join("inside");
+        std::fs::create_dir(&inside).unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
+        let policy = HostPathPolicy::new(
+            [],
+            [
+                data.path().to_path_buf(),
+                std::env::temp_dir(),
+                unrelated.path().to_path_buf(),
+            ],
+            None,
+            None,
+        );
+        // A clone made before the plugin loads, as the engine hands out.
+        let workloads = policy.clone();
+        workloads
+            .open(data.path())
+            .expect("nothing is closed before the plugin loads");
+
+        let resolved = resolve_plugin_volumes(
+            "vol",
+            &[host_path("data", data.path())],
+            &[mount("data", "/data", true)],
+            &policy,
+        )
+        .await
+        .unwrap();
+        for refused in [data.path(), inside.as_path(), &std::env::temp_dir()] {
+            let err = workloads
+                .open(refused)
+                .err()
+                .unwrap_or_else(|| panic!("{} should be refused", refused.display()));
+            assert!(
+                format!("{err:#}").contains("a host plugin mounts"),
+                "{err:#}"
+            );
+        }
+        workloads
+            .open(unrelated.path())
+            .expect("a directory apart from the plugin's is still permitted");
+
+        drop(resolved);
+        workloads
+            .open(data.path())
+            .expect("an unloaded plugin's directories are released");
+    }
+
+    #[tokio::test]
+    async fn a_directory_two_plugins_mount_stays_closed_until_both_unload() {
+        let data = tempfile::tempdir().unwrap();
+        let policy = HostPathPolicy::new([], [data.path().to_path_buf()], None, None);
+        let volumes = [host_path("data", data.path())];
+        let mounts = [mount("data", "/data", true)];
+        let first = resolve_plugin_volumes("first", &volumes, &mounts, &policy)
+            .await
+            .unwrap();
+        let second = resolve_plugin_volumes("second", &volumes, &mounts, &policy)
+            .await
+            .unwrap();
+
+        drop(first);
+        assert!(
+            policy.open(data.path()).is_err(),
+            "the second plugin still mounts it"
+        );
+        drop(second);
+        policy
+            .open(data.path())
+            .expect("released once neither plugin mounts it");
+    }
+
+    #[tokio::test]
+    async fn plugin_volumes_no_mount_uses_are_not_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let used = dir.path().join("used");
+        let unused = dir.path().join("unused");
+        std::fs::create_dir(&used).unwrap();
+        std::fs::create_dir(&unused).unwrap();
+        let policy = HostPathPolicy::new([], [dir.path().to_path_buf()], None, None);
+
+        let resolved = resolve_plugin_volumes(
+            "vol",
+            &[
+                host_path("used", &used),
+                host_path("unused", &unused),
+                host_path("missing", &dir.path().join("missing")),
+            ],
+            &[mount("used", "/used", true)],
+            &policy,
+        )
+        .await
+        .expect("an unmounted volume is not opened, so a missing one is no error");
+        assert_eq!(resolved.mounts.len(), 1);
+        policy
+            .open(&unused)
+            .expect("an unmounted volume is not closed to workloads");
+        assert!(policy.open(&used).is_err());
+    }
+
+    #[tokio::test]
+    async fn plugin_volumes_are_released_when_the_component_fails_to_load() -> anyhow::Result<()> {
+        let data = tempfile::tempdir()?;
+        let engine = Engine::builder()
+            .with_allowed_host_paths([data.path().to_path_buf()])
+            .build()?;
+
+        let result = ComponentHostPlugin::builder()
+            .id("invalid")
+            .wasm(b"invalid WebAssembly")
+            .engine(engine.clone())
+            .volumes([host_path("data", data.path())].into())
+            .volume_mounts([mount("data", "/data", true)].into())
+            .build()
+            .await;
+        assert!(result.is_err(), "invalid WebAssembly must fail to load");
+        engine.host_paths().open(data.path())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plugin_volumes_refuse_what_cannot_be_preopened() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("weights.gguf");
+        std::fs::write(&file, b"not a directory").unwrap();
+        let models = || vec![host_path("models", dir.path())];
+        let scratch = Volume {
+            name: "scratch".to_string(),
+            volume_type: VolumeType::EmptyDir(crate::types::EmptyDirVolume {}),
+        };
+
+        for (volumes, mounts, expected) in [
+            (
+                models(),
+                vec![mount("models", "models", true)],
+                "must be absolute",
+            ),
+            (
+                models(),
+                vec![
+                    mount("models", "/models", true),
+                    mount("models", "/models", false),
+                ],
+                "two volumeMounts mount at",
+            ),
+            (
+                models(),
+                vec![
+                    mount("models", "/models", true),
+                    mount("models", "/models/", false),
+                ],
+                "two volumeMounts mount at",
+            ),
+            (
+                models(),
+                vec![mount("models", "/a/../models", true)],
+                "must not contain",
+            ),
+            (
+                models(),
+                vec![mount("weights", "/models", true)],
+                "does not declare",
+            ),
+            (
+                vec![
+                    host_path("models", dir.path()),
+                    host_path("models", dir.path()),
+                ],
+                vec![],
+                "two volumes are named 'models'",
+            ),
+            (vec![host_path("", dir.path())], vec![], "empty name"),
+            (vec![scratch.clone()], vec![], "do not support yet"),
+            (
+                vec![host_path("models", &dir.path().join("missing"))],
+                vec![mount("models", "/models", true)],
+                "failed to resolve hostPath volume",
+            ),
+            (
+                vec![host_path("models", &file)],
+                vec![mount("models", "/models", true)],
+                "failed to open hostPath volume",
+            ),
+        ] {
+            let err = resolve_plugin_volumes("vol", &volumes, &mounts, &HostPathPolicy::default())
+                .await
+                .err()
+                .expect("declaration should be refused");
+            let err = format!("{err:#}");
+            assert!(err.contains(expected), "expected {expected:?}, got: {err}");
+            assert!(err.contains("'vol'"), "error should name the plugin: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_store_gets_its_volumes_each_time_it_is_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::builder().build().expect("failed to build engine");
+        let resolved = resolve_plugin_volumes(
+            "vol",
+            &[host_path("models", dir.path())],
+            &[mount("models", "/models", true)],
+            &HostPathPolicy::default(),
+        )
+        .await
+        .unwrap();
+        let mut store_context = PluginStoreContext {
+            allowed_hosts: Arc::from([]),
+            allowed_ip_name_lookups: Arc::from([]),
+            host_ref: None,
+            network: crate::host::ports::NetworkHandle::new(),
+            socket_policy: Arc::new(crate::sockets::policy::SocketPolicy::default()),
+            volumes: resolved.mounts,
+            _volume_registration: Arc::new(resolved.registration),
+        };
+        let store = build_plugin_store(&engine, "vol", &HashMap::new(), &store_context);
+        assert_eq!(store.data().active_ctx.volume_mounts.len(), 1);
+
+        // The directory was opened at load and the handle kept, so an
+        // incarnation started after its path is gone still gets the volume:
+        // nothing is opened by path again.
+        let gone = dir.path().to_path_buf();
+        drop(dir);
+        // Windows keeps a folder while a handle to it is open, and the store
+        // above holds one.
+        if cfg!(not(windows)) {
+            assert!(!gone.exists());
+        }
+        store_context.network = crate::host::ports::NetworkHandle::new();
+        let store = build_plugin_store(&engine, "vol", &HashMap::new(), &store_context);
+        assert_eq!(store.data().active_ctx.volume_mounts.len(), 1);
     }
 }

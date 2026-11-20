@@ -1,0 +1,11 @@
+[package]
+name = "structured-caller"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { workspace = true, features = ["async-spawn"] }

@@ -4,6 +4,12 @@
 //! this, importing `wasmcloud:nats/core` would reach every subject the
 //! connection can see.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use tokio::time::Instant;
+
 use super::config::PolicySpec;
 
 /// Subject prefixes denied regardless of grant.
@@ -26,6 +32,70 @@ const RESERVED_SUBJECT_PREFIXES: &[&str] = &["$JS.", "$KV.", "$OBJ.", "_nats_pus
 /// this same token so the two cannot drift.
 pub const INBOX_TOKEN_PREFIX: &str = "_INBOX";
 
+/// Where nats-server puts the reply inbox of a request it sends itself, such
+/// as an auth callout.
+///
+/// Its other system reply subject, `$SYS._INBOX_.<server id>`, answers account
+/// connection counts between servers, which no workload takes part in.
+const SERVER_INBOX_PREFIX: &str = "$SYS._INBOX.";
+
+/// How long a delivered `reply-to` stays publishable.
+const REPLY_GRANT_TTL: Duration = Duration::from_secs(30);
+
+/// Cap on outstanding reply grants, so a firehose of unanswered requests cannot
+/// grow the map without bound.
+const MAX_PENDING_REPLIES: usize = 1024;
+
+/// Inboxes the host has handed to a guest as a `reply-to`, each good for one
+/// publish.
+///
+/// A responder has to answer on a random `_INBOX` subject that no sane grant
+/// covers. Granting `_INBOX.>` instead would let the workload read every other
+/// client's replies, so the authorization is scoped to the exact inbox the host
+/// just delivered and consumed on first use.
+///
+/// The requester picks the `reply-to`, so a grant must not reach anything a
+/// requester could abuse. System subjects follow normal host grants and are
+/// not reserved, so a requester could otherwise aim a responder at
+/// `$SYS.REQ.SERVER.PING` or another system request. A grant therefore covers
+/// a system subject only inside the server's own reply inboxes, where an auth
+/// callout expects its answer.
+#[derive(Debug, Default)]
+pub struct ReplyGrants {
+    pending: Mutex<HashMap<String, Instant>>,
+}
+
+impl ReplyGrants {
+    /// Records that `inbox` was handed to the guest and may be replied to once.
+    ///
+    /// A system subject outside the server's reply inboxes is not recorded.
+    pub fn grant(&self, inbox: &str) {
+        let system = inbox.split('.').next() == Some("$SYS");
+        if system && !inbox.starts_with(SERVER_INBOX_PREFIX) {
+            return;
+        }
+        let now = Instant::now();
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        pending.retain(|_, granted| now.duration_since(*granted) < REPLY_GRANT_TTL);
+        if pending.len() >= MAX_PENDING_REPLIES {
+            return;
+        }
+        pending.insert(inbox.to_string(), now);
+    }
+
+    /// Consumes a reply grant, if this subject has an unexpired one.
+    pub fn take(&self, subject: &str) -> bool {
+        let Ok(mut pending) = self.pending.lock() else {
+            return false;
+        };
+        pending
+            .remove(subject)
+            .is_some_and(|granted| Instant::now().duration_since(granted) < REPLY_GRANT_TTL)
+    }
+}
+
 /// Stream-name prefixes that back a KV or object-store bucket.
 ///
 /// These streams hold the bucket's values as ordinary messages, so reaching one
@@ -41,6 +111,7 @@ pub struct PolicyEngine {
     /// carries — see [`PolicyEngine::publishable_literal_subjects`].
     subject_allow_raw: Vec<String>,
     stream_allow: Vec<NatsSubjectPattern>,
+    stream_delete_allow: Vec<NatsSubjectPattern>,
     bucket_allow: Vec<NatsSubjectPattern>,
     /// Lattice subjects to deny when the host is lattice-connected.
     lattice_prefixes: Vec<String>,
@@ -82,7 +153,15 @@ impl NatsSubjectPattern {
                 }
                 "*" => tokens.push(Token::Any),
                 "" => valid = false,
-                literal => tokens.push(Token::Literal(literal.to_string())),
+                literal => {
+                    if literal
+                        .chars()
+                        .any(|c| c.is_whitespace() || c == '*' || c == '>')
+                    {
+                        valid = false;
+                    }
+                    tokens.push(Token::Literal(literal.to_string()));
+                }
             }
         }
         Self {
@@ -241,6 +320,11 @@ impl PolicyEngine {
                 .iter()
                 .map(|s| NatsSubjectPattern::parse(s))
                 .collect(),
+            stream_delete_allow: spec
+                .stream_delete_allow
+                .iter()
+                .map(|s| NatsSubjectPattern::parse(s))
+                .collect(),
             bucket_allow: spec
                 .bucket_allow
                 .iter()
@@ -371,6 +455,22 @@ impl PolicyEngine {
         }
     }
 
+    /// Checks a guest-supplied literal subject for a stored-message lookup.
+    ///
+    /// The caller must authorize the stream first. Reserved subjects can be
+    /// read within a granted stream, but a lookup must not expand a wildcard
+    /// into subjects outside the grant.
+    pub fn check_stored_subject_query(&self, subject: &str) -> Result<(), Denied> {
+        let requested = NatsSubjectPattern::parse(subject);
+        if !requested.valid {
+            return Err(Denied::NotGranted);
+        }
+        if requested.trailing || requested.tokens.contains(&Token::Any) {
+            return Err(Denied::WildcardNotAllowed);
+        }
+        self.check_stored_subject(subject)
+    }
+
     /// Checks a stream name for read or management access.
     ///
     /// A bucket's backing stream is reachable here only when the bucket itself
@@ -399,6 +499,24 @@ impl PolicyEngine {
         }
     }
 
+    /// Destructive stream calls require both stream grants. Bucket streams stay reserved.
+    pub fn check_stream_delete(&self, stream: &str) -> Result<(), Denied> {
+        if stream.starts_with('$')
+            || BUCKET_BACKING_STREAM_PREFIXES
+                .iter()
+                .any(|p| stream.starts_with(p))
+            || self.is_reserved(stream)
+        {
+            return Err(Denied::Reserved);
+        }
+        self.check_stream(stream)?;
+        if self.stream_delete_allow.iter().any(|p| p.matches(stream)) {
+            Ok(())
+        } else {
+            Err(Denied::NotGranted)
+        }
+    }
+
     /// Checks a KV bucket name.
     pub fn check_bucket(&self, bucket: &str) -> Result<(), Denied> {
         if self.bucket_allow.iter().any(|p| p.matches(bucket)) {
@@ -410,6 +528,7 @@ impl PolicyEngine {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
 
@@ -418,10 +537,30 @@ mod tests {
             &PolicySpec {
                 subject_allow: subjects.iter().map(|s| s.to_string()).collect(),
                 stream_allow: streams.iter().map(|s| s.to_string()).collect(),
+                stream_delete_allow: vec![],
                 bucket_allow: buckets.iter().map(|s| s.to_string()).collect(),
             },
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn a_reply_grant_reaches_server_inboxes_but_no_other_system_subject() {
+        let grants = ReplyGrants::default();
+        for subject in [
+            "$SYS.REQ.SERVER.PING",
+            "$SYS.REQ.USER.AUTH",
+            "$SYS._INBOX_.server",
+            "$SYS",
+        ] {
+            grants.grant(subject);
+            assert!(!grants.take(subject), "{subject} took a reply grant");
+        }
+        for subject in ["$SYS._INBOX.abc.def", "_INBOX.abc", "_INBOX_orders.abc"] {
+            grants.grant(subject);
+            assert!(grants.take(subject), "{subject} lost its reply grant");
+            assert!(!grants.take(subject), "{subject} replayed its reply grant");
+        }
     }
 
     #[test]
@@ -442,6 +581,54 @@ mod tests {
             engine(&[], &[], &[]).check_subscription(subject),
             Err(Denied::NotGranted)
         );
+    }
+
+    #[test]
+    fn stream_deletion_requires_both_grants_and_refuses_reserved_streams() {
+        for (reads, deletes, allowed) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, true),
+        ] {
+            let p = PolicyEngine::new(
+                &PolicySpec {
+                    stream_allow: if reads { vec![">".into()] } else { vec![] },
+                    stream_delete_allow: if deletes { vec![">".into()] } else { vec![] },
+                    bucket_allow: vec![">".into()],
+                    ..Default::default()
+                },
+                vec!["runtime.host.".into()],
+            );
+            assert_eq!(p.check_stream_delete("ORDERS").is_ok(), allowed);
+            for stream in [
+                "KV_secrets",
+                "OBJ_files",
+                "$JS.internal",
+                "runtime.host.events",
+            ] {
+                assert_eq!(p.check_stream_delete(stream), Err(Denied::Reserved));
+            }
+        }
+    }
+
+    #[test]
+    fn purge_pattern_must_be_contained_and_avoid_reserved_subjects() {
+        let p = engine(&["orders.mine.>", "$KV.>", "*.*"], &["ORDERS"], &[]);
+        assert!(p.check_subscription("orders.mine.*").is_ok());
+        for pattern in [
+            "orders.>",
+            "orders.*.>",
+            ">",
+            "",
+            "$KV.>",
+            "*.>",
+            "orders.mine.foo*",
+            "orders.mine.foo>",
+            "orders.mine. bad",
+        ] {
+            assert!(p.check_subscription(pattern).is_err(), "{pattern}");
+        }
     }
 
     #[test]
@@ -733,6 +920,62 @@ mod tests {
         let p = engine(&[">"], &[], &["config"]);
         assert!(p.check_stored_subject("$KV.config.key").is_ok());
         assert_eq!(p.check_subject("$KV.config.key"), Err(Denied::Reserved));
+    }
+
+    #[test]
+    fn stored_subject_queries_follow_the_stored_message_grant() {
+        let p = engine(
+            &["$KV.config.allowed", "$OBJ.files.>"],
+            &[],
+            &["config", "files"],
+        );
+        for (stream, subject) in [
+            ("KV_config", "$KV.config.allowed"),
+            ("OBJ_files", "$OBJ.files.chunk"),
+        ] {
+            assert!(p.check_stream(stream).is_ok());
+            assert!(p.check_stored_subject_query(subject).is_ok());
+            assert_eq!(p.check_subject(subject), Err(Denied::Reserved));
+            assert_eq!(p.check_stream_delete(stream), Err(Denied::Reserved));
+        }
+        assert_eq!(
+            p.check_stored_subject_query("$KV.config.hidden"),
+            Err(Denied::NotGranted)
+        );
+        assert_eq!(p.check_stream("KV_private"), Err(Denied::Reserved));
+    }
+
+    #[test]
+    fn stored_subject_queries_reject_patterns_and_malformed_literals() {
+        let p = engine(&[">"], &[">"], &["config"]);
+        for subject in [
+            "*",
+            ">",
+            "$KV.config.*",
+            "$KV.config.>",
+            "orders.*.received",
+        ] {
+            assert_eq!(
+                p.check_stored_subject_query(subject),
+                Err(Denied::WildcardNotAllowed),
+                "{subject}"
+            );
+        }
+        for subject in [
+            "",
+            ".orders",
+            "orders.",
+            "orders..new",
+            "orders.new*",
+            "orders.new>",
+            "orders. new",
+        ] {
+            assert_eq!(
+                p.check_stored_subject_query(subject),
+                Err(Denied::NotGranted),
+                "{subject}"
+            );
+        }
     }
 
     #[test]

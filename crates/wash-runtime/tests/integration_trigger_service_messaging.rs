@@ -292,9 +292,9 @@ async fn test_trigger_service_restarts_and_resubscribes_on_fault() -> Result<()>
 /// receives on; the in-memory backend also accepts none, which subscribes it to
 /// everything.
 fn messaging_handler_interface(subscriptions: Option<&str>) -> WitInterface {
-    let mut config = HashMap::new();
+    let mut config = wash_runtime::wit::Config::new();
     if let Some(subscriptions) = subscriptions {
-        config.insert("subscriptions".to_string(), subscriptions.to_string());
+        config.insert("subscriptions", subscriptions);
     }
     WitInterface {
         namespace: "wasmcloud".to_string(),
@@ -440,7 +440,7 @@ async fn test_trigger_service_messaging_via_nats_backend() -> Result<()> {
     // backend, where an empty config subscribes the service to everything.
     const SUBJECT: &str = "trigger.service.e2e";
 
-    let container = GenericImage::new("nats", "2.12.8-alpine")
+    let container = GenericImage::new("nats", "2.12.15-alpine")
         .with_exposed_port(4222.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Server is ready"))
         .start()

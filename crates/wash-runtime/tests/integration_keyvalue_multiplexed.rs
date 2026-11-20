@@ -10,7 +10,7 @@
 //! Requires Docker (redis + NATS); marked `#[ignore]`, so it runs only under
 //! `cargo test --include-ignored` (CI's Linux leg) and not a plain `cargo test`
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -35,7 +35,7 @@ fn kv_iface(name: &str, backend: &str, url: &str) -> WitInterface {
         .into_iter()
         .collect(),
         version: None,
-        config: HashMap::from([
+        config: wash_runtime::wit::Config::from_iter([
             ("backend".to_string(), backend.to_string()),
             ("url".to_string(), url.to_string()),
         ]),
@@ -57,7 +57,7 @@ async fn multiplexed_routes_to_redis_and_nats() -> Result<()> {
     let redis_url = format!("redis://127.0.0.1:{redis_port}");
 
     // --- NATS container (JetStream enabled for KV) ---
-    let nats = GenericImage::new("nats", "2.12.8-alpine")
+    let nats = GenericImage::new("nats", "2.12.15-alpine")
         .with_exposed_port(4222.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Server is ready"))
         .with_cmd(["-js"])
@@ -82,7 +82,7 @@ async fn multiplexed_routes_to_redis_and_nats() -> Result<()> {
     // --- build the routing registry from two named host interfaces ---
     let plugin = MultiplexedKeyValue::new()
         .with_provider(Arc::new(RedisProvider))
-        .with_provider(Arc::new(NatsProvider));
+        .with_provider(Arc::new(NatsProvider::default()));
     let interfaces = HashSet::from([
         kv_iface("redis-kv", "redis", &redis_url),
         kv_iface("nats-kv", "nats", &nats_url),

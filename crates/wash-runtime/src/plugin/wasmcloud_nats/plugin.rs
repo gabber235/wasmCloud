@@ -4,13 +4,13 @@
 //! What a binding is described by is parsed in `super::config`; this module is
 //! the `HostPlugin` lifecycle around it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context as _;
 use futures::StreamExt as _;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::engine::workload::{ResolvedWorkload, UnresolvedWorkload, WorkloadItem};
 use crate::observability::{MeterKind, Meters};
@@ -18,7 +18,7 @@ use crate::plugin::bindings::{UNNAMED_BINDING, describe_binding};
 use crate::plugin::{
     HostPlugin, PluginEgressPolicy, WitInterfaces, WorkloadFailureSink, WorkloadTracker,
 };
-use crate::wit::{WitInterface, WitWorld};
+use crate::wit::{Config, ConfigStr, ConfigValue, WitInterface, WitWorld};
 
 use super::config::{
     CoreSubscriptionConfig, JetStreamSubscriptionConfig, KvWatchConfig, NatsConfig,
@@ -50,7 +50,7 @@ pub struct ComponentData {
     /// component, in the canonical form [`subscription_spec`] renders. Kept so
     /// the next component of the same workload can tell whether it is about to
     /// pick up the same ones — see [`WasmcloudNats::on_workload_item_bind`].
-    pub(super) untargeted_specs: Vec<String>,
+    pub(super) untargeted_specs: Vec<ConfigValue>,
     pub(super) cancel_token: tokio_util::sync::CancellationToken,
 }
 /// `wasmcloud:nats` host plugin — NATS-native capabilities split by interface.
@@ -66,6 +66,9 @@ pub struct WasmcloudNats {
     failure_sink: arc_swap::ArcSwapOption<WorkloadFailureSink>,
     /// Network ceiling checked before the native client connects.
     egress_policy: arc_swap::ArcSwapOption<PluginEgressPolicy>,
+    /// Keeps every connection on its declared `servers`, with or without an
+    /// egress policy.
+    ignore_discovered_servers: bool,
     /// The host's guest-memory budget, when it told this plugin. Subscription
     /// byte budgets are per subscription and were never compared against it:
     /// seven subscriptions at the 32MiB default is 224MiB of potential backlog
@@ -93,6 +96,7 @@ impl WasmcloudNats {
             lattice_prefixes: Vec::new(),
             failure_sink: arc_swap::ArcSwapOption::empty(),
             egress_policy: arc_swap::ArcSwapOption::empty(),
+            ignore_discovered_servers: false,
             memory_budget: None,
             host_backlog: Arc::new(subscriber::HostBacklogBudget::unbounded()),
         }
@@ -151,28 +155,35 @@ impl WasmcloudNats {
         }
     }
 
+    /// Reconnects every workload connection only to its declared `servers`,
+    /// never to ones the cluster advertises.
+    pub fn with_ignore_discovered_servers(mut self, ignore: bool) -> Self {
+        self.ignore_discovered_servers = ignore;
+        self
+    }
+
     /// Resolves the connection a plain, unlabeled call goes out on.
     pub(super) async fn conn_for(&self, workload_id: &str) -> Option<Arc<ConnHandle>> {
         self.connections.get(workload_id).await
     }
 
-    fn check_egress(&self, config: &NatsConfig) -> anyhow::Result<()> {
+    fn check_egress(&self, servers: &[String]) -> anyhow::Result<()> {
+        match self.egress_policy.load_full() {
+            Some(policy) => servers.iter().try_for_each(|s| policy.check_nats_server(s)),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::check_egress`], then what each server resolves to now, both
+    /// against one load of the policy.
+    async fn check_egress_resolved(&self, servers: &[String]) -> anyhow::Result<()> {
         let Some(policy) = self.egress_policy.load_full() else {
             return Ok(());
         };
-        for server in &config.servers {
-            let server = server
-                .parse::<async_nats::ServerAddr>()
-                .with_context(|| format!("NATS server {server:?} is invalid"))?;
-            policy
-                .check_url(
-                    server.as_url_str(),
-                    crate::host::declared_port::Protocol::Tcp,
-                    4222,
-                )
-                .with_context(|| format!("NATS server {server:?} is denied"))?;
-        }
-        Ok(())
+        servers
+            .iter()
+            .try_for_each(|s| policy.check_nats_server(s))?;
+        policy.check_nats_servers_resolved(servers).await
     }
 
     /// Opens one connection per binding name.
@@ -184,7 +195,7 @@ impl WasmcloudNats {
     async fn open_bindings(
         &self,
         workload_id: &str,
-        bindings: Vec<(&str, HashMap<String, String>)>,
+        bindings: Vec<(&str, Config)>,
         opened: &mut bool,
     ) -> anyhow::Result<()> {
         for (binding, merged) in bindings {
@@ -205,11 +216,7 @@ impl WasmcloudNats {
             // `servers`" this would otherwise fail with sends authors looking
             // at config they can see is present.
             if super::keys::get(&merged, "servers").is_none() && !merged.is_empty() {
-                // Sorted: the same manifest has to be refused with the same
-                // message every time, and `merged` is a `HashMap`.
-                let mut present: Vec<String> =
-                    merged.keys().map(|key| format!("`{key}`")).collect();
-                present.sort();
+                let present: Vec<String> = merged.keys().map(|key| format!("`{key}`")).collect();
                 anyhow::bail!(
                     "wasmcloud:nats binding `{}` of workload `{workload_id}` has no `servers`, \
                      but does set {}. Connection settings only reach the host from an entry one \
@@ -229,7 +236,11 @@ impl WasmcloudNats {
                     describe_binding(binding)
                 )
             })?;
-            self.check_egress(&config)?;
+            let checked = self.check_egress_resolved(&config.servers).await;
+            match super::keys::get(&merged, "servers") {
+                Some(servers) => servers.guard("servers", checked)?,
+                None => checked?,
+            }
 
             // A stream grant alone reaches nothing: every read of a stored
             // message is checked against the *subject* grant, so a binding
@@ -241,7 +252,7 @@ impl WasmcloudNats {
                 tracing::warn!(
                     workload_id,
                     binding = describe_binding(binding),
-                    streams = config.policy.stream_allow.join(","),
+                    streams = ?super::keys::get(&merged, "stream-allow"),
                     "wasmcloud:nats binding grants streams but no subjects, so every JetStream \
                      read returns empty: a stored message is checked against `subject-allow` \
                      before it is handed over. Add the subjects those streams store to \
@@ -280,12 +291,10 @@ impl WasmcloudNats {
                 )
             }
 
-            // A server the cluster advertises was never checked against the
-            // ceiling, so under a declared policy the client stays on the
-            // servers the operator wrote. `configure_egress_policy` says so at
-            // startup, where an operator can act on it.
-            let ignore_discovered_servers = self.egress_policy.load().is_some();
-            let handle = self
+            // An egress policy always excludes unchecked advertised servers.
+            let ignore_discovered_servers =
+                self.ignore_discovered_servers || self.egress_policy.load().is_some();
+            let acquired = self
                 .connections
                 .acquire(
                     workload_id,
@@ -294,13 +303,14 @@ impl WasmcloudNats {
                     self.lattice_prefixes.clone(),
                     ignore_discovered_servers,
                 )
-                .await?;
+                .await;
+            let handle = super::keys::guard_connection(&merged, acquired)?;
             *opened = true;
 
-            info!(
+            debug!(
                 workload_id,
                 binding = describe_binding(binding),
-                servers = config.servers.join(","),
+                servers = ?super::keys::get(&merged, "servers"),
                 auth = config.auth.kind(),
                 server_version = handle.server_version(),
                 "opened NATS connection"
@@ -310,10 +320,11 @@ impl WasmcloudNats {
             debug!(
                 workload_id,
                 binding = describe_binding(binding),
-                subject_allow = config.policy.subject_allow.join(","),
-                stream_allow = config.policy.stream_allow.join(","),
-                bucket_allow = config.policy.bucket_allow.join(","),
-                inbox_prefix = config.inbox_prefix.as_deref().unwrap_or_default(),
+                subject_allow = ?super::keys::get(&merged, "subject-allow"),
+                stream_allow = ?super::keys::get(&merged, "stream-allow"),
+                stream_delete_allow = ?super::keys::get(&merged, "stream-delete-allow"),
+                bucket_allow = ?super::keys::get(&merged, "bucket-allow"),
+                inbox_prefix = ?super::keys::get(&merged, "inbox-prefix"),
                 "wasmcloud:nats binding grant"
             );
         }
@@ -360,12 +371,10 @@ impl WasmcloudNats {
             workload_id,
             binding = describe_binding(binding),
             subscriptions,
-            capacity_bytes = handle.limits.subscription_capacity_bytes,
-            worst_case_bytes = worst_case,
             host_backlog_ceiling_bytes = ceiling,
             host_budget_bytes = budget,
             "wasmcloud:nats: {subscriptions} core subscriptions at \
-             `subscription-capacity-bytes` could hold {worst_case} bytes between them, past \
+             `subscription-capacity-bytes` could exceed \
              the {ceiling} this host allows for NATS backlogs across every workload. Nothing \
              is narrowed — each subscription still buffers what it was configured to — but \
              once the host-wide total is reached, further deliveries shed with \
@@ -648,8 +657,8 @@ fn binding_name(interface: &WitInterface) -> &str {
 ///
 /// Shared connection settings have already been resolved. Selectors and
 /// subscriptions remain on their original entries and do not configure sockets.
-fn bindings_by_name<'a>(bound: &[&'a WitInterface]) -> Vec<(&'a str, HashMap<String, String>)> {
-    let mut merged: BTreeMap<&str, HashMap<String, String>> = BTreeMap::new();
+fn bindings_by_name<'a>(bound: &[&'a WitInterface]) -> Vec<(&'a str, Config)> {
+    let mut merged: BTreeMap<&str, Config> = BTreeMap::new();
     for interface in bound {
         merged.entry(binding_name(interface)).or_insert_with(|| {
             interface
@@ -680,13 +689,6 @@ impl HostPlugin for WasmcloudNats {
     /// failover an unlisted peer would have given, which is why it is said here
     /// rather than left to be found when a node goes down.
     fn configure_egress_policy(&self, policy: Arc<PluginEgressPolicy>) -> anyhow::Result<()> {
-        if policy.disabled_loopback_grants() {
-            warn!(
-                plugin_id = self.id(),
-                "native plugin declares allowedHostLoopbackPorts, but host-loopback access is \
-                 disabled"
-            );
-        }
         info!(
             plugin_id = self.id(),
             "wasmcloud:nats connections are limited to the declared `servers`; cluster-advertised \
@@ -725,11 +727,18 @@ impl HostPlugin for WasmcloudNats {
 
         // The base alone is not required to be complete: a host that sets only
         // grants leaves the servers to a workload under `allow`.
-        for (name, layer) in declared.host_layers(&super::binding_schema()) {
-            let config = NatsConfig::from_map(&layer)
+        //
+        // A key a plugin secret supplies has no value until bind, so it reads
+        // as set and its value is checked when a workload binds the layer.
+        for (name, layer, pending) in declared.host_layers(&super::binding_schema()) {
+            let servers = NatsConfig::check_layer(&layer, &pending)
                 .map_err(|e| anyhow::anyhow!("binding `{name}`: {e:#}"))?;
-            self.check_egress(&config)
-                .with_context(|| format!("binding `{name}`"))?;
+            let checked = self.check_egress(&servers);
+            match super::keys::get(&layer, "servers") {
+                Some(servers) => servers.guard("servers", checked),
+                None => checked,
+            }
+            .with_context(|| format!("binding `{name}`"))?;
         }
         Ok(())
     }
@@ -755,7 +764,7 @@ impl HostPlugin for WasmcloudNats {
                     .all(|v| ceiling.iter().any(|c| c.contains(&v)))
             }
             // Plain names: subset, not pattern containment.
-            "stream-allow" | "bucket-allow" => {
+            "stream-allow" | "stream-delete-allow" | "bucket-allow" => {
                 let ceiling: std::collections::HashSet<&str> = split(ceiling).collect();
                 split(value).all(|v| ceiling.contains(v))
             }
@@ -870,7 +879,7 @@ impl HostPlugin for WasmcloudNats {
         // linker's mutable one.
         let component = item.component().clone();
 
-        let linker = item.linker();
+        let linker = item.linker()?;
         {
             use interfaces::bindings::wasmcloud::nats as nats_wit;
             // `types` carries record and error definitions only: nothing to
@@ -944,7 +953,7 @@ impl HostPlugin for WasmcloudNats {
         let mut jetstream_subs = Vec::new();
         let mut core_subs = Vec::new();
         let mut kv_watches = Vec::new();
-        let mut untargeted_specs: Vec<String> = Vec::new();
+        let mut untargeted_specs: Vec<ConfigValue> = Vec::new();
 
         let component_id = component.id().to_string();
         // The manifest's `components[].name`, alongside the runtime id: a
@@ -957,12 +966,12 @@ impl HostPlugin for WasmcloudNats {
             let binding = binding_name(interface);
             // Every other key this plugin reads accepts either spelling, so
             // these do too.
-            let cfg = |key: &str| -> Option<&String> {
+            let cfg = |key: &str| -> Option<ConfigStr<'_>> {
                 interface
                     .config
                     .iter()
                     .find(|(k, _)| super::keys::canonical(k) == key)
-                    .map(|(_, v)| v)
+                    .and_then(|(_, v)| v.as_config_str())
             };
             // The runtime hands an unnamed host-interface entry to every
             // component whose world covers it, which for a subscription means
@@ -971,14 +980,19 @@ impl HostPlugin for WasmcloudNats {
             // for; entries that name another component are simply not this
             // component's.
             let targeted = match cfg("component") {
-                Some(target) if *target != component_id && *target != component_name => continue,
+                Some(target)
+                    if target.expose() != component_id && target.expose() != component_name =>
+                {
+                    continue;
+                }
                 Some(_) => true,
                 None => false,
             };
             if serves(interface, &["handler", "jetstream-handler"])
                 && let Some(raw) = cfg("jetstream-subscriptions")
             {
-                let subs = parse_jetstream_subscriptions(binding, raw)?;
+                let parsed = parse_jetstream_subscriptions(binding, raw.expose());
+                let subs = raw.guard("jetstream-subscriptions", parsed)?;
                 if !targeted {
                     untargeted_specs.extend(subs.iter().map(|sub| {
                         let value = match &sub.queue_group {
@@ -987,7 +1001,7 @@ impl HostPlugin for WasmcloudNats {
                             }
                             None => format!("{}:{}", sub.stream, sub.filter_subject),
                         };
-                        subscription_spec("jetstream-subscriptions", binding, value)
+                        subscription_spec("jetstream-subscriptions", binding, raw, value)
                     }));
                 }
                 jetstream_subs.extend(subs);
@@ -995,14 +1009,15 @@ impl HostPlugin for WasmcloudNats {
             if serves(interface, &["handler", "core-handler"])
                 && let Some(raw) = cfg("core-subscriptions")
             {
-                let subs = parse_core_subscriptions(binding, raw)?;
+                let parsed = parse_core_subscriptions(binding, raw.expose());
+                let subs = raw.guard("core-subscriptions", parsed)?;
                 if !targeted {
                     untargeted_specs.extend(subs.iter().map(|sub| {
                         let value = match &sub.queue_group {
                             Some(group) => format!("{}:{group}", sub.subject),
                             None => sub.subject.clone(),
                         };
-                        subscription_spec("core-subscriptions", binding, value)
+                        subscription_spec("core-subscriptions", binding, raw, value)
                     }));
                 }
                 core_subs.extend(subs);
@@ -1010,12 +1025,14 @@ impl HostPlugin for WasmcloudNats {
             if serves(interface, &["handler", "kv-handler"])
                 && let Some(raw) = cfg("kv-watches")
             {
-                let watches = parse_kv_watches(binding, raw)?;
+                let parsed = parse_kv_watches(binding, raw.expose());
+                let watches = raw.guard("kv-watches", parsed)?;
                 if !targeted {
                     untargeted_specs.extend(watches.iter().map(|watch| {
                         subscription_spec(
                             "kv-watches",
                             binding,
+                            raw,
                             format!("{}:{}", watch.bucket, watch.filter),
                         )
                     }));
@@ -1161,16 +1178,14 @@ impl HostPlugin for WasmcloudNats {
         workload_id: &str,
         _interfaces: WitInterfaces<'_>,
     ) -> anyhow::Result<()> {
-        let workload_cleanup = |_| async {};
-        let component_cleanup = |data: ComponentData| async move {
-            data.cancel_token.cancel();
-        };
-
-        self.tracker
-            .write()
-            .await
-            .remove_workload_with_cleanup(workload_id, workload_cleanup, component_cleanup)
-            .await;
+        // Taken out under the lock and cancelled after it is released, so an
+        // unbind holds the plugin-wide tracker only for the removal itself.
+        let removed = self.tracker.write().await.take_workload(workload_id);
+        if let Some(removed) = removed {
+            for data in removed.components.into_values() {
+                data.cancel_token.cancel();
+            }
+        }
 
         self.connections.release(workload_id).await;
         debug!(
@@ -1205,13 +1220,47 @@ impl HostPlugin for WasmcloudNats {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::host::allowed_loopback::AllowedLoopbackPort;
     use crate::plugin::{PluginBindingSet, PluginEgressPolicy, WorkloadConfigPolicy};
 
+    #[tokio::test]
+    async fn connection_failures_redact_secret_servers() {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = socket.local_addr().unwrap();
+        let server = format!("nats://{addr}");
+        for key in ["servers", "SERVERS"] {
+            for secret in [false, true] {
+                let plugin = WasmcloudNats::new();
+                let mut config = Config::new();
+                if secret {
+                    config.insert(key, crate::plugin::SecretValue::new(server.clone()));
+                } else {
+                    config.insert(key, server.clone());
+                }
+                let mut opened = false;
+                let err = plugin
+                    .open_bindings("test", vec![(UNNAMED_BINDING, config)], &mut opened)
+                    .await
+                    .unwrap_err();
+                assert!(!opened);
+                for rendered in [format!("{err:#}"), format!("{err:?}")] {
+                    assert_eq!(rendered.contains(&server), !secret, "{rendered}");
+                    if secret {
+                        assert!(rendered.contains("the reason is withheld"), "{rendered}");
+                    } else {
+                        assert!(rendered.contains("failed to connect to NATS"), "{rendered}");
+                    }
+                }
+            }
+        }
+    }
+
     fn nats_config(server: &str) -> NatsConfig {
-        NatsConfig::from_map(&HashMap::from([(
+        NatsConfig::from_map(&Config::from_iter([(
             "servers".to_string(),
             server.to_string(),
         )]))
@@ -1233,34 +1282,30 @@ mod tests {
     }
 
     #[test]
+    fn destructive_stream_ceiling_only_allows_subsets() {
+        let plugin = WasmcloudNats::new();
+        assert!(plugin.narrows("stream-delete-allow", "ORDERS,PAYMENTS", "ORDERS"));
+        assert!(plugin.narrows("stream-delete-allow", "ORDERS", ""));
+        assert!(!plugin.narrows("stream-delete-allow", "ORDERS", "ORDERS,OTHER"));
+        assert!(!plugin.narrows("stream-delete-allow", "", "ORDERS"));
+        assert!(!plugin.narrows("stream-delete-allow", "ORDERS", ">"));
+    }
+
+    #[test]
     fn egress_check_uses_nats_endpoint_normalization() {
         let plugin = WasmcloudNats::new();
         plugin
             .configure_egress_policy(Arc::new(PluginEgressPolicy::new(
-                Arc::from([
-                    "nats://example.com:4222".parse().unwrap(),
-                    "wss://secure.example.com:443".parse().unwrap(),
-                ]),
-                Arc::from([
-                    "example.com".parse().unwrap(),
-                    "secure.example.com".parse().unwrap(),
-                ]),
+                Arc::from(["nats://example.com:4222".parse().unwrap()]),
+                Arc::from(["example.com".parse().unwrap()]),
                 Arc::from([]),
                 &enforcing_policy(None),
             )))
             .unwrap();
 
         plugin
-            .check_egress(&nats_config("example.com"))
+            .check_egress(&nats_config("example.com").servers)
             .expect("a schemeless endpoint uses nats:// and port 4222");
-        plugin
-            .check_egress(&nats_config("wss://secure.example.com"))
-            .expect("wss uses port 443");
-        assert!(
-            plugin
-                .check_egress(&nats_config("ws://secure.example.com"))
-                .is_err()
-        );
     }
 
     #[test]
@@ -1283,7 +1328,158 @@ mod tests {
             )))
             .unwrap();
 
-        assert!(plugin.check_egress(&nats_config("localhost:4222")).is_err());
+        assert!(
+            plugin
+                .check_egress(&nats_config("localhost:4222").servers)
+                .is_err()
+        );
+    }
+
+    fn pending(key: &str) -> std::collections::HashMap<String, crate::plugin::PluginSecretRef> {
+        std::collections::HashMap::from([(
+            key.to_string(),
+            crate::plugin::PluginSecretRef {
+                source: "nats-creds".into(),
+                plugin: "vault".into(),
+                key: format!("nats/{key}").into(),
+                grant: crate::plugin::WorkloadGrant::All,
+            },
+        )])
+    }
+
+    fn binding(pairs: &[(&str, &str)]) -> Config {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// An entry-level secret leaves every binding's other keys checked at host
+    /// start, and its own key reads as set.
+    #[test]
+    fn host_start_checks_the_keys_a_plugin_secret_does_not_supply() {
+        let plugin = WasmcloudNats::new();
+        let set = |orders: &[(&str, &str)]| {
+            PluginBindingSet::new(PLUGIN_NATS_ID)
+                .with_base(binding(&[("username", "svc")]))
+                .with_base_secrets(pending("password"))
+                .with_binding("orders", binding(orders))
+        };
+        plugin
+            .validate_bindings(&set(&[("servers", "nats://a:4222")]))
+            .expect("the pending password satisfies `username`");
+        let err = plugin
+            .validate_bindings(&set(&[("servers", "nats://a:4222"), ("ack-mode", "bogus")]))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("ack-mode"), "{err:#}");
+    }
+
+    /// A typed key a secret supplies has its value checked at bind.
+    #[test]
+    fn a_pending_typed_key_does_not_fail_host_start() {
+        let plugin = WasmcloudNats::new();
+        for key in [
+            "ack-mode",
+            "max-in-flight",
+            "request-timeout-ms",
+            "jwt-as-token",
+        ] {
+            let set = PluginBindingSet::new(PLUGIN_NATS_ID)
+                .with_binding("orders", binding(&[("servers", "nats://a:4222")]))
+                .with_binding_secrets("orders", pending(key));
+            plugin
+                .validate_bindings(&set)
+                .unwrap_or_else(|e| panic!("{key}: {e:#}"));
+        }
+    }
+
+    /// A `servers` a secret supplies is egress-checked at bind.
+    #[test]
+    fn a_pending_servers_skips_the_start_egress_check() {
+        let plugin = WasmcloudNats::new();
+        plugin
+            .configure_egress_policy(Arc::new(PluginEgressPolicy::new(
+                Arc::from(["nats://example.com:4222".parse().unwrap()]),
+                Arc::from(["example.com".parse().unwrap()]),
+                Arc::from([]),
+                &enforcing_policy(None),
+            )))
+            .unwrap();
+        let set = PluginBindingSet::new(PLUGIN_NATS_ID)
+            .with_binding("orders", Config::new())
+            .with_binding_secrets("orders", pending("servers"));
+        plugin.validate_bindings(&set).unwrap();
+    }
+
+    #[test]
+    fn resolved_secret_servers_are_checked_without_being_quoted() {
+        let plugin = WasmcloudNats::new();
+        plugin
+            .configure_egress_policy(PluginEgressPolicy::allowing(&["allowed.example:4222"]))
+            .unwrap();
+        for key in ["servers", "SERVERS"] {
+            for secret in [false, true] {
+                for server in [
+                    "nats://review-secret.invalid:4222",
+                    "nats://[review-secret.invalid",
+                    "nats://allowed.example:4222",
+                ] {
+                    let mut config = Config::new();
+                    let value = if secret {
+                        ConfigValue::Secret(crate::plugin::SecretValue::new(server))
+                    } else {
+                        ConfigValue::from(server)
+                    };
+                    config.insert(key, value);
+                    let set = PluginBindingSet::new(PLUGIN_NATS_ID).with_binding("orders", config);
+                    let result = plugin.validate_bindings(&set);
+                    if server == "nats://allowed.example:4222" {
+                        result.unwrap();
+                        continue;
+                    }
+                    let err = format!("{:#}", result.unwrap_err());
+                    assert!(err.contains("binding `orders`"), "{err}");
+                    assert_eq!(err.contains("review-secret.invalid"), !secret, "{err}");
+                    if secret {
+                        assert!(err.contains("`servers`"), "{err}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A pending key still counts toward the rules its presence decides.
+    #[test]
+    fn a_pending_key_is_checked_for_presence_at_host_start() {
+        let plugin = WasmcloudNats::new();
+        for (orders, key, expected) in [
+            (&[("tls-cert", "/c.pem")][..], "tls-key", None),
+            (&[][..], "tls-cert", Some("`tls-cert` and `tls-key`")),
+            (
+                &[("nkey-seed-file", "/s")][..],
+                "nkey-seed",
+                Some("both supplied"),
+            ),
+            (
+                &[("token", "t")][..],
+                "password",
+                Some("conflicting NATS credentials"),
+            ),
+            (&[][..], "jwt", Some("`jwt` requires")),
+        ] {
+            let mut config = vec![("servers", "nats://a:4222")];
+            config.extend_from_slice(orders);
+            let set = PluginBindingSet::new(PLUGIN_NATS_ID)
+                .with_binding("orders", binding(&config))
+                .with_binding_secrets("orders", pending(key));
+            match (plugin.validate_bindings(&set), expected) {
+                (Ok(()), None) => {}
+                (Err(e), Some(expected)) => {
+                    assert!(format!("{e:#}").contains(expected), "{key}: {e:#}")
+                }
+                (result, expected) => panic!("{key}: {result:?}, expected {expected:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1302,8 +1498,8 @@ mod tests {
             v.sort();
             v
         };
-        assert_eq!(versions(&world.imports), vec!["0.1.2"]);
-        assert_eq!(versions(&world.exports), vec!["0.1.2"]);
+        assert_eq!(versions(&world.imports), vec!["0.1.3"]);
+        assert_eq!(versions(&world.exports), vec!["0.1.3"]);
         for iface in world.exports.iter() {
             assert!(
                 iface.interfaces.contains("kv-handler"),
@@ -1340,7 +1536,7 @@ mod tests {
     /// stay because what they cover is a `wasmcloud:nats` manifest shape — a
     /// binding split across an import entry and a handler entry — and that
     /// shape has to keep working whoever owns the folding.
-    fn merge(entries: &[WitInterface]) -> anyhow::Result<Vec<(String, HashMap<String, String>)>> {
+    fn merge(entries: &[WitInterface]) -> anyhow::Result<Vec<(String, Config)>> {
         // `allow`, the `wash dev` posture: these cover the *fold*, and a
         // manifest that describes its own binding is exactly what the fold is
         // for. Under `deny` the same manifest is refused before the fold is
@@ -1362,7 +1558,7 @@ mod tests {
     fn split_entries_share_connection_without_subscription_settings() {
         let entries = [
             entry(
-                "wasmcloud:nats/types,core,jetstream@0.1.2",
+                "wasmcloud:nats/types,core,jetstream@0.1.3",
                 None,
                 &[
                     ("servers", "nats://localhost:4222"),
@@ -1371,7 +1567,7 @@ mod tests {
                 ],
             ),
             entry(
-                "wasmcloud:nats/jetstream-handler@0.1.2",
+                "wasmcloud:nats/jetstream-handler@0.1.3",
                 None,
                 &[("jetstream-subscriptions", "ORDERS:orders.eu.>")],
             ),
@@ -1393,12 +1589,12 @@ mod tests {
     fn entries_may_repeat_a_key_they_agree_on() {
         let entries = [
             entry(
-                "wasmcloud:nats/core@0.1.2",
+                "wasmcloud:nats/core@0.1.3",
                 None,
                 &[("servers", "nats://localhost:4222")],
             ),
             entry(
-                "wasmcloud:nats/core-handler@0.1.2",
+                "wasmcloud:nats/core-handler@0.1.3",
                 None,
                 &[
                     ("servers", "nats://localhost:4222"),
@@ -1417,12 +1613,12 @@ mod tests {
     #[test]
     fn a_label_naming_the_plugin_is_the_unnamed_binding() {
         let plain = entry(
-            "wasmcloud:nats/core@0.1.2",
+            "wasmcloud:nats/core@0.1.3",
             None,
             &[("servers", "nats://localhost:4222")],
         );
         let labeled = entry(
-            "wasmcloud:nats/core-handler@0.1.2",
+            "wasmcloud:nats/core-handler@0.1.3",
             Some(super::super::PLUGIN_NATS_ID),
             &[("core-subscriptions", "orders.new")],
         );
@@ -1440,7 +1636,7 @@ mod tests {
     #[test]
     fn conflicting_entries_are_refused_by_key_name() {
         let a = entry(
-            "wasmcloud:nats/core@0.1.2",
+            "wasmcloud:nats/core@0.1.3",
             None,
             &[
                 ("servers", "nats://localhost:4222"),
@@ -1448,7 +1644,7 @@ mod tests {
             ],
         );
         let b = entry(
-            "wasmcloud:nats/core-handler@0.1.2",
+            "wasmcloud:nats/core-handler@0.1.3",
             None,
             &[("subject_allow", "orders.>")],
         );
@@ -1468,7 +1664,7 @@ mod tests {
     #[test]
     fn a_binding_without_servers_is_still_refused() {
         let entries = [entry(
-            "wasmcloud:nats/jetstream-handler@0.1.2",
+            "wasmcloud:nats/jetstream-handler@0.1.3",
             None,
             &[("jetstream-subscriptions", "ORDERS:orders.>")],
         )];
@@ -1481,7 +1677,7 @@ mod tests {
     fn named_bindings_fold_separately() {
         let entries = [
             entry(
-                "wasmcloud:nats/core@0.1.2",
+                "wasmcloud:nats/core@0.1.3",
                 Some("hub"),
                 &[
                     ("servers", "nats://hub:4222"),
@@ -1489,7 +1685,7 @@ mod tests {
                 ],
             ),
             entry(
-                "wasmcloud:nats/core@0.1.2",
+                "wasmcloud:nats/core@0.1.3",
                 Some("leaf"),
                 &[
                     ("servers", "nats://leaf:4222"),
@@ -1517,7 +1713,8 @@ mod tests {
     async fn connection_config_on_an_unmatched_entry_says_so() {
         let plugin = WasmcloudNats::new();
         let mut opened = false;
-        let merged = HashMap::from([("core-subscriptions".to_string(), "orders.new".to_string())]);
+        let merged =
+            Config::from_iter([("core-subscriptions".to_string(), "orders.new".to_string())]);
 
         let err = plugin
             .open_bindings("wl", vec![(UNNAMED_BINDING, merged)], &mut opened)
@@ -1546,7 +1743,7 @@ mod tests {
     async fn the_host_declaration_reaches_open_bindings() {
         let declared = PluginBindingSet::new(super::super::PLUGIN_NATS_ID)
             .with_default_bundle("servers", [("servers", "nats://host:4222")])
-            .with_base(HashMap::from([(
+            .with_base(Config::from_iter([(
                 "subject-allow".to_string(),
                 "orders.>".to_string(),
             )]));
@@ -1555,7 +1752,7 @@ mod tests {
         let merged = declared
             .resolve(
                 UNNAMED_BINDING,
-                &HashMap::from([("subject-allow".to_string(), "orders.received".to_string())]),
+                &Config::from_iter([("subject-allow".to_string(), "orders.received".to_string())]),
                 &super::super::binding_schema(),
                 &|key: &str, host: &str, workload: &str| plugin.narrows(key, host, workload),
             )
@@ -1581,13 +1778,13 @@ mod tests {
     fn a_workload_may_narrow_a_grant_but_not_widen_one() {
         let declared = PluginBindingSet::new(super::super::PLUGIN_NATS_ID)
             .with_workload_config(WorkloadConfigPolicy::Deny)
-            .with_base(HashMap::from([(
+            .with_base(Config::from_iter([(
                 "servers".to_string(),
                 "nats://host:4222".to_string(),
             )]))
             .with_binding(
                 "orders",
-                HashMap::from([
+                Config::from_iter([
                     ("subject-allow".to_string(), "orders.>".to_string()),
                     ("stream-allow".to_string(), "ORDERS,PROCESSED".to_string()),
                 ]),
@@ -1599,7 +1796,7 @@ mod tests {
         let resolved = declared
             .resolve(
                 "orders",
-                &HashMap::from([
+                &Config::from_iter([
                     ("subject-allow".to_string(), "orders.received".to_string()),
                     ("stream-allow".to_string(), "ORDERS".to_string()),
                 ]),
@@ -1616,7 +1813,7 @@ mod tests {
         let err = declared
             .resolve(
                 "orders",
-                &HashMap::from([(
+                &Config::from_iter([(
                     "subject-allow".to_string(),
                     "orders.received,billing.>".to_string(),
                 )]),
@@ -1635,13 +1832,13 @@ mod tests {
     fn a_ceiling_nobody_declared_grants_nothing() {
         let declared = PluginBindingSet::new(super::super::PLUGIN_NATS_ID)
             .with_workload_config(WorkloadConfigPolicy::Deny)
-            .with_binding("orders", HashMap::new());
+            .with_binding("orders", Config::new());
         let plugin = WasmcloudNats::new();
 
         let err = declared
             .resolve(
                 "orders",
-                &HashMap::from([("subject-allow".to_string(), "orders.>".to_string())]),
+                &Config::from_iter([("subject-allow".to_string(), "orders.>".to_string())]),
                 &super::super::binding_schema(),
                 &|key: &str, host: &str, workload: &str| plugin.narrows(key, host, workload),
             )
@@ -1656,17 +1853,17 @@ mod tests {
     fn a_refused_workload_key_fails_the_bind() {
         let declared = PluginBindingSet::new(super::super::PLUGIN_NATS_ID)
             .with_workload_config(WorkloadConfigPolicy::Deny)
-            .with_base(HashMap::from([(
+            .with_base(Config::from_iter([(
                 "servers".to_string(),
                 "nats://host:4222".to_string(),
             )]))
-            .with_binding("orders", HashMap::new());
+            .with_binding("orders", Config::new());
         let plugin = WasmcloudNats::new();
 
         let err = declared
             .resolve(
                 "orders",
-                &HashMap::from([("servers".to_string(), "nats://elsewhere:4222".to_string())]),
+                &Config::from_iter([("servers".to_string(), "nats://elsewhere:4222".to_string())]),
                 &super::super::binding_schema(),
                 &|key: &str, host: &str, workload: &str| plugin.narrows(key, host, workload),
             )

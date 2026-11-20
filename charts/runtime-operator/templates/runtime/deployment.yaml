@@ -30,7 +30,8 @@
        the ConfigMap this deployment mounts. */}}
 {{- /* A host group's own `resources` replaces the chart-wide block wholesale
        (no merge), and carries the host knobs `defaultHeapMemory`,
-       `coreInstances`, `guestMemoryMode` and `maxConcurrentStarts` alongside
+       `memoryReservation`, `memoryGuardSize`, `maxMemories`, `setMaxMemoriesFromMemoryPrecommitLimit`, `coreInstances`,
+       `guestMemoryMode`, `maxConcurrentStarts` and `hostcallFuel` alongside
        the Kubernetes requests/limits. */}}
 {{- $resources := .resources | default $top.Values.runtime.resources | default dict }}
 {{- /* Probes, unlike `resources`, merge per field: a group naming one timing
@@ -198,6 +199,14 @@ spec:
         {{- end }}
       serviceAccountName: {{ include "runtime.serviceAccountName" $top }}
       {{- include "runtime-operator.imagePullSecrets" $top | nindent 6 }}
+      {{- with .nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: host
           image: {{ if $imgRegistry }}{{ printf "%s/%s" $imgRegistry $imgRepo }}{{ else }}{{ $imgRepo }}{{ end }}:{{ $imgTag }}
@@ -215,15 +224,21 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            {{- /* Host memory budgets, from the effective `resources`:
-                   `limits.memory` is the host's total guest memory budget,
-                   guestMemoryMode says whether that budget is enforced or only
-                   counted, and defaultHeapMemory/coreInstances are wasmtime
-                   knobs parked alongside them (all three stripped back out of
-                   the `resources:` block below). Unset means unset — the host
-                   then derives its budget from its cgroup, counts against it
-                   rather than enforcing it, and leaves the pool knobs at
-                   wasmtime's defaults.
+            {{- /* Host memory knobs, from the effective `resources`:
+                   guestMemoryMode says how the guest memory budget is applied
+                   (see values.yaml), and defaultHeapMemory/maxMemories/
+                   coreInstances are wasmtime knobs parked alongside it (all
+                   stripped back out of the `resources:` block below). An unset
+                   maxMemories is derived by the host from the node; the other
+                   pool knobs stay at wasmtime's defaults. The mode is always
+                   rendered, `enforce` unless named, so the budget is enforced
+                   whatever the paired host image defaults to.
+
+                   The budget itself is not rendered: the host derives it from
+                   its cgroup, which is `limits.memory`, and keeps a quarter
+                   back for everything in the pod that is not a guest. Passing
+                   `limits.memory` through would enforce a budget of the whole
+                   pod, which the kernel OOM-kills before it refuses a guest.
 
                    These go through the flags' `WASH_*` env fallbacks rather
                    than `args` on purpose. The chart is routinely paired with a
@@ -231,22 +246,38 @@ spec:
                    older host aborts on an argument it does not recognise —
                    whereas it simply ignores an env var it has never heard of.
                    Keep any new host knob on this side of that line. */}}
-            {{- with $resources.limits }}
-            {{- with .memory }}
-            - name: WASH_HOST_MAX_GUEST_MEMORY
-              value: "{{ . }}"
-            {{- end }}
-            {{- end }}
             {{- with $resources.defaultHeapMemory }}
             - name: WASH_DEFAULT_HEAP_MEMORY
+              value: "{{ include "runtime-operator.envNumber" . }}"
+            {{- end }}
+            {{- with $resources.memoryReservation }}
+            - name: WASH_HOST_MEMORY_RESERVATION
               value: "{{ . }}"
+            {{- end }}
+            {{- /* Zero disables the guard; `with` would silently drop a numeric 0. */}}
+            {{- $guard := $resources.memoryGuardSize }}
+            {{- if or (kindIs "int64" $guard) (kindIs "float64" $guard) (and (kindIs "string" $guard) (ne $guard "")) }}
+            - name: WASH_HOST_MEMORY_GUARD_SIZE
+              value: "{{ $guard }}"
+            {{- end }}
+            {{- with $resources.maxMemories }}
+            - name: WASH_MAX_MEMORIES
+              value: "{{ include "runtime-operator.envNumber" . }}"
+            {{- end }}
+            {{- /* Compared as text: every sibling knob is a string, and a
+                   quoted "false" would be truthy to a bare `if`. */}}
+            {{- if eq (toString $resources.setMaxMemoriesFromMemoryPrecommitLimit) "true" }}
+            - name: WASH_SET_MAX_MEMORIES_FROM_MEMORY_PRECOMMIT_LIMIT
+              value: "true"
             {{- end }}
             {{- with $resources.coreInstances }}
             - name: WASH_CORE_INSTANCES
-              value: "{{ . }}"
+              value: "{{ include "runtime-operator.envNumber" . }}"
             {{- end }}
-            {{- with $resources.guestMemoryMode }}
             - name: WASH_GUEST_MEMORY_MODE
+              value: "{{ $resources.guestMemoryMode | default "enforce" }}"
+            {{- with (.networking | default dict).ipNameLookupGrantLifetime }}
+            - name: WASH_IP_NAME_LOOKUP_GRANT_LIFETIME
               value: "{{ . }}"
             {{- end }}
             {{- /* Not `with`: Go templates treat the integer 0 as empty, and
@@ -257,7 +288,16 @@ spec:
             {{- $starts := $resources.maxConcurrentStarts }}
             {{- if or (kindIs "int64" $starts) (kindIs "float64" $starts) (and (kindIs "string" $starts) (ne $starts "")) }}
             - name: WASH_MAX_CONCURRENT_STARTS
-              value: "{{ $starts }}"
+              value: "{{ include "runtime-operator.envNumber" $starts }}"
+            {{- end }}
+            {{- /* The host refuses 0; refused here so an upgrade stops at
+                   render instead of crashlooping every host. */}}
+            {{- if eq (toString $resources.hostcallFuel) "0" }}
+            {{- fail "resources.hostcallFuel must be greater than zero: leave it empty for wasmtime's default" }}
+            {{- end }}
+            {{- with $resources.hostcallFuel }}
+            - name: WASH_HOSTCALL_FUEL
+              value: "{{ include "runtime-operator.envNumber" . }}"
             {{- end }}
             {{- with $top.Values.runtime.env }}
             {{- toYaml . | nindent 12 }}
@@ -312,6 +352,9 @@ spec:
             {{- with $top.Values.runtime.natsConnectTimeoutSeconds }}
             - "--nats-connect-timeout={{ . }}s"
             {{- end }}
+            {{- if $top.Values.runtime.natsIgnoreDiscoveredServers }}
+            - "--nats-ignore-discovered-servers"
+            {{- end }}
             {{- if $endpoint.enabled }}
             - "--probe-addr=0.0.0.0:{{ $endpoint.port }}"
             {{- end }}
@@ -349,6 +392,16 @@ spec:
             {{- with .maxInboundSocketConnectionsPerWorkload }}
             - "--max-inbound-socket-connections-per-workload={{ . }}"
             {{- end }}
+            {{- end }}
+            {{- /* Which host directories a workload's hostPath volume may
+                   name. Rendered only when set, like `networking`. */}}
+            {{- with .hostPaths }}
+            {{- range .allowed }}
+            - "--allowed-host-path={{ . }}"
+            {{- end }}
+            {{- end }}
+            {{- with .scratchRoot }}
+            - "--scratch-root={{ . }}"
             {{- end }}
             {{- if and (.http) (.http.enabled) }}
             - "--http-addr=0.0.0.0:{{ .http.port }}"
@@ -461,7 +514,7 @@ spec:
               readOnly: true
             {{- end }}
             {{- end }}
-          {{- with omit $resources "defaultHeapMemory" "coreInstances" "guestMemoryMode" "maxConcurrentStarts" }}
+          {{- with omit $resources "defaultHeapMemory" "memoryReservation" "memoryGuardSize" "maxMemories" "setMaxMemoriesFromMemoryPrecommitLimit" "coreInstances" "guestMemoryMode" "maxConcurrentStarts" "hostcallFuel" }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}

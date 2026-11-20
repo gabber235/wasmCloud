@@ -39,7 +39,10 @@ use wash_runtime::{
         HostApi, HostBuilder,
         http::{DevRouter, Ingress},
     },
-    plugin::wasmcloud_postgres::{PgId, WasmcloudPostgres},
+    plugin::{
+        PluginBindingSet, PluginBindings,
+        wasmcloud_postgres::{PgId, WasmcloudPostgres},
+    },
     types::{Component, LocalResources, Workload, WorkloadStartRequest, WorkloadState},
     wit::WitInterface,
 };
@@ -61,12 +64,21 @@ fn named_pg(name: &str, url: &str) -> WitInterface {
         package: "postgres".to_string(),
         interfaces: ["query".to_string()].into_iter().collect(),
         version: Some(semver::Version::parse(PG_VERSION).unwrap()),
-        config: HashMap::from([("url".to_string(), url.to_string())]),
+        config: wash_runtime::wit::Config::from_iter([("url".to_string(), url.to_string())]),
         name: Some(name.to_string()),
     }
 }
 
 /// Build a single connection pool from one URL (used for admin DB setup).
+/// A workload's named `wasmcloud:postgres` import, with nothing of its own: its
+/// `url` is the operator's.
+fn pg_label(name: &str) -> WitInterface {
+    WitInterface {
+        config: Default::default(),
+        ..named_pg(name, "")
+    }
+}
+
 async fn connect(url: &str) -> Result<PgId> {
     let registry = WasmcloudPostgres::multiplexer()
         .build_registry(&HashSet::from([named_pg("admin", url)]))
@@ -132,15 +144,29 @@ async fn implements_imports_route_to_per_credential_connections() -> Result<()> 
         .with_engine(engine)
         .with_http_handler(Arc::new(ingress))
         .with_plugin(Arc::new(WasmcloudPostgres::multiplex_only()))?
+        .with_plugin_bindings(
+            PluginBindings::new().with_plugin(
+                PluginBindingSet::new("wasmcloud-postgres")
+                    .with_binding(
+                        "team-a",
+                        wash_runtime::wit::Config::from_iter([("url".to_string(), team_a_url)]),
+                    )
+                    .with_binding(
+                        "team-b",
+                        wash_runtime::wit::Config::from_iter([("url".to_string(), team_b_url)]),
+                    ),
+            ),
+        )
         .build()?;
     let host = host.start().await.context("failed to start host")?;
 
     // The two named interfaces map to the guest's `team-a` / `team-b` query
-    // imports; each routes to a connection with that role's credentials.
+    // imports; each routes to a connection with the credentials the operator
+    // declared for that label.
     let host_interfaces = vec![
         http_incoming_handler_interface("pg-implements", None),
-        named_pg("team-a", &team_a_url),
-        named_pg("team-b", &team_b_url),
+        pg_label("team-a"),
+        pg_label("team-b"),
     ];
 
     let req = WorkloadStartRequest {

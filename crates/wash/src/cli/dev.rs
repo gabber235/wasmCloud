@@ -27,7 +27,7 @@ use crate::{
         CliCommand, CliContext, CommandOutput, component_build::build_dev_component,
         oci::OCI_CACHE_DIR, signal,
     },
-    config::{Config, load_config},
+    config::{Config, WorkloadConfig, load_config_with_defaults},
     wit::WitConfig,
     workload::{ResolvedWorkload, resolve_component_workload, resolve_workload},
 };
@@ -35,6 +35,16 @@ use crate::{
 /// Start a development server for a Wasm component
 #[derive(Debug, Clone, Args)]
 pub struct DevCommand {}
+
+fn dev_config_defaults() -> Config {
+    Config {
+        workload: Some(WorkloadConfig {
+            allowed_hosts: vec![wash_runtime::host::allowed_hosts::AllowedHost::Any],
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
 
 fn dev_socket_policy(
     quotas: &Arc<wash_runtime::host::quota::QuotaRegistry>,
@@ -67,7 +77,7 @@ impl CliCommand for DevCommand {
         // Load configuration with wit fetch disabled for 2 reasons:
         // 1. During dev sessions, we want to avoid network calls for fetching WIT files to ensure faster startup times.
         // 2. It can cause file watchers to enter a build-loop as we touch wkg files during fetch.
-        let config = load_config(
+        let config = load_config_with_defaults(
             &ctx.user_config_path(),
             Some(project_dir),
             Some(Config {
@@ -78,6 +88,7 @@ impl CliCommand for DevCommand {
                 }),
                 ..Default::default()
             }),
+            dev_config_defaults(),
         )
         .context("failed to load config for development")?;
 
@@ -104,6 +115,13 @@ impl CliCommand for DevCommand {
                 .with_context(|| format!("invalid dev.wasm_proposals entry {name:?}"))?;
             engine_builder = engine_builder.with_wasm_proposal(proposal);
         }
+        if let Some(fuel) = wash_runtime::engine::host_memory::parse_hostcall_fuel(
+            dev_config.hostcall_fuel.as_deref(),
+        )
+        .map_err(|e| anyhow::anyhow!("invalid dev.hostcall_fuel: {e}"))?
+        {
+            engine_builder = engine_builder.with_hostcall_fuel(fuel);
+        }
         // Raised before any ceiling is computed from it: every allowance below
         // is a share of the soft descriptor limit. `wash dev` applies it for
         // the same reason `wash host` does — both own their process.
@@ -118,6 +136,13 @@ impl CliCommand for DevCommand {
         // must still name its loopback ports.
         let socket_policy = dev_socket_policy(&quotas);
         engine_builder = engine_builder.with_socket_policy(Arc::clone(&socket_policy));
+        // The session's volumes are the developer's own declaration, so they
+        // are exactly what the session permits; nothing else can name one.
+        engine_builder = engine_builder
+            .with_allowed_host_paths(dev_config.volumes.iter().map(|v| v.host_path.clone()))
+            // Out of `$TMPDIR`: the scratch root is reserved, and a session
+            // mounting `/tmp` as a volume would otherwise be refused.
+            .with_scratch_root(ctx.cache_dir().join("scratch"));
         let engine = engine_builder.build()?;
 
         let mut host_builder = Host::builder()
@@ -165,8 +190,7 @@ impl CliCommand for DevCommand {
         // the engine above actually installed — same construction as `wash
         // host`, so a limit reproduced in dev is the limit production applies.
         // Dev takes no messaging flags, hence `None` for both knobs.
-        let messaging_limits =
-            crate::config::wasmcloud_messaging_limits(None, None, engine.total_core_instances())?;
+        let messaging_limits = crate::config::wasmcloud_messaging_limits(None, None, &engine)?;
 
         // Enable wasmcloud:messaging — NATS when data_nats_url is configured,
         // otherwise the in-memory backend.
@@ -420,17 +444,23 @@ impl CliCommand for DevCommand {
         // After every plugin is registered, so `build()` can refuse a
         // declaration naming an id this host has no plugin for.
         //
-        // `dev.data_nats_url` is the address a `wasmcloud:nats` binding falls
-        // back to. An anchored bundle rather than a plain default: a binding
-        // that names its own `servers` is pointing somewhere else, and should
-        // inherit nothing else from the dev NATS either.
+        // `dev.data_nats_url` is the address a `wasmcloud:nats` binding, or a
+        // `wasi:blobstore` one naming credentials, falls back to. An anchored
+        // bundle rather than a plain default: a binding that names its own
+        // `servers` is pointing somewhere else, and should inherit nothing
+        // else from the dev NATS either.
         let mut plugin_bindings =
             dev_config.to_plugin_bindings(&config, project_dir, Some(project_dir))?;
         if let Some(url) = &dev_config.data_nats_url {
-            let nats = plugin_bindings
-                .for_plugin(plugin::wasmcloud_nats::PLUGIN_NATS_ID)
-                .with_default_bundle("servers", [("servers", url.clone())]);
-            plugin_bindings = plugin_bindings.with_plugin(nats);
+            for id in [
+                plugin::wasmcloud_nats::PLUGIN_NATS_ID,
+                plugin::wasi_blobstore::PLUGIN_BLOBSTORE_ID,
+            ] {
+                let set = plugin_bindings
+                    .for_plugin(id)
+                    .with_default_bundle("servers", [("servers", url.clone())]);
+                plugin_bindings = plugin_bindings.with_plugin(set);
+            }
         }
         host_builder = host_builder.with_plugin_bindings(plugin_bindings);
 
@@ -458,6 +488,15 @@ impl CliCommand for DevCommand {
         // gitignored-secret warning.
         let resolved_workload = resolve_workload(&config, project_dir, Some(project_dir))
             .context("failed to resolve workload-level configuration")?;
+        if resolved_workload
+            .allowed_hosts
+            .contains(&wash_runtime::host::allowed_hosts::AllowedHost::Any)
+        {
+            info!(
+                "workload allowedHosts admits every host; set workload.allowedHosts in \
+                 .wash/config.yaml to restrict outbound HTTP and socket connections"
+            );
+        }
         let workload = create_workload(
             &host,
             &config,
@@ -869,10 +908,7 @@ fn build_workload_host_interfaces(
         {
             Some(existing) => {
                 for (k, v) in workload_config {
-                    existing
-                        .config
-                        .entry(k.clone())
-                        .or_insert_with(|| v.clone());
+                    existing.config.entry(k.clone()).or_insert_with(|| v.into());
                 }
             }
             None => {
@@ -881,7 +917,7 @@ fn build_workload_host_interfaces(
                     package: "config".into(),
                     interfaces: Default::default(),
                     version: None,
-                    config: workload_config.clone(),
+                    config: workload_config.clone().into(),
                     name: None,
                 });
             }
@@ -921,6 +957,294 @@ async fn reload_component(
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[allow(clippy::unwrap_used)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::config::{DevComponent, DevConfig};
+    use wash_runtime::types::WorkloadStatusRequest;
+
+    #[test]
+    fn dev_egress_defaults_respect_configured_policies() {
+        use wash_runtime::host::allowed_hosts::AllowedHost;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wash_dir = dir.path().join(crate::cli::CONFIG_DIR_NAME);
+        std::fs::create_dir(&wash_dir).unwrap();
+        let global = dir.path().join("global.yaml");
+        let local = wash_dir.join(crate::cli::CONFIG_FILE_NAME);
+        let cases = [
+            (None, None, vec![AllowedHost::Any]),
+            (None, Some("workload: {}"), vec![AllowedHost::Any]),
+            (
+                None,
+                Some("workload:\n  environment:\n    config: {LOG: debug}"),
+                vec![AllowedHost::Any],
+            ),
+            (None, Some("workload:\n  allowedHosts: []"), vec![]),
+            (
+                None,
+                Some("workload:\n  allowedHosts: ['api.example.com']"),
+                vec!["api.example.com".parse().unwrap()],
+            ),
+            (
+                Some("workload:\n  allowedHosts: []"),
+                Some("workload: {}"),
+                vec![],
+            ),
+            (
+                Some("workload:\n  allowedHosts: ['*']"),
+                Some("workload:\n  allowedHosts: []"),
+                vec![],
+            ),
+        ];
+        for (global_yaml, local_yaml, expected) in cases {
+            for (path, yaml) in [(&global, global_yaml), (&local, local_yaml)] {
+                if let Some(yaml) = yaml {
+                    std::fs::write(path, yaml).unwrap();
+                } else if path.exists() {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+            let config = load_config_with_defaults::<Config>(
+                &global,
+                Some(dir.path()),
+                None,
+                dev_config_defaults(),
+            )
+            .unwrap();
+            let resolved = resolve_workload(&config, dir.path(), None).unwrap();
+            assert_eq!(
+                resolved.allowed_hosts, expected,
+                "{global_yaml:?}, {local_yaml:?}"
+            );
+            assert!(resolved.allowed_ip_name_lookups.is_empty());
+            assert!(resolved.allowed_host_loopback_ports.is_empty());
+            let saved = serde_saphyr::to_string(&config).unwrap();
+            let reloaded: Config = serde_saphyr::from_str(&saved).unwrap();
+            assert_eq!(
+                resolve_workload(&reloaded, dir.path(), None).unwrap(),
+                resolved
+            );
+        }
+    }
+
+    fn component() -> Bytes {
+        // Empty component with no imports or exports.
+        Bytes::from_static(b"\0asm\x0d\0\x01\0")
+    }
+
+    fn host() -> Host {
+        Host::builder()
+            .with_engine(
+                Engine::builder()
+                    .with_pooling_allocator(false)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn loads_sidecars_and_service_with_resolved_resources() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("component.wasm");
+        std::fs::write(&path, component())?;
+        let config = Config {
+            dev: Some(DevConfig {
+                service_file: Some(path.clone()),
+                components: vec![DevComponent {
+                    config: HashMap::from([("shared".into(), "sidecar".into())]),
+                    pool_size: Some(2),
+                    max_invocations: Some(3),
+                    max_concurrency: Some(4),
+                    reclaim_window_seconds: Some(5),
+                    reclaim_min_instances: Some(1),
+                    ..DevComponent::new("sidecar", path)
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = ResolvedWorkload {
+            environment: HashMap::from([("APP".into(), "development".into())]),
+            config: HashMap::from([("shared".into(), "workload".into())]),
+            ..Default::default()
+        };
+        let workload = create_workload(
+            &host(),
+            &config,
+            dir.path(),
+            component(),
+            &resolved,
+            &OciConfig::new_with_cache(dir.path().join("cache")),
+        )
+        .await?;
+        let mut components = workload.components.iter();
+        let main = components.next().unwrap();
+        let sidecar = components.next().unwrap();
+        assert!(components.next().is_none());
+        assert_eq!(main.local_resources.config, resolved.config);
+        assert_eq!(sidecar.name, "sidecar");
+        assert_eq!(sidecar.bytes, component());
+        assert!(sidecar.digest.is_some());
+        assert_eq!(sidecar.local_resources.environment, resolved.environment);
+        assert_eq!(
+            sidecar.local_resources.config.get("shared").unwrap(),
+            "sidecar"
+        );
+        assert_eq!(
+            (
+                sidecar.pool_size,
+                sidecar.max_invocations,
+                sidecar.max_concurrency
+            ),
+            (2, 3, 4)
+        );
+        assert_eq!(
+            (
+                sidecar.reclaim_window_seconds,
+                sidecar.reclaim_min_instances
+            ),
+            (5, 1)
+        );
+        let service = workload.service.unwrap();
+        assert_eq!(service.bytes, component());
+        assert!(service.digest.is_some());
+        assert_eq!(service.local_resources.config, resolved.config);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dev_service_does_not_fetch_the_configured_service() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = Config {
+            dev: Some(DevConfig {
+                service: true,
+                service_file: Some(dir.path().join("missing.wasm")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let workload = create_workload(
+            &host(),
+            &config,
+            dir.path(),
+            component(),
+            &ResolvedWorkload::default(),
+            &OciConfig::new_with_cache(dir.path().join("cache")),
+        )
+        .await?;
+        assert!(workload.components.is_empty());
+        assert_eq!(workload.service.unwrap().bytes, component());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loading_errors_identify_the_failing_component() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let host = host();
+        let oci = OciConfig::new_with_cache(dir.path().join("cache"));
+        for (dev, bytes, expected) in [
+            (
+                DevConfig::default(),
+                Bytes::from_static(b"invalid wasm"),
+                "failed to extract component interfaces",
+            ),
+            (
+                DevConfig {
+                    components: vec![DevComponent::new(
+                        "missing-sidecar",
+                        dir.path().join("missing.wasm"),
+                    )],
+                    ..Default::default()
+                },
+                component(),
+                "dev.components['missing-sidecar']",
+            ),
+            (
+                DevConfig {
+                    service_file: Some(dir.path().join("missing-service.wasm")),
+                    ..Default::default()
+                },
+                component(),
+                "failed to load the dev service component",
+            ),
+        ] {
+            let config = Config {
+                dev: Some(dev),
+                ..Default::default()
+            };
+            let error = create_workload(
+                &host,
+                &config,
+                dir.path(),
+                bytes,
+                &ResolvedWorkload::default(),
+                &oci,
+            )
+            .await
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reload_replaces_the_previous_workload() -> anyhow::Result<()> {
+        let host = host().start().await?;
+        let workload = build_workload(
+            &DevConfig::default(),
+            component(),
+            HashSet::new(),
+            vec![],
+            None,
+            &ResolvedWorkload::default(),
+        );
+        let first = reload_component(Arc::clone(&host), &workload, None).await?;
+        let second = reload_component(Arc::clone(&host), &workload, Some(first.clone())).await?;
+        assert_ne!(first, second);
+        let old = host
+            .workload_status(WorkloadStatusRequest { workload_id: first })
+            .await?;
+        assert_eq!(old.workload_status.workload_state, WorkloadState::NotFound);
+        let current = host
+            .workload_status(WorkloadStatusRequest {
+                workload_id: second,
+            })
+            .await?;
+        assert_eq!(
+            current.workload_status.workload_state,
+            WorkloadState::Running
+        );
+        host.stop().await
+    }
+
+    #[tokio::test]
+    async fn reload_reports_a_failed_workload() -> anyhow::Result<()> {
+        let host = host().start().await?;
+        let workload = build_workload(
+            &DevConfig::default(),
+            Bytes::from_static(b"invalid wasm"),
+            HashSet::new(),
+            vec![],
+            None,
+            &ResolvedWorkload::default(),
+        );
+        let error = reload_component(Arc::clone(&host), &workload, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("failed to reload component"),
+            "{error:#}"
+        );
+        host.stop().await
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::config::{DevComponent, DevConfig, DevVolume};
@@ -943,7 +1267,7 @@ mod tests {
             package: package.into(),
             interfaces: HashSet::new(),
             version: None,
-            config: HashMap::new(),
+            config: Default::default(),
             name: None,
         }
     }
@@ -951,7 +1275,7 @@ mod tests {
     fn iface_with_config(namespace: &str, package: &str, kvs: &[(&str, &str)]) -> WitInterface {
         let mut i = iface(namespace, package);
         for (k, v) in kvs {
-            i.config.insert((*k).into(), (*v).into());
+            i.config.insert(*k, *v);
         }
         i
     }
@@ -1208,7 +1532,7 @@ mod tests {
     /// entry that omits them round-trips as "unset" rather than zero.
     #[test]
     fn dev_component_warm_instance_limits_deserialize() {
-        let with: DevComponent = serde_yaml_ng::from_str(
+        let with: DevComponent = serde_saphyr::from_str(
             "name: pooled\nfile: pooled.wasm\npoolSize: 8\nmaxInvocations: 50\n\
              reclaimWindowSeconds: 60\nreclaimMinInstances: 2",
         )
@@ -1219,7 +1543,7 @@ mod tests {
         assert_eq!(with.reclaim_min_instances, Some(2));
 
         let without: DevComponent =
-            serde_yaml_ng::from_str("name: plain\nfile: plain.wasm").unwrap();
+            serde_saphyr::from_str("name: plain\nfile: plain.wasm").unwrap();
         assert_eq!(without.pool_size, None);
         assert_eq!(without.max_invocations, None);
         assert_eq!(without.reclaim_window_seconds, None);

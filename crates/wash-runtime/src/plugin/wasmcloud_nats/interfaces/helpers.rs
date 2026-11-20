@@ -82,7 +82,7 @@ pub(super) fn check_subject(conn: &ConnHandle, subject: &str) -> Result<(), type
 /// deployable behind an `_INBOX.>` grant — which would also let the workload
 /// read every other client's replies. Only a plain not-granted refusal is
 /// reconsidered: a reserved prefix or a wildcard stays denied, so a hostile
-/// requester cannot aim `reply-to` at `$SYS.>` and use the responder as a
+/// requester cannot aim `reply-to` at `$JS.API.>` and use the responder as a
 /// confused deputy. The grant is one-shot, so it cannot be replayed.
 pub(super) fn check_publish_subject(
     conn: &ConnHandle,
@@ -90,7 +90,7 @@ pub(super) fn check_publish_subject(
 ) -> Result<(), types::NatsError> {
     match conn.policy.check_subject(subject) {
         Ok(()) => Ok(()),
-        Err(Denied::NotGranted) if conn.take_reply_grant(subject) => Ok(()),
+        Err(Denied::NotGranted) if conn.reply_grants.take(subject) => Ok(()),
         Err(reason) => Err(denied(reason, types::DeniedResource::Subject, subject)),
     }
 }

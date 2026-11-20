@@ -45,7 +45,10 @@ type VolumeMount struct {
 	// +kubebuilder:validation:Required
 	Name string `json:"name"`
 	// MountPath is the path within the component where the volume should be mounted.
+	// It must be absolute, and no segment may be `.` or `..`; the host refuses
+	// any other path when the workload starts.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^/(([^/]*[^/.][^/]*|[.][.][.]+)?/?)*$`
 	MountPath string `json:"mountPath"`
 	// ReadOnly indicates whether the volume should be mounted as read-only.
 	// +kubebuilder:validation:Optional
@@ -91,6 +94,12 @@ type LocalResources struct {
 	// path (beyond bare `/`), query string, or fragment. The wildcard must
 	// be `*.<rest>` (leading dot required); a bare `*foo` is rejected.
 	//
+	// A raw socket carries no name, so an entry naming a host permits a
+	// wasi:sockets connection only to an address the component resolved
+	// that name into, on the entry's port, for a short time after the
+	// lookup. The entry also permits the lookup itself. An entry with a
+	// scheme and no port permits that scheme's default port.
+	//
 	// Empty or absent allowedHosts denies all outgoing requests
 	// (fail-closed). To opt into unrestricted egress, set `allowedHosts:
 	// ["*"]` explicitly. Final validation runs in the runtime. This regex
@@ -111,11 +120,12 @@ type LocalResources struct {
 	// query string, or fragment. The wildcard must be "*.<rest>" with a
 	// leading dot; a bare "*foo" is rejected.
 	//
-	// Empty or absent allowedIpNameLookups denies every lookup, reported to
-	// the component as permanent-resolver-failure. To resolve any name,
-	// set allowedIpNameLookups: ["*"] explicitly. Resolution is granted
-	// separately from allowedHosts, which governs outbound connections
-	// rather than name lookups. Final validation runs in the runtime.
+	// A host named in allowedHosts may be resolved without being listed
+	// here: this list is for names beyond those. With neither naming it, a
+	// lookup is denied and reported to the component as
+	// permanent-resolver-failure. To resolve any name, set
+	// allowedIpNameLookups: ["*"] explicitly; `*` in allowedHosts permits
+	// connections but opens no lookup. Final validation runs in the runtime.
 	// This regex is an admission-time guard, not the source of truth.
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:items:Pattern=`^\*$|^(\*\.)?[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$|^[0-9A-Fa-f:.]+$`
@@ -192,9 +202,11 @@ type WorkloadComponent struct {
 	ReclaimWindowSeconds int32 `json:"reclaimWindowSeconds,omitempty"`
 	// ReclaimMinInstances is how many warm instances an idle sweep never
 	// retires below. Unset lets a fully idle pool empty out, so the next call
-	// after a quiet spell starts cold. Capped at PoolSize. This is a floor on
-	// reclaim, not a target to grow to: instances are still only built when a
-	// call needs one. Only meaningful alongside ReclaimWindowSeconds.
+	// after a quiet spell starts cold. A value at or above PoolSize disables
+	// reclaim entirely, since a sweep could never find a surplus to retire.
+	// This is a floor on reclaim, not a target to grow to: instances are
+	// still only built when a call needs one. Only meaningful alongside
+	// ReclaimWindowSeconds.
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Minimum=0
 	ReclaimMinInstances int32 `json:"reclaimMinInstances,omitempty"`

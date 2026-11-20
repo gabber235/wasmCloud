@@ -62,7 +62,7 @@ nats:
     registry: docker.io
     repository: nats
     pull_policy: Always
-    tag: "2.12.8-alpine"
+    tag: "2.12.15-alpine"
   # -- Compute resources for the NATS container. Idle ~6Mi (profiled); the
   # bundled NATS is light control-plane use, so the limit is sized accordingly.
   resources:
@@ -199,9 +199,16 @@ operator:
   # setting `spec.template.spec.environment: namespace-b`. If your install
   # relies on namespace boundaries for tenant isolation, set this to
   # `false`: scheduling will then be locked to the workload's own
-  # namespace, and any cross-tenant `environment` is rejected with a
+  # namespace, and any cross-tenant `environment` or a `hostId` pinning
+  # another tenant's host is rejected with a
   # `CrossEnvironmentSchedulingDenied` Warning Event and a
   # `HostSelection=False` condition on the Workload.
+  # Running workloads are held to the same rule: setting this to `false` on
+  # a live cluster stops each one placed outside its namespace's environment,
+  # ten a second, and schedules it again (a pinned one stays unscheduled).
+  # A workload pinned with `hostId` waits until that host has registered,
+  # with a `PinnedHostNotRegistered` Warning Event, since an unregistered
+  # host's environment cannot be checked.
   allowSharedHosts: true
   # -- Additional environment variables for the operator container, appended
   # after the chart-managed vars. Standard Kubernetes env shape (supports
@@ -226,6 +233,11 @@ operator:
   #   extraArgs:
   #     - "-cpu-backpressure-threshold=75"
   extraArgs: []
+  # -- Additional operator pod volumes, including credential Secrets.
+  volumes: []
+  # -- Additional operator container mounts. Mount Secret directories without
+  # subPath so Kubernetes can refresh rotated credentials.
+  volumeMounts: []
   # -- How long a terminating operator pod has to shut down before it is
   # killed. On `SIGTERM` the manager stops its controllers and lets the
   # reconciles already running finish, waiting up to controller-runtime's 30s
@@ -408,12 +420,17 @@ runtime:
   # host: size `limits.memory` for your expected per-host workload density, or
   # remove it to leave host memory uncapped.
   #
-  # `defaultHeapMemory`, `coreInstances`, `guestMemoryMode` and
-  # `maxConcurrentStarts` are host knobs rather than Kubernetes resource fields;
-  # the chart strips them out of the container's `resources` block and sets them
-  # as `WASH_DEFAULT_HEAP_MEMORY` / `WASH_CORE_INSTANCES` /
-  # `WASH_GUEST_MEMORY_MODE` / `WASH_MAX_CONCURRENT_STARTS` for the host.
-  # Leaving them empty uses the host's own defaults.
+  # `defaultHeapMemory`, `memoryReservation`, `memoryGuardSize`, `maxMemories`,
+  # `setMaxMemoriesFromMemoryPrecommitLimit`, `coreInstances`, `guestMemoryMode`,
+  # `maxConcurrentStarts` and `hostcallFuel` are host knobs rather than Kubernetes
+  # resource fields; the chart strips them out of the container's `resources`
+  # block and sets them as `WASH_DEFAULT_HEAP_MEMORY` /
+  # `WASH_HOST_MEMORY_RESERVATION` / `WASH_HOST_MEMORY_GUARD_SIZE` /
+  # `WASH_MAX_MEMORIES` / `WASH_SET_MAX_MEMORIES_FROM_MEMORY_PRECOMMIT_LIMIT` /
+  # `WASH_CORE_INSTANCES` / `WASH_GUEST_MEMORY_MODE` /
+  # `WASH_MAX_CONCURRENT_STARTS` / `WASH_HOSTCALL_FUEL` for the host.
+  # Leaving them empty uses the
+  # host's own defaults.
   #
   # The simplest way to change host sizing for the whole release:
   #   --set runtime.resources.limits.memory=2Gi
@@ -423,29 +440,87 @@ runtime:
       cpu: "250m"
       memory: "64Mi"
     limits:
-      memory: "512Mi"
+      memory: "768Mi"
     # -- Ceiling on any single guest linear memory. Empty leaves wasmtime's
     # default of 4GiB.
     defaultHeapMemory: ""
-    # -- Instance slots the pooling allocator keeps. Empty leaves wasmtime's
-    # default of 1000.
-    coreInstances: ""
-    # -- Whether `limits.memory` is enforced against total guest memory or only
-    # counted: `count` (the default) charges every guest `memory.grow` to the
-    # budget and reports what it would have refused, but allows it; `enforce`
-    # refuses growth past the budget, which the guest sees as `memory.grow`
-    # returning -1. Guest memory has never been bounded in aggregate, so run in
-    # `count` and watch the host's reported high-water mark before switching.
+    # -- Address space reserved for each guest linear memory:
+    # the memory itself, plus the room it may grow into.
+    # Empty is wasmtime's 4GiB.
     #
-    # Before setting `enforce`, note that the chart passes `limits.memory`
-    # through as the guest budget unchanged — 100% of the pod. Guests are not
-    # all a host pod holds: wasmtime itself, compiled module images, NATS, OCI
-    # pulls and HTTP buffers come out of the same limit, and none of them is
-    # charged to this budget. A host left to derive its own budget keeps a
-    # quarter back for them. So an enforced budget equal to `limits.memory` can
-    # still be OOM-killed before it ever refuses a guest; give the host its
-    # headroom by setting `limits.memory` above the guest budget you want, or
-    # by overriding `WASH_HOST_MAX_GUEST_MEMORY` below it via `runtime.env`.
+    # - Each memory's pool slot is this reservation,
+    #   followed by `memoryGuardSize` of unmapped guard.
+    # - With pooling, no memory grows past it, so `defaultHeapMemory` is lowered to it.
+    #   Without pooling, memories may relocate and grow beyond it;
+    #   the guest and process memory budgets still apply.
+    # - Smaller fits more warm instances in the node's address space
+    #   (about 16,000 at 4GiB each).
+    # - SECURITY: smaller moves an isolation boundary and reduces defense in depth.
+    #   At 4GiB, the reservation covers a 32-bit dynamic index;
+    #   the guard covers many constant offsets. Larger offsets still need checks.
+    #   Smaller layouts rely more on software bounds checks,
+    #   whose bugs could expose another guest's memory.
+    # - More explicit bounds checks can slow guest memory access.
+    memoryReservation: ""
+    # -- Unmapped guard after each guest memory's reservation,
+    # between it and the next slot; never accessible to a guest.
+    # Empty is wasmtime's 32MiB.
+    # It catches accesses whose constant offset carries them past the reservation.
+    # Smaller shrinks each slot, and moves the same isolation boundary
+    # as `memoryReservation`.
+    memoryGuardSize: ""
+    # -- Linear memories the pooling allocator keeps room for, the count that
+    # sizes the pool: by default, each reserves 4 GiB plus a guard, and
+    # the fiber-stack, component-instance, core-instance, table and GC heap
+    # totals follow from it. Empty lets the host derive it from the node: half its
+    # address space and 90% of `vm.max_map_count` at six mappings per warm
+    # component, 9,829 on a default Linux node, never below 1000. Set it to
+    # plan a node's `vm.max_map_count` around a known pool.
+    maxMemories: ""
+    # -- On a node that commits the pool's stack and table mappings at
+    # startup (Linux with `vm.overcommit_memory=2`, or a finite `RLIMIT_DATA`),
+    # an empty `maxMemories` keeps the host at 1000 memories rather than the
+    # derived count, since the derived count would commit about 25 GiB of
+    # stacks and tables. `true` lets the host size itself against a quarter
+    # of its commit limit instead, the smallest of that and the usual bounds.
+    # No effect on other nodes or when `maxMemories` is set.
+    setMaxMemoriesFromMemoryPrecommitLimit: false
+    # -- Core instances (live core modules) the pool admits: a counter that
+    # reserves nothing, sixteen per memory when empty. Set alone, without
+    # `maxMemories`, it also pins the memory count to this number, as it did
+    # before `maxMemories` existed, and the host warns at startup; set
+    # `maxMemories` instead.
+    coreInstances: ""
+    # -- How the host's guest memory budget is applied:
+    #
+    # - `enforce` (what an empty value renders) refuses growth past the budget.
+    #   The guest sees `memory.grow` return -1.
+    # - `count` charges every guest `memory.grow` to the budget
+    #   and reports what it would have refused, but allows it.
+    #   Use it to size a host: watch the reported high-water mark,
+    #   then return to `enforce`.
+    # - `growth` enforces like `enforce`,
+    #   but leaves up to 2 MiB of each memory's first allocation
+    #   (its initial size) uncharged.
+    #   It is for hosts packing many small instances.
+    #
+    # `growth` overcommits.
+    # The process-memory guard (on by default, derived from `limits.memory`)
+    # refuses only new instances and growth,
+    # so instances that come to write all their initial memory
+    # can take the host past its limit.
+    # `WASH_HOST_MAX_INITIAL_GUEST_MEMORY` bounds the overcommit:
+    # four times the budget, unless set in `runtime.env`.
+    #
+    # The host derives the budget: three quarters of `limits.memory`, and
+    # never less than 256MiB — so keep `limits.memory` above 342Mi, or the
+    # floor leaves the host no headroom. Guests are not all a host pod holds:
+    # wasmtime itself, compiled module images, NATS, OCI pulls and HTTP
+    # buffers come out of the same limit, and none of them is charged to this
+    # budget, so the last quarter is kept back for them. The same budget sizes
+    # the `wasmcloud:nats` backlog ceiling. Name a different budget with
+    # `WASH_HOST_MAX_GUEST_MEMORY` via `runtime.env`; one equal to
+    # `limits.memory` can be OOM-killed before it ever refuses a guest.
     guestMemoryMode: ""
     # -- How many workloads a host pulls and compiles at once. Each start it
     # admits ends in a compile that spreads over every core the host can see,
@@ -466,6 +541,21 @@ runtime:
     # explicitly on a host group that is requested far below the node it lands
     # on.
     maxConcurrentStarts: ""
+    # -- Roughly the most bytes a guest may copy to the host in one call
+    # (e.g. `256MiB`). Past it the call traps. Must be greater than zero.
+    #
+    # Also bounds each read the host makes from a future or stream, but not
+    # byte streams it reads directly, such as HTTP bodies and socket writes.
+    # This is wasmtime's [`Store::set_hostcall_fuel`]. Unset, it is
+    # wasmtime's default of 128 MiB. The host allocates these bytes outside
+    # the guest memory budget, from what `limits.memory` leaves over after
+    # that budget (192 MiB at the default 768Mi; less on a small limit, where
+    # the budget's 256 MiB floor takes more than three quarters). With a
+    # `guestMemoryMode` other than `count`, the host warns at startup when
+    # this is larger. Unrelated to fuel metering.
+    #
+    # [`Store::set_hostcall_fuel`]: https://docs.rs/wasmtime/latest/wasmtime/struct.Store.html#method.set_hostcall_fuel
+    hostcallFuel: ""
   # -- Probes for host containers, rendered for a host group with
   # `probes.endpoint` enabled or one that serves HTTP
   # (`hostGroups[].http.enabled`). A host group sets its own with
@@ -574,6 +664,12 @@ runtime:
   # rather than a reason to exit and spend a pod restart. Zero fails on the
   # first refusal. `probes.endpoint.startupFailureThreshold` has to cover this.
   natsConnectTimeoutSeconds: 60
+  # -- Restrict host and workload NATS connections to their configured URLs.
+  # Defaults to true for the chart's NATS Service; advertised pod IPs can be
+  # reused by another cluster. Set false when a host group uses a single pod
+  # URL and needs discovery for cluster failover, or runs an older host image
+  # without --nats-ignore-discovered-servers. Applies to every host group.
+  natsIgnoreDiscoveredServers: true
   # -- How long a terminating host pod has to shut down before it is killed.
   #
   # Three numbers in sequence, and this is the budget for all of them:
@@ -634,20 +730,28 @@ runtime:
       # a binding of its own; it defaults to `deny`.
       #
       # Keys are `wasmcloud:nats` config keys — `servers`, `subject-allow`,
-      # `stream-allow`, `bucket-allow`, `creds`, `jwt`/`nkey-seed`,
+      # `stream-allow`, `stream-delete-allow`, `bucket-allow`, `creds`, `jwt`/`nkey-seed`,
       # `username`/`password`, `token`, `tls-*`, `jetstream-domain`. The
       # entry's own `config` applies to every binding; each entry under
       # `bindings` layers over it. Leave `servers` out to take
       # `wasmcloudNatsUrl` above, which brings the data plane's TLS with it.
       #
-      # The three grants are ceilings, not switches: a workload may ask for a
-      # subset of what is declared here and is refused only for asking for
-      # more. All three are deny-by-default, and `stream-allow` on its own
-      # reaches nothing readable — every stored message a workload reads is
-      # checked against `subject-allow` as well, so a binding granted streams
-      # and no subjects gets empty results rather than an error. Grant the
-      # subjects those streams store alongside the stream itself. (The host
-      # warns at bind when a binding has streams and no subjects.)
+      # `nkey-seed-file`, `password-file` and `token-file` name files in place
+      # of those values. The host rereads them, like `creds`, on every
+      # reconnect, so a Secret mounted into the host pod rotates without a
+      # redeploy. `jwt-as-token: "true"` also sends the `creds` or `jwt` user
+      # JWT as the token, for an auth callout on a server without trusted
+      # operators, which drops the JWT before the callout sees it.
+      #
+      # A workload may narrow the host's grant ceilings. All deny by default.
+      # Stored messages also require `subject-allow`, so `stream-allow` on its
+      # own reaches nothing readable: a binding granted streams and no subjects
+      # gets empty results rather than an error. Grant the subjects those
+      # streams store alongside the stream itself. (The host warns at bind
+      # when a binding has streams but no subjects.)
+      # Purge and delete also require `stream-delete-allow` for the stream.
+      # Purge filters must fit inside `subject-allow`; deleting a sequence
+      # checks its stored subject. All grants are host-owned ceilings.
       #
       # `inbox-prefix` is refused on the entry's own `config`: it would give
       # every workload on the group the same inbox, and two workloads sharing
@@ -702,10 +806,44 @@ runtime:
       #                   how you rehearse a flip to `deny` without breaking a
       #                   workload mid-flight.
       #
-      #                   `deny` refuses nothing where nothing is declared, so
-      #                   it is safe as the default: a plugin that names no
-      #                   keys of its own, under an entry that sets none, owns
-      #                   none.
+      #                   `deny` refuses only the keys a plugin claims or this
+      #                   entry sets. The built-ins claim the keys that decide
+      #                   what a binding reaches: `wasmcloud-nats` its servers,
+      #                   credentials, and grants; the multiplexed keyvalue
+      #                   plugins `url`, `root`, and `prefix`, plus the redis
+      #                   connection settings below, blobstore `url` and
+      #                   `root`, messaging `url`; `wasmcloud-postgres` a
+      #                   named import's `url`, and the databases the unnamed
+      #                   import may select as a comma-separated `database`.
+      #
+      #                   Redis keyvalue connection settings (the v1 redis
+      #                   provider's names; any case, `_` or `-`), set on a
+      #                   binding's `config`:
+      #                     backend-reconnect-num-retries   redials of a
+      #                       dropped connection before the waiting call
+      #                       fails (default 3, max 1000)
+      #                     backend-reconnect-max-delay-ms  longest pause
+      #                       between redials (default 300, max 600000)
+      #                     backend-connection-timeout-ms   cap on one
+      #                       connection attempt (default 3000, 1 to 600000);
+      #                       with the two above, one whole redial must fit
+      #                       in 600000ms or the binding is refused
+      #                     backend-response-timeout-ms     cap on one
+      #                       command's reply (default none: a large SCAN or
+      #                       MGET can be slow, and a timed-out command still
+      #                       runs on the server; 1 to 600000)
+      #                   A binding with different settings gets its own
+      #                   connection rather than sharing a pooled one.
+      #                   Upgrading: these keys are the operator's, so under
+      #                   `deny` a workload that sets one (as a manifest
+      #                   carried over from a v1 redis link may) is refused
+      #                   where it used to bind with the key ignored. Move the
+      #                   value to the binding here, or drop it.
+      #
+      #                   A value on the entry's own `config` is shared by every
+      #                   workload binding that label: one `root` or redis
+      #                   `prefix` there is one store for all of them. Declare
+      #                   `bindings` per label to keep workloads apart.
       #   hostOwnedKeys   extra keys claimed for the host under `deny`, on top
       #                   of the ones the plugin declares in code and the ones
       #                   this entry sets. The point is the keys left *unset* —
@@ -715,6 +853,11 @@ runtime:
       #                   `(implements ..)` label a workload asks for. Each
       #                   takes its own `config`/`configFrom`/`secretFrom`,
       #                   layered over the entry's.
+
+      #
+      # A `secretFrom` name may also be a key of this host group's
+      # `pluginSecrets` (below), served by a host component plugin at bind
+      # instead of a Kubernetes Secret.
       #
       # Every entry here is file-backed (rendered into the `wash host` config
       # file, never a CLI arg), since a binding can carry credentials.
@@ -741,6 +884,47 @@ runtime:
       #         prod:
       #           configFrom: [vault-prod]
       plugins: []
+      # -- Secrets a host component plugin serves through
+      # `wasmcloud:host/secret-source`, by the name a `plugins` entry's or
+      # binding's `secretFrom` uses. `keys` maps each config key to the key
+      # the plugin is asked for. `workloads` is required: the namespaces (and
+      # optionally names) whose workloads may have its values, or `all`. A
+      # name is a WorkloadDeployment's, WorkloadDaemonSet's or WorkloadReplicaSet's,
+      # else the Workload's own; it narrows a grant within a namespace, which is the
+      # boundary. The host asks the plugin on every workload bind, naming the
+      # workload, so one entry serves each workload its own value when the
+      # plugin scopes its answer by that name; a rotation reaches the next
+      # bind, and no volume or Reloader annotation is involved.
+      # A workload outside the grant fails to deploy. On `wasmcloud-secrets`,
+      # whose keys each stand alone, an entry its own `secretFrom` names is
+      # instead left out of that workload's config.
+      # Only `plugins` entries and bindings can name one, and while an entry's
+      # own `secretFrom` names one, no other plugin may serve the same
+      # interface, or a workload's plain import would bypass the grant.
+      #
+      #   pluginSecrets:
+      #     # Each workload's own secrets, under the key names it imports.
+      #     workload-secrets:
+      #       plugin: vault-secrets
+      #       keys:
+      #         db-password: db-password
+      #       workloads: all
+      #     # One postgres role every replica of `billing/reports` shares.
+      #     reports-db:
+      #       plugin: vault-secrets
+      #       keys:
+      #         url: platform/postgres/reports-url
+      #       workloads:
+      #         - namespace: billing
+      #           name: reports
+      #   plugins:
+      #     - id: wasmcloud-secrets
+      #       secretFrom: [workload-secrets]
+      #     - id: wasmcloud-postgres
+      #       bindings:
+      #         reports-db:
+      #           secretFrom: [reports-db]
+      pluginSecrets: {}
       # -- Deprecated alias for `plugins`, from when only component plugins
       # could be declared. Entries here must name an `image` or `file`; a
       # native plugin's configuration belongs under `plugins`. Merges with
@@ -792,7 +976,8 @@ runtime:
       # the host on its own. Without that controller the annotations are
       # inert, and a rotation needs a manual `kubectl rollout restart`.
       #
-      #   allowedIpNameLookups  names this plugin may resolve. Omitted/empty
+      #   allowedIpNameLookups  names this plugin may resolve, beyond the
+      #                   hosts `allowedHosts` names. Both omitted/empty
       #                   denies every lookup.
       #   allowedHostLoopbackPorts  ports this plugin may reach on host
       #                   loopback. Components use raw `wasi:sockets` with
@@ -837,13 +1022,37 @@ runtime:
         # `allowedHostLoopbackPorts` entry naming the port. `127.0.0.1` keeps
         # meaning the guest's own virtual network either way.
         allowHostLoopback: false
-        # -- How the raw-socket egress policy is applied: `count` or `enforce`.
+        # -- How the raw-socket egress policy is applied: `enforce` or `count`.
         #
-        # Raw socket connect was never gated, so enforcing on upgrade would
-        # sever live traffic. `count` evaluates the policy, records what it
-        # would refuse, and allows the connection anyway. Watch the
-        # would-deny counters, then switch to `enforce`.
-        socketEgress: count
+        # `enforce` refuses a connection the policy does not permit: a workload
+        # reaches only what its `allowedHosts` declares. An entry permits an
+        # address by naming it (a literal IP, or `*`) or by naming a host the
+        # workload itself resolved into it — see `ipNameLookupGrantLifetime`.
+        #
+        # `count` evaluates the policy, records what it would refuse in the
+        # would-deny counters, and allows the connection anyway — range
+        # refusals included, not only a missing `allowedHosts` entry.
+        socketEgress: enforce
+        # -- How long an address a workload resolved stays connectable under an
+        # `allowedHosts` entry naming the host it resolved, e.g. "60s". Empty
+        # (the default) keeps it connectable for as long as the workload's
+        # store remembers the lookup, even after the name has moved off that
+        # address. Set one where addresses are reused, such as pod IPs.
+        #
+        # A raw socket carries no name, so `allowedHosts: [db.internal:5432]`
+        # permits a socket only to an address a lookup of `db.internal` handed
+        # that workload, on that port. That entry also lets the workload
+        # resolve the name; `allowedIpNameLookups` is for names it resolves
+        # without connecting to them.
+        # With a lifetime set the grant lapses that long after the lookup. Not
+        # a DNS TTL: a workload that caches an address longer must then resolve
+        # again before a new connect or datagram, and open connections are
+        # unaffected.
+        #
+        # The grant is the address, not the server: two names behind one
+        # address are indistinguishable, and a name that resolves to another
+        # private service grants that service unless `denyPrivateRanges` is on.
+        ipNameLookupGrantLifetime: ""
         # -- Deny outbound connections to loopback, link-local (including the
         # cloud metadata address), multicast, and documentation ranges —
         # including whatever DNS returned for a permitted name.
@@ -885,6 +1094,26 @@ runtime:
         # allows any port the OS will grant.
         # NOTE: not yet wired to the host, as with `publishPorts` above.
         publishPortRange: ""
+      # -- Which host directories a workload's `hostPath` volume may name. A
+      # volume is judged by its canonical path, so `..` and symlinks cannot
+      # step outside an allowed directory. The host's own credential paths,
+      # kernel filesystems (`/proc`, `/sys`, `/dev`), and any volume inside or
+      # containing `scratchRoot` (such as `/tmp` with the default root) are
+      # refused whatever is set here.
+      # This is a host-wide guardrail, not a multi-tenant storage policy:
+      # every workload on the host may mount any directory listed. Where
+      # tenants author workloads, refuse their raw `hostPath` volumes before
+      # they reach a host.
+      hostPaths:
+        # -- Directories a `hostPath` volume may lie within. Empty permits none.
+        allowed: []
+      # -- Where `emptyDir` volumes live. Empty uses `wasmcloud-scratch` under
+      # the container's temporary directory. Point it at a mounted volume to
+      # keep scratch off the container filesystem, or at a memory-backed one
+      # knowing scratch then counts against the pod's memory. Each workload's
+      # scratch is removed when it stops, and a restarted host removes what
+      # its predecessor left.
+      scratchRoot: ""
       http:
         enabled: true
         port: 9191
@@ -949,9 +1178,19 @@ runtime:
       #   limits:
       #     memory: "2Gi"
       #   defaultHeapMemory: "512MiB"
-      #   coreInstances: "200"
-      #   guestMemoryMode: "enforce"
+      #   maxMemories: "200"
+      #   guestMemoryMode: "count"
       #   maxConcurrentStarts: "1"
+      #   hostcallFuel: "256MiB"
+      # -- Node labels this group's host pods must match, e.g. to keep a
+      # webgpu group on GPU nodes. Add `tolerations` when those nodes are
+      # tainted:
+      # nodeSelector:
+      #   nvidia.com/gpu.present: "true"
+      # tolerations:
+      #   - key: nvidia.com/gpu
+      #     operator: Exists
+      #     effect: NoSchedule
       # -- Per-host-group probes. Merged field by field over
       # `runtime.probes`, so a group can retune one timing and inherit the
       # rest:

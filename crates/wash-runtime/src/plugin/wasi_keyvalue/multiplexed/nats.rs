@@ -7,7 +7,10 @@ use bytes::{Buf, Bytes};
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::RwLock;
 
-use crate::plugin::multiplex::BackendProvider;
+use crate::plugin::PluginEgressPolicy;
+use crate::plugin::multiplex::{
+    BackendProvider, check_nats_url, check_nats_url_resolved, connect_nats,
+};
 
 use super::{
     CasGuard, CasOutcome, KeyResponse, KvBackend, KvId, LIST_KEYS_BATCH_SIZE, StoreError, Versioned,
@@ -319,26 +322,56 @@ async fn present_entry(
 /// Provider for [`NatsBackend`], selected by `config.backend = "nats"`. Requires
 /// `config.url` (e.g. `nats://127.0.0.1:4222`).
 #[derive(Default)]
-pub struct NatsProvider;
+pub struct NatsProvider {
+    ignore_discovered_servers: bool,
+}
+
+impl NatsProvider {
+    /// Restrict connections to their configured URL even without an egress policy.
+    pub fn with_ignore_discovered_servers(mut self, ignore: bool) -> Self {
+        self.ignore_discovered_servers = ignore;
+        self
+    }
+}
 
 #[async_trait::async_trait]
 impl BackendProvider<KvId> for NatsProvider {
-    fn pool_key(&self, config: &HashMap<String, String>) -> Option<String> {
-        config.get("url").cloned()
+    fn pool_key(&self, config: &crate::wit::Config) -> Option<String> {
+        config.expose("url").map(str::to_string)
     }
     fn backend_type(&self) -> &'static str {
         "nats"
     }
 
-    async fn instantiate(&self, config: &HashMap<String, String>) -> anyhow::Result<KvId> {
+    async fn instantiate(
+        &self,
+        config: &crate::wit::Config,
+        egress: Option<&PluginEgressPolicy>,
+    ) -> anyhow::Result<KvId> {
         let url = config
-            .get("url")
+            .value("url")
             .ok_or_else(|| anyhow::anyhow!("nats keyvalue backend requires a 'url' config"))?;
-        let client = async_nats::connect(url).await?;
+        let client = connect_nats(url, egress, self.ignore_discovered_servers).await?;
         let context = async_nats::jetstream::new(client);
         Ok(Arc::new(NatsBackend {
             context: Arc::new(context),
             stores: RwLock::new(HashMap::new()),
         }))
+    }
+
+    fn check_egress(
+        &self,
+        config: &crate::wit::Config,
+        policy: &PluginEgressPolicy,
+    ) -> anyhow::Result<()> {
+        check_nats_url(config, policy)
+    }
+
+    async fn check_resolved_egress(
+        &self,
+        config: &crate::wit::Config,
+        policy: &PluginEgressPolicy,
+    ) -> anyhow::Result<()> {
+        check_nats_url_resolved(config, policy).await
     }
 }

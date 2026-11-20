@@ -90,7 +90,7 @@ use wash_runtime::{
 /// HTTP incoming-handler (0.2.2) with `host` config, plus optional
 /// comma-separated `host-aliases`. (example :  "admin,user,customer")
 pub fn http_incoming_handler_interface(host_header: &str, aliases: Option<&str>) -> WitInterface {
-    let mut config = HashMap::new();
+    let mut config = wash_runtime::wit::Config::new();
     config.insert("host".to_string(), host_header.to_string());
     if let Some(aliases) = aliases {
         config.insert("host-aliases".to_string(), aliases.to_string());
@@ -117,7 +117,7 @@ fn wasi_blobstore_interface() -> WitInterface {
         .into_iter()
         .collect(),
         version: Some(semver::Version::parse("0.2.0-draft").unwrap()),
-        config: HashMap::new(),
+        config: Default::default(),
         name: None,
     }
 }
@@ -130,7 +130,7 @@ fn wasi_keyvalue_interface() -> WitInterface {
             .into_iter()
             .collect(),
         version: Some(semver::Version::parse("0.2.0-draft").unwrap()),
-        config: HashMap::new(),
+        config: Default::default(),
         name: None,
     }
 }
@@ -141,7 +141,7 @@ fn wasi_logging_interface() -> WitInterface {
         package: "logging".to_string(),
         interfaces: ["logging".to_string()].into_iter().collect(),
         version: Some(semver::Version::parse("0.1.0-draft").unwrap()),
-        config: HashMap::new(),
+        config: Default::default(),
         name: None,
     }
 }
@@ -152,7 +152,7 @@ fn wasi_config_interface() -> WitInterface {
         package: "config".to_string(),
         interfaces: ["store".to_string()].into_iter().collect(),
         version: Some(semver::Version::parse("0.2.0-rc.1").unwrap()),
-        config: HashMap::new(),
+        config: Default::default(),
         name: None,
     }
 }
@@ -193,7 +193,7 @@ pub fn acme_kv_interface() -> WitInterface {
         package: "kv".to_string(),
         interfaces: ["store".to_string()].into_iter().collect(),
         version: Some(semver::Version::parse("0.1.0").unwrap()),
-        config: HashMap::new(),
+        config: Default::default(),
         name: None,
     }
 }
@@ -216,7 +216,7 @@ pub fn kv_plugin_caller_host_interfaces_with_config(
     vec![
         http_incoming_handler_interface(host_header, None),
         WitInterface {
-            config,
+            config: config.into(),
             ..acme_kv_interface()
         },
     ]
@@ -252,7 +252,7 @@ pub fn secrets_interface(config: HashMap<String, String>) -> WitInterface {
             .into_iter()
             .collect(),
         version: Some(semver::Version::parse("2.1.0").unwrap()),
-        config,
+        config: config.into(),
         name: None,
     }
 }
@@ -513,6 +513,47 @@ pub async fn start_host_with_component_plugin_bindings(
         plugin_bindings,
     )
     .await
+}
+
+/// Start a p3 host with several component plugins, `(id, wasm)` each, and the
+/// operator's `plugin_bindings` for them.
+#[cfg(all(
+    feature = "host-component-plugins",
+    feature = "wasi-blobstore",
+    feature = "wasi-config",
+    feature = "wasi-keyvalue",
+    feature = "wasi-logging"
+))]
+pub async fn start_host_with_component_plugins(
+    addr: &str,
+    plugins: &[(&'static str, &'static [u8])],
+    plugin_bindings: wash_runtime::plugin::PluginBindings,
+) -> Result<(std::net::SocketAddr, impl HostApi)> {
+    let engine = Engine::builder().build()?;
+    let ingress = Ingress::new(DevRouter::default(), addr.parse()?).await?;
+    let bound_addr = ingress.addr();
+    let mut builder = with_standard_plugins(
+        HostBuilder::new()
+            .with_engine(engine.clone())
+            .with_http_handler(Arc::new(ingress)),
+    )?;
+    let native_plugins = builder.native_plugins();
+    let host_ref = builder.host_ref();
+    for (id, wasm) in plugins {
+        let plugin = ComponentHostPlugin::builder()
+            .id(id)
+            .wasm(wasm)
+            .engine(engine.clone())
+            .native_plugins(native_plugins.clone())
+            .maybe_host_ref(Some(host_ref.clone()))
+            .build()
+            .await
+            .with_context(|| format!("failed to build host component plugin '{id}'"))?;
+        builder = builder.with_plugin(Arc::new(plugin))?;
+    }
+    let host = builder.with_plugin_bindings(plugin_bindings).build()?;
+    let host = host.start().await.context("Failed to start host")?;
+    Ok((bound_addr, host))
 }
 
 /// Start a p3 host with the standard plugin set plus a [`ComponentHostPlugin`]

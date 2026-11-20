@@ -1,12 +1,22 @@
 # syntax=docker/dockerfile:1-labs
 
-FROM cgr.dev/chainguard/rust:latest-dev AS builder
+FROM cgr.dev/chainguard/rust:latest-dev@sha256:c5b31e7f0d9647fb726da4523fc8df2506794c32370fe8a6b8ad17eb7ab252bf AS builder
 WORKDIR /src
 ENV RUST_BACKTRACE=1
 
 # tools
 USER root
-RUN apk --no-cache add protoc protobuf protobuf-dev
+RUN attempt=1; delay=2; \
+    until apk update && apk add --no-cache protoc protobuf protobuf-dev; do \
+        if [ "$attempt" -ge 5 ]; then \
+            echo "APK installation failed after $attempt attempts" >&2; \
+            exit 1; \
+        fi; \
+        echo "APK installation attempt $attempt failed; retrying in ${delay}s" >&2; \
+        sleep "$delay"; \
+        attempt=$((attempt + 1)); \
+        delay=$((delay * 2)); \
+    done
 USER nonroot
 
 # copy source code
@@ -21,8 +31,18 @@ ARG CARGO_FEATURES=""
 RUN cargo build --release --bin wash ${CARGO_FEATURES:+--features ${CARGO_FEATURES}}
 
 # Release image
-FROM cgr.dev/chainguard/wolfi-base
-RUN apk add --no-cache git
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:ae9575b121f5776e2f04e192064bc2c5665af9d1c425d620dc773aca31698712
+RUN attempt=1; delay=2; \
+    until apk update && apk add --no-cache git; do \
+        if [ "$attempt" -ge 5 ]; then \
+            echo "APK installation failed after $attempt attempts" >&2; \
+            exit 1; \
+        fi; \
+        echo "APK installation attempt $attempt failed; retrying in ${delay}s" >&2; \
+        sleep "$delay"; \
+        attempt=$((attempt + 1)); \
+        delay=$((delay * 2)); \
+    done
 COPY --from=builder /src/target/release/wash /usr/local/bin/wash
 
 # Smoke test the binary against THIS stage's libc. The builder and the runtime

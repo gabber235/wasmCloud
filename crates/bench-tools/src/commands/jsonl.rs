@@ -8,6 +8,24 @@
 //!   `throughput`) so the existing `arewefastyet` reader doesn't break
 //!   on the schema bump.
 //! - gungraun rows carry only `metric` + `value` (Ir instruction counts).
+//! - Density rows (from `<target>/density/<bench>.json`, a list of
+//!   [`bench_tools::density::Report`]) carry `metric`, `value`, `unit` and
+//!   `better`, as k6 rows do: group `density`, one `param` per flavour
+//!   label (`warm`, `scale-to-zero@2cpu`), one row per figure. The label is
+//!   stable across machines; what ran is in the bench's own report.
+//!   `--group` (or `WASMCLOUD_BENCH_GROUP`) replaces `density`, for a preset
+//!   whose runs are their own series (`density-max`). Under a group, each
+//!   flavour with steps adds one `metric: "ramp"` row right after its own
+//!   metric rows: its steps thinned to at most
+//!   [`bench_tools::density::RAMP_POINTS`], as columns in `steps` (see
+//!   [`bench_tools::density::Ramp`]), with the run's stop reason, limits and
+//!   per-workload cost beside them. `value` is how many steps the run took
+//!   before thinning and `unit` is `steps`; the row has no `better`, so it
+//!   is not a trend, and charting consumers leave it out. The default
+//!   `density` series carries no ramps.
+//! - Pressure rows (from `<target>/pressure/<bench>.json`, a list of
+//!   [`bench_tools::pressure::Report`]) have the same shape, with group
+//!   `pressure` and one `param` per case label.
 //!
 //! The dedup key in `push-s3.sh` is widened to include `.metric`, which
 //! lets `(bench, group, param)` map to multiple rows, one per metric,
@@ -39,6 +57,31 @@ pub struct Args {
     /// `$CARGO_TARGET_DIR/.bench-start-<bench>`.
     #[arg(long)]
     pub marker: Option<PathBuf>,
+
+    /// Group for density rows in place of `density`, so a preset's runs
+    /// form their own series, with a per-step ramp per flavour. Refused for
+    /// other benches. Empty means none: the workflow passes it empty for
+    /// every bench that is not a grouped preset.
+    #[arg(long, env = "WASMCLOUD_BENCH_GROUP", value_parser = parse_group)]
+    pub group: Option<String>,
+}
+
+/// Same shape as the bench and host names: lower-case words joined by `-`
+/// or `_`. Empty is accepted here and read as no group.
+fn parse_group(value: &str) -> Result<String, String> {
+    let ok = value.is_empty()
+        || value.split(['-', '_']).all(|w| {
+            !w.is_empty()
+                && w.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        });
+    if ok {
+        Ok(value.to_owned())
+    } else {
+        Err(format!(
+            "invalid group {value:?}: use lower-case words joined by - or _"
+        ))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -56,6 +99,41 @@ struct CriterionRow<'a> {
     std_dev_ns: f64,
     ci_low_ns: f64,
     ci_high_ns: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct DensityRow<'a> {
+    bench: &'a str,
+    group: &'a str,
+    param: &'a str,
+    #[serde(flatten)]
+    meta: &'a Meta,
+    metric: &'static str,
+    value: f64,
+    unit: &'static str,
+    better: &'static str,
+}
+
+/// One flavour's thinned ramp. Field order keeps the identifying fields
+/// first, as in the other rows, and the bulky columns last.
+#[derive(Debug, Serialize)]
+struct RampRow<'a> {
+    bench: &'a str,
+    group: &'a str,
+    param: &'a str,
+    #[serde(flatten)]
+    meta: &'a Meta,
+    metric: &'static str,
+    value: f64,
+    unit: &'static str,
+    flavour: Option<bench_tools::density::Flavour>,
+    stop: &'a str,
+    guest_memory_mode: Option<&'a str>,
+    memory_limit_bytes: u64,
+    baseline_footprint_bytes: Option<u64>,
+    marginal_bytes_per_workload: Option<u64>,
+    peak_starts_per_sec: Option<f64>,
+    steps: bench_tools::density::Ramp,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,13 +156,37 @@ pub fn run(args: Args) -> Result<()> {
         .unwrap_or(Path::new("target"))
         .to_path_buf();
     let marker_override = args.marker.clone();
+    let group = args.group.as_deref().filter(|g| !g.is_empty());
     let meta = Meta::capture()?;
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
+    if group.is_some() && !density_path(&target_dir, &args.bench).exists() {
+        anyhow::bail!(
+            "--group applies to density benches only; {} wrote no density report",
+            args.bench
+        );
+    }
+
     if crate::callgrind::is_instruction_bench(&args.bench) {
         return emit_gungraun(&mut out, &args.bench, &meta, &target_dir);
+    }
+    if let Some(reports) = pressure_reports(&target_dir, &args.bench)? {
+        let rows = reports.iter().map(|r| (r.case.label(), r.metrics()));
+        return emit_metrics(&mut out, &args.bench, "pressure", &meta, rows);
+    }
+    if let Some(reports) = density_reports(&target_dir, &args.bench)? {
+        // Each flavour's metric rows, then, under a preset's group, its ramp.
+        for report in &reports {
+            let rows = std::iter::once((report.label.clone(), report.metrics()));
+            let name = group.unwrap_or("density");
+            emit_metrics(&mut out, &args.bench, name, &meta, rows)?;
+            if let Some(group) = group {
+                emit_ramp(&mut out, &args.bench, group, &meta, report)?;
+            }
+        }
+        return Ok(());
     }
 
     emit_criterion(
@@ -156,5 +258,97 @@ fn emit_gungraun<W: Write>(
         serde_json::to_writer(&mut *out, &serialized)?;
         out.write_all(b"\n")?;
     }
+    Ok(())
+}
+
+/// The density reports a run wrote to `<target>/density/<bench>.json`, if
+/// this bench is one that writes them.
+pub fn density_reports(
+    target_dir: &Path,
+    bench: &str,
+) -> Result<Option<Vec<bench_tools::density::Report>>> {
+    read_reports(&density_path(target_dir, bench))
+}
+
+fn density_path(target_dir: &Path, bench: &str) -> PathBuf {
+    target_dir.join("density").join(format!("{bench}.json"))
+}
+
+/// The pressure reports a run wrote to `<target>/pressure/<bench>.json`, if
+/// this bench is one that writes them.
+pub fn pressure_reports(
+    target_dir: &Path,
+    bench: &str,
+) -> Result<Option<Vec<bench_tools::pressure::Report>>> {
+    read_reports(&target_dir.join("pressure").join(format!("{bench}.json")))
+}
+
+fn read_reports<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<Vec<T>>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path)?;
+    let reports = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+    Ok(Some(reports))
+}
+
+/// One row per `(label, metric)`, in the density row shape.
+fn emit_metrics<W: Write>(
+    out: &mut W,
+    bench: &str,
+    group: &str,
+    meta: &Meta,
+    reports: impl Iterator<Item = (String, Vec<bench_tools::density::Metric>)>,
+) -> Result<()> {
+    for (label, metrics) in reports {
+        for metric in metrics {
+            let row = DensityRow {
+                bench,
+                group,
+                param: &label,
+                meta,
+                metric: metric.name,
+                value: metric.value,
+                unit: metric.unit,
+                better: metric.better.as_str(),
+            };
+            serde_json::to_writer(&mut *out, &row)?;
+            out.write_all(b"\n")?;
+        }
+    }
+    Ok(())
+}
+
+/// The `ramp` row of a report with steps; nothing for one without.
+fn emit_ramp<W: Write>(
+    out: &mut W,
+    bench: &str,
+    group: &str,
+    meta: &Meta,
+    report: &bench_tools::density::Report,
+) -> Result<()> {
+    let Some(steps) = report.ramp(bench_tools::density::RAMP_POINTS) else {
+        return Ok(());
+    };
+    let row = RampRow {
+        bench,
+        group,
+        param: &report.label,
+        meta,
+        metric: "ramp",
+        value: report.steps.len() as f64,
+        unit: "steps",
+        flavour: report.flavour,
+        stop: &report.stop,
+        guest_memory_mode: report.guest_memory_mode.as_deref(),
+        memory_limit_bytes: report.memory_limit_bytes,
+        baseline_footprint_bytes: report.baseline_footprint_bytes,
+        marginal_bytes_per_workload: report.marginal_bytes_per_workload,
+        peak_starts_per_sec: report.peak_starts_per_sec(),
+        steps,
+    };
+    serde_json::to_writer(&mut *out, &row)?;
+    out.write_all(b"\n")?;
     Ok(())
 }

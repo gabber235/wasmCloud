@@ -148,7 +148,7 @@ impl HostPlugin for DynamicConfig {
 
         // Add `wasi:config/store` to the workload's linker
         bindings::wasi::config::store::add_to_linker::<_, SharedCtx>(
-            component_handle.linker(),
+            component_handle.linker()?,
             extract_active_ctx,
         )?;
 
@@ -159,9 +159,14 @@ impl HostPlugin for DynamicConfig {
             let mut config_map = ComponentConfig::new();
 
             for entry in entries {
+                // A component reads its config as text, so a secret is exposed
+                // here, where it is handed over.
                 for (key, value) in entry.config.iter() {
-                    if let Some(previous) = config_map.insert(key.clone(), value.clone())
-                        && &previous != value
+                    let Some(value) = value.expose() else {
+                        continue;
+                    };
+                    if let Some(previous) = config_map.insert(key.clone(), value.to_string())
+                        && previous != value
                     {
                         tracing::warn!(
                             key,
@@ -213,9 +218,10 @@ impl HostPlugin for DynamicConfig {
             return Ok(());
         };
         // A host component plugin's own bind-time config is filed under its
-        // plugin id as both ids (`component_host::link_native_imports`), and
-        // workload ids come from the caller. A workload that happens to carry a
-        // plugin's id stops without taking that plugin's config with it.
+        // plugin id as both ids (`component_host::link_native_imports`). The
+        // host refuses a workload id equal to a plugin id
+        // (`Host::workload_reserve`); this keeps the plugin's own entry even
+        // if a workload with that id is ever bound some other way.
         components.retain(|component_id, _| component_id.as_ref() == workload_id);
         if components.is_empty() {
             config.remove(workload_id);
@@ -225,13 +231,13 @@ impl HostPlugin for DynamicConfig {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::engine::{
         InstancePolicy, workload::UnresolvedWorkload, workload::WorkloadComponent,
     };
     use crate::types::LocalResources;
-    use std::collections::HashMap;
     use wasmtime::component::{Component, Linker};
 
     fn config_importer(name: &str, config: &[(&str, &str)]) -> WorkloadComponent {
@@ -305,7 +311,8 @@ mod tests {
 
     fn shared(entry: &str) -> WitInterface {
         let mut interface = WitInterface::from(entry);
-        interface.config = HashMap::from([("shared".to_string(), "yes".to_string())]);
+        interface.config =
+            crate::wit::Config::from_iter([("shared".to_string(), "yes".to_string())]);
         interface
     }
 
@@ -332,7 +339,8 @@ mod tests {
     #[tokio::test]
     async fn every_matching_entry_lands_in_one_view() {
         let mut package_only = WitInterface::from("wasi:config");
-        package_only.config = HashMap::from([("extra".to_string(), "1".to_string())]);
+        package_only.config =
+            crate::wit::Config::from_iter([("extra".to_string(), "1".to_string())]);
 
         // Repeated because the order under test comes from a `HashSet`: one
         // run proves nothing.

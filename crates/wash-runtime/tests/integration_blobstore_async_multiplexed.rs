@@ -13,7 +13,6 @@
 //! `cargo test`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -35,7 +34,7 @@ fn nats_blob_iface(name: &str, url: &str) -> WitInterface {
             .into_iter()
             .collect(),
         version: None,
-        config: HashMap::from([
+        config: wash_runtime::wit::Config::from_iter([
             ("backend".to_string(), "nats".to_string()),
             ("url".to_string(), url.to_string()),
         ]),
@@ -52,7 +51,7 @@ fn err(e: impl std::fmt::Debug) -> anyhow::Error {
 #[ignore = "requires Docker (NATS JetStream); run with `cargo test --include-ignored`"]
 async fn async_multiplexed_blobstore_routes_to_nats() -> Result<()> {
     // --- NATS container (JetStream enabled for the object store) ---
-    let nats = GenericImage::new("nats", "2.12.8-alpine")
+    let nats = GenericImage::new("nats", "2.12.15-alpine")
         .with_exposed_port(4222.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Server is ready"))
         .with_cmd(["-js"])
@@ -63,7 +62,8 @@ async fn async_multiplexed_blobstore_routes_to_nats() -> Result<()> {
     let nats_url = format!("nats://127.0.0.1:{nats_port}");
 
     // --- build the routing registry from the named host interface ---
-    let plugin = MultiplexedAsyncBlobstore::new().with_provider(Arc::new(NatsBlobProvider));
+    let plugin =
+        MultiplexedAsyncBlobstore::new().with_provider(Arc::new(NatsBlobProvider::default()));
     let registry = plugin
         .build_registry(&[nats_blob_iface("nats-blob", &nats_url)])
         .await

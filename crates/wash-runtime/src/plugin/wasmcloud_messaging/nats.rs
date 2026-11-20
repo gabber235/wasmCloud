@@ -60,7 +60,7 @@ use crate::engine::workload::{ResolvedWorkload, WorkloadItem};
 use crate::observability::{MeterKind, Meters};
 use crate::plugin::wasmcloud_messaging::Admitted;
 use crate::plugin::{HostPlugin, WitInterfaces, WorkloadTracker};
-use crate::wit::{WitInterface, WitWorld};
+use crate::wit::{ConfigStr, ConfigValue, WitInterface, WitWorld};
 
 pub(crate) const PLUGIN_MESSAGING_ID: &str = "wasmcloud-messaging";
 const CONSUMER_GROUP_CONFIG: &str = "consumer_group";
@@ -84,6 +84,18 @@ enum ConsumerGroup {
     Broadcast,
 }
 
+/// A component's own config, which is text, or else the interface's, which may
+/// be a secret.
+fn first<'a>(
+    local: &'a Option<String>,
+    interface: &'a Option<ConfigValue>,
+) -> Option<ConfigStr<'a>> {
+    local
+        .as_deref()
+        .map(ConfigStr::from)
+        .or_else(|| interface.as_ref()?.as_config_str())
+}
+
 impl ConsumerGroup {
     fn resolve(
         configured: Option<&str>,
@@ -105,12 +117,23 @@ impl ConsumerGroup {
         }
     }
 
+    #[cfg(test)]
     fn name(&self) -> Option<&str> {
         match self {
             Self::Grouped(name) => Some(name),
             Self::Broadcast => None,
         }
     }
+}
+
+fn admission_workload_name<'a>(
+    local: Option<&'a str>,
+    interface: Option<&'a ConfigValue>,
+    fallback: &'a str,
+) -> &'a str {
+    super::parse_admission_group(local)
+        .or_else(|| super::parse_admission_group(interface.and_then(ConfigValue::as_text)))
+        .unwrap_or(fallback)
 }
 
 #[derive(Clone)]
@@ -357,26 +380,40 @@ impl HostPlugin for NatsMessaging {
         // (so workers in one workload can subscribe to different subjects),
         // falling back to the workload-scoped host interface config. Capture
         // the host-interface fallback before borrowing the component.
-        let interface_subscriptions = interface.config.get("subscriptions").cloned();
-        let interface_consumer_group = interface.config.get(CONSUMER_GROUP_CONFIG).cloned();
-        let interface_max_in_flight = interface.config.get(super::MAX_IN_FLIGHT_CONFIG).cloned();
-        let interface_admission_wait = interface.config.get(super::ADMISSION_WAIT_CONFIG).cloned();
-        let interface_admission_group =
-            interface.config.get(super::ADMISSION_GROUP_CONFIG).cloned();
+        let interface_subscriptions = interface.config.expose("subscriptions").map(str::to_string);
+        let interface_consumer_group = interface.config.get_value(CONSUMER_GROUP_CONFIG).cloned();
+        let interface_max_in_flight = interface
+            .config
+            .get_value(super::MAX_IN_FLIGHT_CONFIG)
+            .cloned();
+        let interface_admission_wait = interface
+            .config
+            .get_value(super::ADMISSION_WAIT_CONFIG)
+            .cloned();
+        let interface_admission_group = interface
+            .config
+            .get_value(super::ADMISSION_GROUP_CONFIG)
+            .cloned();
 
         // Bind only the revision(s) the workload actually declared: the two
         // surfaces are separate linker instances, and binding one a component
         // never imports is harmless but binding the wrong one is not.
         if super::declares_async_messaging(&interfaces) {
-            types_p3::add_to_linker::<_, SharedCtx>(component_handle.linker(), extract_active_ctx)?;
+            types_p3::add_to_linker::<_, SharedCtx>(
+                component_handle.linker()?,
+                extract_active_ctx,
+            )?;
             consumer_p3::add_to_linker::<_, SharedCtx>(
-                component_handle.linker(),
+                component_handle.linker()?,
                 extract_active_ctx,
             )?;
         } else {
-            types_p2::add_to_linker::<_, SharedCtx>(component_handle.linker(), extract_active_ctx)?;
+            types_p2::add_to_linker::<_, SharedCtx>(
+                component_handle.linker()?,
+                extract_active_ctx,
+            )?;
             consumer_p2::add_to_linker::<_, SharedCtx>(
-                component_handle.linker(),
+                component_handle.linker()?,
                 extract_active_ctx,
             )?;
         }
@@ -422,33 +459,34 @@ impl HostPlugin for NatsMessaging {
                 // bound; its delivery path is gated elsewhere.
                 WorkloadItem::Service(_) => "service".to_string(),
             };
-            let max_in_flight = super::parse_max_in_flight(
-                local_max_in_flight
-                    .as_deref()
-                    .or(interface_max_in_flight.as_deref()),
-            );
-            let consumer_group = ConsumerGroup::resolve(
-                local_consumer_group
-                    .as_deref()
-                    .or(interface_consumer_group.as_deref()),
+            let max_in_flight =
+                super::parse_max_in_flight(first(&local_max_in_flight, &interface_max_in_flight));
+            let configured_group = first(&local_consumer_group, &interface_consumer_group);
+            let resolved_group = ConsumerGroup::resolve(
+                configured_group.map(ConfigStr::expose),
                 component_handle.workload_namespace(),
                 component_handle.workload_name(),
                 &component_name,
-            )?;
-
-            let admission_wait = super::parse_admission_wait(
-                local_admission_wait
-                    .as_deref()
-                    .or(interface_admission_wait.as_deref()),
             );
+            let consumer_group = match configured_group {
+                Some(group) => group.guard(CONSUMER_GROUP_CONFIG, resolved_group)?,
+                None => resolved_group?,
+            };
+
+            let admission_wait = super::parse_admission_wait(first(
+                &local_admission_wait,
+                &interface_admission_wait,
+            ));
             // The same namespace/workload/component triple the consumer group
             // is built from above. It both attributes a shed message to
             // something a manifest author recognizes and selects the gate, so
             // replicas of this deployment on this host share one ceiling
             // rather than getting one apiece.
-            let workload_name = super::parse_admission_group(local_admission_group.as_deref())
-                .or_else(|| super::parse_admission_group(interface_admission_group.as_deref()))
-                .unwrap_or_else(|| component_handle.stable_workload_name());
+            let workload_name = admission_workload_name(
+                local_admission_group.as_deref(),
+                interface_admission_group.as_ref(),
+                component_handle.stable_workload_name(),
+            );
             let identity = super::AdmissionIdentity::new(
                 component_handle.workload_namespace(),
                 workload_name,
@@ -463,7 +501,6 @@ impl HostPlugin for NatsMessaging {
             debug!(
                 component_id = component_handle.id(),
                 subscriptions = ?raw_subscriptions,
-                consumer_group = consumer_group.name().unwrap_or(BROADCAST_CONSUMER_GROUP),
                 max_in_flight = admission.limit(),
                 "tracking handler component for NATS messaging"
             );
@@ -526,6 +563,11 @@ impl HostPlugin for NatsMessaging {
             }
         };
 
+        let admission = match &pre {
+            Some(_) => admission.with_workload(workload, component_id).await?,
+            None => admission,
+        };
+
         let workload = workload.clone();
         let component_id = component_id.to_string();
         let tracker_component_id = component_id.clone();
@@ -534,7 +576,6 @@ impl HostPlugin for NatsMessaging {
         for subject in &subjects {
             debug!(
                 %subject,
-                consumer_group = consumer_group.name().unwrap_or(BROADCAST_CONSUMER_GROUP),
                 "subscribing to NATS subject"
             );
             let result = match &consumer_group {
@@ -558,7 +599,6 @@ impl HostPlugin for NatsMessaging {
             };
             debug!(
                 %subject,
-                consumer_group = consumer_group.name().unwrap_or(BROADCAST_CONSUMER_GROUP),
                 "successfully subscribed"
             );
 
@@ -584,12 +624,22 @@ impl HostPlugin for NatsMessaging {
         let guest_meter = self.meters.read().await.guest();
         // The identity every message on this component is measured under,
         // resolved once here rather than per delivery.
-        let attributes = workload
-            .component_identity(&component_id)
-            .await
-            .attributes(PLUGIN_MESSAGING_ID, super::MESSAGING_OPERATION);
+        let identity = workload.component_identity(&component_id).await;
+        let attributes = identity.attributes(PLUGIN_MESSAGING_ID, super::MESSAGING_OPERATION);
 
-        let span = tracing::Span::current();
+        // The loop runs for the workload's life, so its span is a root of its
+        // own, linked to the start that created it. Parenting it on the
+        // current span would hold the start's span, and every span above it
+        // (`workload_start`, `handle_command`), open for as long as the
+        // workload runs, keeping them unexported and in memory. DEBUG, so a
+        // host not tracing at that level keeps no span per subscriber at all.
+        let span = tracing::debug_span!(
+            parent: None,
+            "wasmcloud.messaging.subscriber",
+            workload.id = %workload.id(),
+            component_id = %component_id,
+        );
+        span.follows_from(tracing::Span::current());
         let handle = tokio::spawn(async move {
             debug!(
                 parent: &span,
@@ -603,6 +653,7 @@ impl HostPlugin for NatsMessaging {
                             None => {
                                 warn!(
                                     parent: &span,
+                                    workload.id = %workload.id(),
                                     component_id = %component_id,
                                     "NATS subscriber stream closed unexpectedly; handler will stop receiving messages"
                                 );
@@ -633,6 +684,7 @@ impl HostPlugin for NatsMessaging {
                         if http_handler.is_none() && pre.is_none() {
                             warn!(
                                 parent: &span,
+                                workload.id = %workload.id(),
                                 component_id = %component_id,
                                 "host is gone and this component has no per-message \
                                  instance; ending the NATS subscriber loop"
@@ -663,10 +715,10 @@ impl HostPlugin for NatsMessaging {
                             {
                                 Ok(Ok(())) => debug!(%subject, "trigger service handled message"),
                                 Ok(Err(e)) => {
-                                    warn!(%subject, error = %e, "trigger service message handler returned error")
+                                    warn!(workload.id = %workload.id(), %subject, error = %e, "trigger service message handler returned error")
                                 }
                                 Err(e) => {
-                                    warn!(%subject, error = %e, "failed to deliver message to trigger service")
+                                    warn!(workload.id = %workload.id(), %subject, error = %e, "failed to deliver message to trigger service")
                                 }
                             }
                             continue;
@@ -674,6 +726,7 @@ impl HostPlugin for NatsMessaging {
 
                         let Some(pre) = &pre else {
                             warn!(
+                                workload.id = %workload.id(),
                                 %subject,
                                 component_id = %component_id,
                                 "no trigger service registered and no per-message instance; dropping message"
@@ -702,8 +755,21 @@ impl HostPlugin for NatsMessaging {
                         // while parked on a saturated semaphore, and is
                         // cancel-safe: dropping the future releases whichever
                         // permit it had already taken.
+                        // Looked up before admission: a warm instance already
+                        // holds its pool slots, so only a store of this
+                        // delivery's own reserves them (see `PoolCharge`).
+                        let pool = if pre.serves_async() {
+                            workload.instance_pool_for_component(&component_id).await
+                        } else {
+                            None
+                        };
+                        let charge = if pool.is_some() {
+                            super::PoolCharge::Defer
+                        } else {
+                            super::PoolCharge::Reserve
+                        };
                         let permit = tokio::select! {
-                            admitted = admission.acquire_before_deadline(&component_id, &subject) => {
+                            admitted = admission.acquire_before_deadline(&component_id, &subject, charge) => {
                                 match admitted {
                                     Admitted::Slot(permit) => permit,
                                     // Already logged and counted; drop this
@@ -751,12 +817,6 @@ impl HostPlugin for NatsMessaging {
                         // message: without a pool there is nothing to reuse,
                         // and the sync `@0.2.0` call holds `&mut Store` so it
                         // could not share an instance anyway.
-                        let pool = if pre.serves_async() {
-                            workload.instance_pool_for_component(&component_id).await
-                        } else {
-                            None
-                        };
-
                         if let Some(pool) = pool {
                             let msg = crate::host::trigger_service::BrokerMessage {
                                 subject,
@@ -767,15 +827,19 @@ impl HostPlugin for NatsMessaging {
                             let workload = workload.clone();
                             let component_id = component_id.clone();
                             let instance_pre = pre.instance_pre().clone();
+                            let admission = admission.clone();
                             tokio::spawn(async move {
-                                // Released on completion, trap or not — which
-                                // is what frees the slot this message holds.
-                                let _permit = permit;
+                                // The permit goes along: released on
+                                // completion, trap or not — which is what
+                                // frees the slot this message holds — and
+                                // reserved against if a store gets built.
                                 let result = super::deliver_pooled(
                                     &workload,
                                     &component_id,
                                     &instance_pre,
                                     &pool,
+                                    &admission,
+                                    permit,
                                     msg,
                                     attributes,
                                 )
@@ -786,16 +850,19 @@ impl HostPlugin for NatsMessaging {
                             continue;
                         }
 
-                        let mut store = match workload.new_store(&component_id).await {
+                        let mut store = match workload
+                            .new_store_as(&component_id, Some(&identity))
+                            .await
+                        {
                             Err(e) => {
-                                warn!("failed to create store for component {component_id}: {e}");
+                                warn!(workload.id = %workload.id(), "failed to create store for component {component_id}: {e}");
                                 continue;
                             }
                             Ok(s) => s,
                         };
                         let proxy = match pre.instantiate(&mut store).await {
                             Err(e) => {
-                                warn!("failed to instantiate component {component_id}: {e}");
+                                warn!(workload.id = %workload.id(), "failed to instantiate component {component_id}: {e}");
                                 continue;
                             }
                             Ok(p) => p,
@@ -982,6 +1049,7 @@ async fn sync_with_server(client: &async_nats::Client) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     //! Locks in the plugin's state-machine invariants without Docker /
     //! NATS / wasmtime: the seam between the plugin and its tracker, and
@@ -1120,6 +1188,24 @@ mod tests {
                 &"workload".repeat(40),
                 "handler.>",
             )
+        );
+    }
+
+    #[test]
+    fn secret_admission_groups_never_become_telemetry_identities() {
+        let secret = ConfigValue::from(crate::plugin::SecretValue::new("private-group"));
+        let plain = ConfigValue::from("public-group");
+        assert_eq!(
+            admission_workload_name(None, Some(&secret), "workload"),
+            "workload"
+        );
+        assert_eq!(
+            admission_workload_name(None, Some(&plain), "workload"),
+            "public-group"
+        );
+        assert_eq!(
+            admission_workload_name(Some("local"), Some(&secret), "workload"),
+            "local"
         );
     }
 

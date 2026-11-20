@@ -62,6 +62,7 @@ use crate::engine::abandon::{AbandonFlag, DispatchedCall};
 use crate::engine::ctx::SharedCtx;
 use crate::engine::instance_driver::{InstanceJob, InvocationSample, PoolSlot};
 use crate::engine::instance_pool::{ComponentInstance, Declined, Dispatch, InstancePool};
+use crate::engine::lent_reply::{LentReplies, LentReply};
 use crate::engine::workload::ResolvedWorkload;
 
 /// Invocations one of a service's ingresses may have queued before its driver
@@ -288,6 +289,7 @@ async fn serve_alone(
             .await
         })
         .await
+        .inspect_err(|e| crate::engine::trap_remediation::note_guest_fault(store.data(), e))
         .map_err(|e| anyhow::anyhow!("dispatched call store faulted: {e:#}"))?
 }
 
@@ -302,18 +304,26 @@ async fn serve_alone(
 /// retire, so it keeps serving; a guest *trap* faults its store either way, and
 /// the supervisor restarts it.
 pub(crate) struct GuestTask {
-    pub(crate) instance: Instance,
-    pub(crate) job: GuestJob,
-    pub(crate) placement: Placement,
+    instance: Instance,
+    /// The invocation span the guest task owns while it runs.
+    span: tracing::Span,
+    call: Box<dyn GuestCall>,
+    reply: LentReply<anyhow::Result<()>>,
+    attributes: Arc<[opentelemetry::KeyValue]>,
+    control: SettleOnDrop,
+    placement: Placement,
 }
 
-impl AccessorTask<SharedCtx> for GuestTask {
-    async fn run(self, accessor: &Accessor<SharedCtx>) -> wasmtime::Result<()> {
-        let GuestTask {
-            instance,
-            job,
-            placement,
-        } = self;
+impl GuestTask {
+    /// Serve `job` on `instance`, its reply lent from the store's `replies`
+    /// and answered with `faulted` if the store faults first.
+    pub(crate) fn new(
+        instance: Instance,
+        job: GuestJob,
+        placement: Placement,
+        replies: &Arc<LentReplies>,
+        faulted: &'static str,
+    ) -> Self {
         let GuestJob {
             span,
             call,
@@ -321,11 +331,33 @@ impl AccessorTask<SharedCtx> for GuestTask {
             attributes,
             control,
         } = job;
+        Self {
+            instance,
+            span,
+            call,
+            reply: replies.lend(reply, move |err| Err(anyhow::anyhow!("{faulted}: {err:#}"))),
+            attributes,
+            control,
+            placement,
+        }
+    }
+}
+
+impl AccessorTask<SharedCtx> for GuestTask {
+    async fn run(self, accessor: &Accessor<SharedCtx>) -> wasmtime::Result<()> {
+        let GuestTask {
+            instance,
+            span,
+            call,
+            reply,
+            attributes,
+            control,
+            placement,
+        } = self;
         let outcome = serve(accessor, instance, call, attributes, &control.0, placement)
             .instrument(span)
             .await;
-        // A dropped dispatcher closes the channel.
-        let _ = reply.send(outcome);
+        reply.send(outcome);
         Ok(())
     }
 }
@@ -1085,9 +1117,9 @@ impl Drop for ServiceClaim {
 /// item calls go to, not the instance that serves them: a component's warm set
 /// and a service's incarnations both turn over underneath it.
 ///
-/// The workload is behind an [`Arc`] because cloning a [`ResolvedWorkload`] is
-/// not cheap — it copies the service's `Linker` by value, string pool and all —
-/// and a target is expected to be cloned per dispatch.
+/// The workload is behind an [`Arc`] because a target is expected to be
+/// cloned per dispatch, and cloning a [`ResolvedWorkload`] copies every map it
+/// holds.
 #[derive(Clone)]
 pub struct DispatchTarget {
     workload: Arc<ResolvedWorkload>,
@@ -1133,10 +1165,10 @@ enum TargetItem {
     /// A component: instantiated per call, or served on a warm instance.
     Component {
         id: Arc<str>,
-        /// Resolved once, with the target, rather than per call: pre-linking a
-        /// component against its linker checks every import, which is exactly
-        /// the work `InstancePre` exists to do ahead of time. The HTTP
-        /// entrypoint captures one the same way, at the same point.
+        /// Captured once, with the target, rather than looked up per call:
+        /// the component's kept link, the work `InstancePre` exists to do
+        /// ahead of time. The HTTP entrypoint captures one the same way, at
+        /// the same point.
         pre: InstancePre<SharedCtx>,
         /// The warm set this component's calls run on, or `None` when each gets
         /// a store of its own. Read once, with `pre` and under the same lock:
@@ -1186,9 +1218,7 @@ impl DispatchTarget {
             by_operation: Mutex::default(),
         });
         Ok(Self {
-            // Copied once per target: cloning a `ResolvedWorkload` copies the
-            // service's `Linker` by value, so it is worth paying here rather
-            // than on every clone of the target.
+            // Copied once per target rather than on every clone of it.
             workload: Arc::new(workload.clone()),
             item,
             metrics,
@@ -1297,7 +1327,7 @@ fn start_on_component(
     let (job, pool) = match pool {
         None => (job, None),
         Some(pool) => {
-            let (job, room) = match pool.try_dispatch(InstanceJob::Guest(job)) {
+            let (job, room) = match pool.try_dispatch(InstanceJob::Guest(Box::new(job))) {
                 Dispatch::Sent => return,
                 Dispatch::NeedsInstance(job) => (job, Some(Arc::clone(pool))),
                 Dispatch::Saturated(job) => {
@@ -1312,7 +1342,7 @@ fn start_on_component(
                 debug_assert!(false, "a dispatched job cannot come back as another kind");
                 return;
             };
-            (job, room)
+            (*job, room)
         }
     };
     tokio::spawn(hand_off(
@@ -1341,13 +1371,13 @@ async fn hand_off(
             Some(Err(e)) => return job.refuse(e),
             None => return,
         };
-        match pool.dispatch_on_new(built, InstanceJob::Guest(job)) {
+        match pool.dispatch_on_new(built, InstanceJob::Guest(Box::new(job))) {
             Ok(()) => return,
             Err(Declined {
                 job: InstanceJob::Guest(declined),
                 instance,
             }) => {
-                job = declined;
+                job = *declined;
                 reclaimed = instance;
             }
             Err(_) => {
@@ -1376,7 +1406,10 @@ async fn build_instance(
 ) -> Option<anyhow::Result<ComponentInstance>> {
     let build = async {
         let mut store = workload.new_store(component_id).await?;
-        let instance = pre.instantiate_async(&mut store).await?;
+        let instance = pre
+            .instantiate_async(&mut store)
+            .await
+            .map_err(|e| crate::engine::pool_usage::explain_instantiate_failure(store.data(), e))?;
         anyhow::Ok(ComponentInstance { store, instance })
     };
     tokio::select! {
@@ -1442,6 +1475,7 @@ fn missed_deadline() -> anyhow::Error {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use std::sync::Arc;
     use std::time::Duration;

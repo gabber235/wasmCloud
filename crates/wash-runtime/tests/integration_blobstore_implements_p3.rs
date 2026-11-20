@@ -36,7 +36,10 @@ use wash_runtime::{
         HostApi, HostBuilder,
         http::{DevRouter, Ingress},
     },
-    plugin::wasi_blobstore::{MultiplexedAsyncBlobstore, NatsBlobProvider},
+    plugin::{
+        PluginBindingSet, PluginBindings,
+        wasi_blobstore::{MultiplexedAsyncBlobstore, NatsBlobProvider},
+    },
     types::{Component, LocalResources, Workload, WorkloadStartRequest, WorkloadState},
     wit::WitInterface,
 };
@@ -48,17 +51,15 @@ const BLOBSTORE_IMPLEMENTS_P3_WASM: &[u8] = include_bytes!("wasm/blobstore_imple
 
 /// A named async `wasmcloud:blobstore` interface routed to the NATS backend.
 /// `name` is the `(implements ..)` label the guest imports under; `iface` is the
-/// blobstore sub-interface (`blobstore` or `container`).
-fn nats_blob_iface(name: &str, iface: &str, url: &str) -> WitInterface {
+/// blobstore sub-interface (`blobstore` or `container`). The server's `url` is
+/// the operator's, declared on the host.
+fn nats_blob_iface(name: &str, iface: &str) -> WitInterface {
     WitInterface {
         namespace: "wasmcloud".to_string(),
         package: "blobstore".to_string(),
         interfaces: [iface.to_string()].into_iter().collect(),
         version: Some(semver::Version::parse("0.1.0").unwrap()),
-        config: HashMap::from([
-            ("backend".to_string(), "nats".to_string()),
-            ("url".to_string(), url.to_string()),
-        ]),
+        config: wash_runtime::wit::Config::from_iter([("backend".to_string(), "nats".to_string())]),
         name: Some(name.to_string()),
     }
 }
@@ -67,7 +68,7 @@ fn nats_blob_iface(name: &str, iface: &str, url: &str) -> WitInterface {
 #[ignore = "requires Docker (NATS JetStream); run with `cargo test --include-ignored`"]
 async fn p3_guest_streams_blobstore_through_nats() -> Result<()> {
     // --- NATS container (JetStream enabled for the object store) ---
-    let nats = GenericImage::new("nats", "2.12.8-alpine")
+    let nats = GenericImage::new("nats", "2.12.15-alpine")
         .with_exposed_port(4222.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Server is ready"))
         .with_cmd(["-js"])
@@ -85,8 +86,13 @@ async fn p3_guest_streams_blobstore_through_nats() -> Result<()> {
         .with_engine(engine)
         .with_http_handler(Arc::new(ingress))
         .with_plugin(Arc::new(
-            MultiplexedAsyncBlobstore::new().with_provider(Arc::new(NatsBlobProvider)),
+            MultiplexedAsyncBlobstore::new().with_provider(Arc::new(NatsBlobProvider::default())),
         ))?
+        .with_plugin_bindings(PluginBindings::new().with_plugin(
+            PluginBindingSet::new("wasmcloud-blobstore-multiplexed").with_base(
+                wash_runtime::wit::Config::from_iter([("url".to_string(), nats_url)]),
+            ),
+        ))
         .build()?;
     let host = host.start().await.context("failed to start host")?;
 
@@ -94,8 +100,8 @@ async fn p3_guest_streams_blobstore_through_nats() -> Result<()> {
     // imports both route to the same NATS server (pooled by url).
     let host_interfaces = vec![
         http_incoming_handler_interface("blob-impl", None),
-        nats_blob_iface("store-a", "blobstore", &nats_url),
-        nats_blob_iface("objects-a", "container", &nats_url),
+        nats_blob_iface("store-a", "blobstore"),
+        nats_blob_iface("objects-a", "container"),
     ];
 
     let req = WorkloadStartRequest {

@@ -55,8 +55,17 @@ jobs:
           filters: |
             relevant:
               - '.github/workflows/wash.yml'
+              - '.github/actions/setup-rust/**'
               - '.github/tool-versions.env'
               - '.github/scripts/wasmtime-features.mjs'
+              - '.github/actions/setup-syft/**'
+              - '.github/scripts/release-sboms.mjs'
+              - '.cargo/**'
+              - 'xtask/**'
+              - 'fuzz/**'
+              - 'scripts/bench/run-bench.sh'
+              - 'scripts/bench/install-runner.sh'
+              - 'scripts/bench/ansible/**'
               - 'crates/**'
               - 'src/**'
               - 'tests/**'
@@ -70,13 +79,18 @@ jobs:
               - 'deploy/kind/kind-config.yaml'
             workflow:
               - '.github/workflows/wash.yml'
+              # canary-binaries runs the binary inventory check with these.
+              - '.github/actions/setup-syft/**'
+              - '.github/scripts/release-sboms.mjs'
 
   check:
     needs:
       - changes
     if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # The macOS and Windows legs run close to 60 minutes. This limit is a
+    # stopgap while their build time is being reduced.
+    timeout-minutes: 75
     permissions:
       contents: read
     strategy:
@@ -93,7 +107,7 @@ jobs:
           persist-credentials: false
       - name: Free disk space
         if: ${{ matrix.os == 'ubuntu-latest' }}
-        uses: ./.github/actions/free-disk-space
+        uses: $/.github/actions/free-disk-space
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -111,7 +125,7 @@ jobs:
         with:
           version: ${{ env.WASM_TOOLS_VERSION }}
       - name: Setup Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
       # Compile the wash-runtime wasm test fixtures. The test/bench targets
       # `include_bytes!` these, so they must exist before the `cargo test`
       # steps below. Targets wasm32-wasip2/wasip1 come from setup-rust.
@@ -119,6 +133,26 @@ jobs:
         run: cargo xtask build-fixtures
       - name: Build
         run: cargo build
+      - name: Check parser feature build
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo check --locked -p wash-runtime --no-default-features --features washlet
+      # The private release campaign stages these harnesses against the
+      # release; catch API drift here instead. The libFuzzer archive is only
+      # linked, so `cargo check` accepts a placeholder. `--cfg fuzzing` changes
+      # every dependency's fingerprint, so the build gets its own directory
+      # under `target/`, which rust-cache saves with the rest.
+      - name: Check fuzz harnesses
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          FUZZ_SOURCE="${RUNNER_TEMP}/fuzz-source"
+          git worktree add --detach "${FUZZ_SOURCE}"
+          cargo xtask fuzz prepare --source "${FUZZ_SOURCE}" --language rust
+          cargo metadata --manifest-path "${FUZZ_SOURCE}/fuzz/Cargo.toml" --format-version 1 > /dev/null
+          cargo xtask fuzz verify-lock --source "${FUZZ_SOURCE}"
+          touch "${RUNNER_TEMP}/libclang_rt.fuzzer-x86_64.a"
+          LLVM_LIBFUZZER_PATH="${RUNNER_TEMP}/libclang_rt.fuzzer-x86_64.a" RUSTFLAGS="--cfg fuzzing" \
+            CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target/fuzz-check" \
+            cargo check --locked --manifest-path "${FUZZ_SOURCE}/fuzz/Cargo.toml" --bins
       # One pass with the optional features on. A default-feature pass would
       # recompile the tree to re-run the ~58 targets neither feature gates, so
       # nothing here runs in the configuration the released image ships.
@@ -128,6 +162,20 @@ jobs:
           RUST_BACKTRACE: "1"
         run: |
           cargo test --workspace --features "${OPTIONAL_FEATURES}"
+      # Authenticated Docker Hub pulls get a far higher rate limit than
+      # anonymous ones. Fork PRs get no org secrets and pull anonymously.
+      - name: Log in to Docker Hub
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_WASMCLOUD_CI_PULL_USER }}
+          DOCKERHUB_PASSWORD: ${{ secrets.DOCKERHUB_WASMCLOUD_CI_PULL }}
+        run: |
+          if [ -z "${DOCKERHUB_PASSWORD}" ]; then
+            echo "no Docker Hub credentials; pulling anonymously"
+            exit 0
+          fi
+          echo "${DOCKERHUB_PASSWORD}" | docker login --username "${DOCKERHUB_USER}" --password-stdin
       # Linux only: the hosted macOS/Windows runners have no Docker. `#[ignore]`
       # is what opts a suite INTO this step. Not all are containers --
       # `test_pull_and_validate_ghcr_component` pulls from ghcr.io.
@@ -161,14 +209,14 @@ jobs:
         with:
           persist-credentials: false
       - name: Free disk space
-        uses: ./.github/actions/free-disk-space
+        uses: $/.github/actions/free-disk-space
       - name: Setup Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
         with:
           rust-toolchain: nightly
           rust-components: rustfmt
       - name: Install cargo-machete
-        uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         env:
           # Authenticate the action's GitHub API calls so they aren't throttled
           # by the 60/hr anonymous per-IP limit shared across hosted runners.
@@ -231,7 +279,7 @@ jobs:
           persist-credentials: false
       - name: Login to ghcr.io
         if: github.repository == 'wasmCloud/wasmCloud'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -241,11 +289,15 @@ jobs:
       # Split into two single-output builds: dual `type=image`+`type=docker`
       # on one call confuses `digest` output (last write to
       # `containerimage.digest` wins → docker-tarball envelope, not
-      # registry). The second call hits the cache the first wrote.
+      # registry). The second call reuses the first's layers from the
+      # builder's local cache.
       # RELEASE image — DEFAULT features only: exactly what we ship. The
       # operator-e2e `release` leg loads this tarball, so we test the bytes we
       # release. build_push below reuses this build's cache (same features), so
       # the pushed canary is byte-identical to what that e2e leg exercised.
+      # No GHA layer cache on any wash image: `COPY . .` comes before
+      # `cargo build`, so every commit misses the ~1 GB cargo layer, and
+      # writing it crowds the Rust caches out of the 10 GB Actions cache.
       - name: Build wash runtime image — release / default features (tarball for operator-e2e)
         id: build_tar_release
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -254,29 +306,18 @@ jobs:
           outputs: type=docker,dest=/tmp/wash-image-release.tar,name=localhost/wasmcloud-wash:e2e
           # No `build-args`: the Dockerfile's `CARGO_FEATURES=""` default applies
           # (a plain `cargo build`, default features).
-          # head_ref on PRs (the source branch, shared across re-pushes and
-          # across PRs from the same branch); falls back to ref_name on main
-          # ("main"), then the main scope for cold-cache reads on first push.
-          cache-from: |
-            type=gha,scope=wash-release-arm64-${{ github.head_ref || github.ref_name }}
-            type=gha,scope=wash-release-arm64-main
-          cache-to: type=gha,scope=wash-release-arm64-${{ github.head_ref || github.ref_name }},mode=max
       - name: Push wash runtime image to GHCR by digest (main only)
         # PRs lack org-package write access; only push on main so
         # canary-publish can assemble the manifest after all gates pass.
         # Ships DEFAULT features only — byte-identical to the RELEASE tarball
         # above (whose cache this reuses), so the pushed canary is the exact
-        # bytes the operator-e2e `release` leg tested. No `cache-to` — the
-        # release build already wrote it.
+        # bytes the operator-e2e `release` leg tested.
         if: github.repository == 'wasmCloud/wasmCloud' && ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main')
         id: build_push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           outputs: type=image,name=ghcr.io/wasmcloud/wash,push-by-digest=true,name-canonical=true,push=true
-          cache-from: |
-            type=gha,scope=wash-release-arm64-${{ github.head_ref || github.ref_name }}
-            type=gha,scope=wash-release-arm64-main
       - name: Export digest
         if: github.repository == 'wasmCloud/wasmCloud' && ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main')
         env:
@@ -291,14 +332,14 @@ jobs:
           touch "/tmp/digests/${DIGEST#sha256:}"
       - name: Upload digest
         if: github.repository == 'wasmCloud/wasmCloud' && ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main')
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wash-image-digest-arm64
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
       - name: Upload release image tarball
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wash-image-tarball-release-arm64
           path: /tmp/wash-image-release.tar
@@ -329,7 +370,7 @@ jobs:
           persist-credentials: false
       - name: Login to ghcr.io
         if: github.repository == 'wasmCloud/wasmCloud' && ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main')
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -344,10 +385,6 @@ jobs:
           outputs: type=docker,dest=/tmp/wash-image-all-features.tar,name=localhost/wasmcloud-wash:e2e
           build-args: |
             CARGO_FEATURES=host-component-plugins
-          cache-from: |
-            type=gha,scope=wash-all-features-arm64-${{ github.head_ref || github.ref_name }}
-            type=gha,scope=wash-all-features-arm64-main
-          cache-to: type=gha,scope=wash-all-features-arm64-${{ github.head_ref || github.ref_name }},mode=max
       # Same split as `wash-image`: reuses the tarball build's cache, so the
       # pushed image is the bytes the operator-e2e legs tested.
       - name: Push all-features image to GHCR by digest (main only)
@@ -359,9 +396,6 @@ jobs:
           outputs: type=image,name=ghcr.io/wasmcloud/wash,push-by-digest=true,name-canonical=true,push=true
           build-args: |
             CARGO_FEATURES=host-component-plugins
-          cache-from: |
-            type=gha,scope=wash-all-features-arm64-${{ github.head_ref || github.ref_name }}
-            type=gha,scope=wash-all-features-arm64-main
       - name: Export digest
         if: github.repository == 'wasmCloud/wasmCloud' && ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main')
         env:
@@ -378,14 +412,14 @@ jobs:
       # folds it into the default multi-arch manifest.
       - name: Upload digest
         if: github.repository == 'wasmCloud/wasmCloud' && ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main')
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wash-image-all-features-digest-arm64
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
       - name: Upload all-features image tarball
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wash-image-tarball-all-features-arm64
           path: /tmp/wash-image-all-features.tar
@@ -413,7 +447,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Login to ghcr.io
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -429,10 +463,6 @@ jobs:
         with:
           context: .
           outputs: type=image,name=ghcr.io/wasmcloud/wash,push-by-digest=true,name-canonical=true,push=true
-          cache-from: |
-            type=gha,scope=wash-release-amd64-${{ github.head_ref || github.ref_name }}
-            type=gha,scope=wash-release-amd64-main
-          cache-to: type=gha,scope=wash-release-amd64-${{ github.head_ref || github.ref_name }},mode=max
       - name: Export digest
         env:
           DIGEST: ${{ steps.build_push.outputs.digest }}
@@ -445,7 +475,7 @@ jobs:
           fi
           touch "/tmp/digests/${DIGEST#sha256:}"
       - name: Upload digest
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wash-image-digest-amd64
           path: /tmp/digests/*
@@ -470,7 +500,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Login to ghcr.io
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -485,10 +515,6 @@ jobs:
           outputs: type=image,name=ghcr.io/wasmcloud/wash,push-by-digest=true,name-canonical=true,push=true
           build-args: |
             CARGO_FEATURES=host-component-plugins
-          cache-from: |
-            type=gha,scope=wash-all-features-amd64-${{ github.head_ref || github.ref_name }}
-            type=gha,scope=wash-all-features-amd64-main
-          cache-to: type=gha,scope=wash-all-features-amd64-${{ github.head_ref || github.ref_name }},mode=max
       - name: Export digest
         env:
           DIGEST: ${{ steps.build_push.outputs.digest }}
@@ -501,7 +527,7 @@ jobs:
           fi
           touch "/tmp/digests/${DIGEST#sha256:}"
       - name: Upload digest
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wash-image-all-features-digest-amd64
           path: /tmp/digests/*
@@ -533,8 +559,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/free-disk-space
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/free-disk-space
+      - uses: $/.github/actions/setup-rust
       - name: Build e2e fixture components + wash
         working-directory: runtime-operator
         run: make e2e-images
@@ -542,7 +568,7 @@ jobs:
           E2E_IMAGES_MODE: build
           E2E_FIXTURES_DIR: ${{ runner.temp }}/e2e-fixtures
       - name: Upload e2e fixture components + wash
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-fixtures
           path: ${{ runner.temp }}/e2e-fixtures
@@ -605,19 +631,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup-go
+      - uses: $/.github/actions/setup-go
       # The fixture components + the in-repo wash were built by the e2e-fixtures
       # job; download them so `make e2e-images` (push mode) just deploys the
       # registry and pushes — no Rust build on this leg. Both legs push fixtures.
       - name: Download e2e fixture components + wash
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: e2e-fixtures
           path: ${{ runner.temp }}/e2e-fixtures
       # The registry host is always all-features; load it as :all-features on both
       # legs. The tarballs internally tag localhost/wasmcloud-wash:e2e, so retag.
       - name: Download all-features host image
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: wash-image-tarball-all-features-arm64
           path: /tmp
@@ -629,7 +655,7 @@ jobs:
       # alongside the all-features registry host so one cluster runs both.
       - name: Download release host image
         if: matrix.variant == 'release'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: wash-image-tarball-release-arm64
           path: /tmp
@@ -655,7 +681,7 @@ jobs:
         working-directory: runtime-gateway
         run: |
           for attempt in 1 2 3; do
-            if docker build -t localhost/runtime-gateway:e2e .; then
+            if docker build --build-context runtime-operator=../runtime-operator -t localhost/runtime-gateway:e2e .; then
               exit 0
             fi
             if [ "${attempt}" -eq 3 ]; then
@@ -664,7 +690,7 @@ jobs:
             echo "runtime-gateway image build failed (attempt ${attempt}/3); retrying in 10 seconds"
             sleep 10
           done
-      - uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+      - uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
         with:
           cluster_name: wasmcloud-e2e
           config: deploy/kind/kind-config.yaml
@@ -711,6 +737,74 @@ jobs:
           kubectl get workloaddeployments.runtime.wasmcloud.dev -A -o yaml || true
           kubectl get workloads.runtime.wasmcloud.dev -A -o yaml || true
 
+  # The opt-in `mimalloc` and `jemalloc` features, which no other job builds.
+  # Native legs check both on Linux and MSVC (where `jemalloc` is a no-op).
+  # Cross legs link a zigbuild binary for a release target and fail if the
+  # allocator's symbols are missing: a wrong `ar` links jemalloc silently empty.
+  allocators:
+    needs:
+      - changes
+    if: always() && (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: windows-latest
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            buildTarget: aarch64-unknown-linux-gnu.2.17
+            feature: jemalloc
+            symbol: _rjem_malloc
+          - os: ubuntu-latest
+            target: s390x-unknown-linux-gnu
+            buildTarget: s390x-unknown-linux-gnu.2.17
+            feature: mimalloc
+            # MiMalloc calls only the aligned API, and --gc-sections drops
+            # the unreferenced mi_malloc.
+            symbol: mi_malloc_aligned
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Free disk space
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        uses: $/.github/actions/free-disk-space
+      - name: Setup Rust
+        uses: $/.github/actions/setup-rust
+        with:
+          rust-targets: ${{ matrix.target }}
+          install-zigbuild: ${{ matrix.target != '' }}
+          cache-key: allocators-${{ matrix.target || 'native' }}
+      - name: Check allocator features
+        if: ${{ !matrix.target }}
+        run: |
+          cargo check --locked -p wash --features mimalloc
+          cargo check --locked -p wash --features jemalloc
+          cargo check --locked -p wash --features mimalloc,jemalloc
+      - name: Cross-build and check the allocator is linked
+        if: ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+          BUILD_TARGET: ${{ matrix.buildTarget }}
+          FEATURE: ${{ matrix.feature }}
+          SYMBOL: ${{ matrix.symbol }}
+        run: |
+          cargo zigbuild --locked --target "${BUILD_TARGET}" -p wash --features "${FEATURE}"
+          bin="target/${TARGET}/debug/wash"
+          # Via a file: under pipefail, `grep -q` exiting early SIGPIPEs readelf.
+          readelf --wide --syms "${bin}" > "${RUNNER_TEMP}/syms.txt"
+          if ! grep -qw "${SYMBOL}" "${RUNNER_TEMP}/syms.txt"; then
+            echo "::error::${bin} built with --features ${FEATURE} has no ${SYMBOL}: the allocator was not linked"
+            exit 1
+          fi
+          echo "${bin}: ${SYMBOL} linked"
+
   # The main branch ruleset requires this exact check name. Other workflows
   # must give their gate jobs unique names so they cannot mask a wash failure.
   gate:
@@ -718,6 +812,7 @@ jobs:
     needs:
       - check
       - lint
+      - allocators
       - wash-image
       - wash-image-all-features
       - wash-image-amd64
@@ -794,13 +889,13 @@ jobs:
         with:
           persist-credentials: false
       - name: Download digests
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: /tmp/digests
           pattern: wash-image-digest-*
           merge-multiple: true
       - name: Login to ghcr.io
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -845,7 +940,7 @@ jobs:
         env:
           STEPS_META_OUTPUTS_VERSION: ${{ steps.meta.outputs.version }}
       - name: Download all-features digests
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: /tmp/digests-all-features
           pattern: wash-image-all-features-digest-*
@@ -914,44 +1009,44 @@ jobs:
             # Fedora, Arch, RHEL, etc. are glibc-linked, so this binary can
             # dlopen them reliably (unlike the musl build).
             buildTarget: x86_64-unknown-linux-gnu.2.17
-            buildCommand: cargo zigbuild
+            buildCommand: cargo auditable zigbuild
             artifact: wash-x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             bin: wash
           - target: aarch64-unknown-linux-gnu
             buildTarget: aarch64-unknown-linux-gnu.2.17
-            buildCommand: cargo zigbuild
+            buildCommand: cargo auditable zigbuild
             artifact: wash-aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             bin: wash
           - target: s390x-unknown-linux-gnu
             buildTarget: s390x-unknown-linux-gnu.2.17
-            buildCommand: cargo zigbuild
+            buildCommand: cargo auditable zigbuild
             artifact: wash-s390x-unknown-linux-gnu
             runner: ubuntu-latest
             bin: wash
           - target: x86_64-unknown-linux-musl
-            buildCommand: cargo zigbuild
+            buildCommand: cargo auditable zigbuild
             artifact: wash-x86_64-unknown-linux-musl
             runner: ubuntu-latest
             bin: wash
           - target: aarch64-unknown-linux-musl
-            buildCommand: cargo zigbuild
+            buildCommand: cargo auditable zigbuild
             artifact: wash-aarch64-unknown-linux-musl
             runner: ubuntu-latest
             bin: wash
           - target: x86_64-apple-darwin
-            buildCommand: cargo build
+            buildCommand: cargo auditable build
             artifact: wash-x86_64-apple-darwin
             runner: macos-15-intel
             bin: wash
           - target: aarch64-apple-darwin
-            buildCommand: cargo build
+            buildCommand: cargo auditable build
             artifact: wash-aarch64-apple-darwin
             runner: macos-latest
             bin: wash
           - target: x86_64-pc-windows-msvc
-            buildCommand: cargo build
+            buildCommand: cargo auditable build
             artifact: wash-x86_64-pc-windows-msvc
             runner: windows-latest
             bin: wash.exe
@@ -962,12 +1057,22 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: ./.github/actions/setup-rust
+        uses: $/.github/actions/setup-rust
         with:
           rust-toolchain: stable
           # Only needed for ubuntu
           install-zigbuild: ${{ matrix.runner == 'ubuntu-latest' }}
           rust-targets: "${{ matrix.target }}"
+
+      - name: Install cargo-auditable
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tool: cargo-auditable@0.7.7
+
+      - name: Install pinned SBOM generator
+        uses: $/.github/actions/setup-syft
 
       - name: Set SOURCE_DATE_EPOCH from commit timestamp
         # Pin embedded timestamps in the binary to the merge commit's author
@@ -990,6 +1095,10 @@ jobs:
           ${{ matrix.buildCommand }} --release --target ${{ matrix.buildTarget || matrix.target }} -p wash
           cp target/${{ matrix.target }}/release/${{ matrix.bin }} ${{ matrix.artifact }}
 
+      # release-tag.yml refuses binaries without embedded dependency metadata.
+      - name: Check embedded dependency inventory
+        run: node .github/scripts/release-sboms.mjs check-binary ${{ matrix.artifact }}
+
       - name: Create Windows zip archive
         if: runner.os == 'Windows'
         shell: pwsh
@@ -997,7 +1106,7 @@ jobs:
           Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.bin }}" -DestinationPath "${{ matrix.artifact }}.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
@@ -1005,7 +1114,7 @@ jobs:
 
       - name: Upload Windows zip artifact
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}.zip
           path: ${{ matrix.artifact }}.zip

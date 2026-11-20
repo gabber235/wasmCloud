@@ -8,8 +8,10 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	runtimev1alpha1 "go.wasmcloud.dev/runtime-operator/v2/api/runtime/v1alpha1"
 	runtime_controllers "go.wasmcloud.dev/runtime-operator/v2/internal/controller/runtime"
 	"go.wasmcloud.dev/runtime-operator/v2/pkg/wasmbus"
+	"k8s.io/client-go/discovery"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
 
@@ -31,6 +33,9 @@ type EmbeddedOperatorConfig struct {
 	// host unreachable. Unset means DefaultHeartbeatTTL; anything under
 	// MinHeartbeatTTL is raised to it.
 	HeartbeatTTL time.Duration
+	// ReadyRequeueInterval overrides periodic polling for healthy workload
+	// Deployments, ReplicaSets, and Workloads. Zero uses their defaults.
+	ReadyRequeueInterval time.Duration
 	// Host CPU threshold (percentage).
 	// Used to calculate workload scheduling, avoiding hosts that are over this threshold.
 	HostCPUThreshold float64
@@ -71,7 +76,7 @@ func NewEmbeddedOperator(
 	ctx context.Context,
 	mgr manager.Manager,
 	cfg EmbeddedOperatorConfig,
-) (*EmbeddedOperator, error) {
+) (_ *EmbeddedOperator, err error) {
 	// Validate before any side effects (NATS connect, controller setup).
 	// Every Host CRD is created in cfg.Namespace, and the operator's
 	// namespaced Role for Host CRUD binds there.
@@ -92,6 +97,12 @@ func NewEmbeddedOperator(
 	if err != nil {
 		return nil, err
 	}
+	// Nothing owns the connection until the operator is returned.
+	defer func() {
+		if err != nil {
+			nc.Close()
+		}
+	}()
 	bus := wasmbus.NewNatsBus(nc)
 	retiredHosts := &runtime_controllers.RetiredHosts{}
 
@@ -127,28 +138,64 @@ func NewEmbeddedOperator(
 	}
 
 	if err = (&runtime_controllers.WorkloadReconciler{
-		Client:            mgr.GetClient(),
-		Scheme:            mgr.GetScheme(),
-		Bus:               bus,
-		Recorder:          mgr.GetEventRecorder("workload-controller"),
-		OperatorNamespace: cfg.Namespace,
-		AllowSharedHosts:  cfg.AllowSharedHosts,
+		ReadyRequeueInterval: cfg.ReadyRequeueInterval,
+		Client:               mgr.GetClient(),
+		Bus:                  bus,
+		Recorder:             mgr.GetEventRecorder("workload-controller"),
+		OperatorNamespace:    cfg.Namespace,
+		AllowSharedHosts:     cfg.AllowSharedHosts,
+		EvictionLimiter:      runtime_controllers.NewEvictionLimiter(),
 	}).SetupWithManager(mgr); err != nil {
 		return nil, err
 	}
 
 	if err = (&runtime_controllers.WorkloadReplicaSetReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		ReadyRequeueInterval: cfg.ReadyRequeueInterval,
+		Client:               mgr.GetClient(),
+		Scheme:               mgr.GetScheme(),
+		Recorder:             mgr.GetEventRecorder("workload-replicaset-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		return nil, err
 	}
 
 	if err = (&runtime_controllers.WorkloadDeploymentReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		ReadyRequeueInterval: cfg.ReadyRequeueInterval,
+		Client:               mgr.GetClient(),
+		Scheme:               mgr.GetScheme(),
+		Recorder:             mgr.GetEventRecorder("workload-deployment-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		return nil, err
+	}
+
+	// An upgrade that skipped the chart's crds/ has no WorkloadDaemonSet CRD.
+	// Its informer would never sync and take every other controller down.
+	daemonSetCRD := &crdWatch{
+		gv:   runtimev1alpha1.GroupVersion,
+		kind: "WorkloadDaemonSet",
+	}
+	if daemonSetCRD.discovery, err = discovery.NewDiscoveryClientForConfig(mgr.GetConfig()); err != nil {
+		return nil, err
+	}
+	installed, err := daemonSetCRD.installed()
+	switch {
+	case err != nil:
+		return nil, err
+	case !installed:
+		mgr.GetLogger().Error(nil, "WorkloadDaemonSet CRD is not installed, its controller is off; "+
+			"the operator restarts once the CRD is applied")
+		if err = mgr.Add(daemonSetCRD); err != nil {
+			return nil, err
+		}
+	default:
+		if err = (&runtime_controllers.WorkloadDaemonSetReconciler{
+			Client:            mgr.GetClient(),
+			APIReader:         mgr.GetAPIReader(),
+			Scheme:            mgr.GetScheme(),
+			OperatorNamespace: cfg.Namespace,
+			AllowSharedHosts:  cfg.AllowSharedHosts,
+		}).SetupWithManager(mgr); err != nil {
+			return nil, err
+		}
 	}
 
 	if err = (&runtime_controllers.WorkloadRouteReconciler{

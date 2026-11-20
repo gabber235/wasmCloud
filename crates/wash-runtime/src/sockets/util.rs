@@ -5,7 +5,7 @@ use core::time::Duration;
 
 use rustix::fd::AsFd;
 use rustix::io::Errno;
-use rustix::net::{bind, connect, connect_unspec, sockopt};
+use rustix::net::{bind, connect, connect_unspec, getsockname, sockopt};
 use tracing::debug;
 
 use super::SocketAddressFamily;
@@ -60,6 +60,12 @@ pub fn is_valid_address_family(addr: IpAddr, socket_family: SocketAddressFamily)
 
 pub fn is_valid_remote_address(addr: SocketAddr) -> bool {
     !addr.ip().to_canonical().is_unspecified() && addr.port() != 0
+}
+
+/// Whether `a` and `b` name the same UDP peer. Only ip and port count: a v6
+/// address can carry a flow label or scope id the other spelling lacks.
+pub fn is_same_peer(a: SocketAddr, b: SocketAddr) -> bool {
+    a.ip() == b.ip() && a.port() == b.port()
 }
 
 pub fn is_valid_unicast_address(addr: IpAddr) -> bool {
@@ -443,7 +449,32 @@ pub fn udp_connect(sockfd: impl AsFd, addr: SocketAddr) -> Result<(), Errno> {
     }
 }
 
+/// Dissolves the socket's association, keeping its local port.
+///
+/// Linux releases the port of a socket bound with port 0 when it
+/// disconnects, so the next send would pick a fresh one and a peer that
+/// already has the address would lose the socket. Binding the port back
+/// keeps the address stable, which an unspecified socket relies on: its
+/// loopback half is registered under this same port.
+///
+/// macOS clears the local IP instead and refuses a second bind, so a socket
+/// bound to one address accepts datagrams for any local address afterwards.
 pub fn udp_disconnect(sockfd: impl AsFd) -> Result<(), Errno> {
+    let sockfd = sockfd.as_fd();
+    let before = local_address(sockfd)?;
+    dissolve(sockfd)?;
+    let after = local_address(sockfd)?;
+    if after.port() == 0 && before.port() != 0 {
+        bind(sockfd, &SocketAddr::new(after.ip(), before.port()))?;
+    }
+    Ok(())
+}
+
+fn local_address(sockfd: impl AsFd) -> Result<SocketAddr, Errno> {
+    SocketAddr::try_from(getsockname(sockfd)?)
+}
+
+fn dissolve(sockfd: impl AsFd) -> Result<(), Errno> {
     match connect_unspec(sockfd) {
         // BSD platforms return an error even if the UDP socket was disconnected successfully.
         //
@@ -492,6 +523,7 @@ pub fn implicit_bind_addr(family: SocketAddressFamily) -> SocketAddr {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     #[tokio::test]
@@ -566,6 +598,29 @@ mod tests {
 
         let result = udp_disconnect(&sock);
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn disconnect_keeps_an_ephemeral_port() {
+        for (family, local, peer) in [
+            (SocketAddressFamily::Ipv4, "127.0.0.1:0", "127.0.0.1:9999"),
+            (SocketAddressFamily::Ipv4, "0.0.0.0:0", "127.0.0.1:9999"),
+            (SocketAddressFamily::Ipv6, "[::1]:0", "[::1]:9999"),
+            (SocketAddressFamily::Ipv6, "[::]:0", "[::1]:9999"),
+        ] {
+            let sock = udp_socket(family).unwrap();
+            udp_bind(&sock, local.parse().unwrap()).unwrap();
+            let bound = sock.local_addr().unwrap();
+            for _ in 0..2 {
+                udp_connect(&sock, peer.parse().unwrap()).unwrap();
+                udp_disconnect(&sock).unwrap();
+                assert_eq!(sock.local_addr().unwrap().port(), bound.port());
+                #[cfg(target_os = "linux")]
+                assert_eq!(sock.local_addr().unwrap().ip(), bound.ip());
+                #[cfg(target_os = "macos")]
+                assert!(sock.local_addr().unwrap().ip().is_unspecified());
+            }
+        }
     }
 
     #[tokio::test]

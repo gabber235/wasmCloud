@@ -3,6 +3,10 @@
 [![Apache 2.0 License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/wasmcloud/wasmCloud)](https://github.com/wasmcloud/wasmCloud/releases)
 [![Slack](https://img.shields.io/badge/Slack-wasmcloud-4A154B?logo=slack)](https://slack.wasmcloud.com/)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/6363/badge)](https://www.bestpractices.dev/projects/6363)
+[![OpenSSF Baseline](https://www.bestpractices.dev/projects/6363/baseline)](https://www.bestpractices.dev/projects/6363)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/wasmCloud/wasmCloud/badge)](https://scorecard.dev/viewer/?uri=github.com/wasmCloud/wasmCloud)
+[![CLOMonitor](https://img.shields.io/endpoint?url=https://clomonitor.io/api/projects/cncf/wasm-cloud/badge)](https://clomonitor.io/projects/cncf/wasm-cloud)
 
 <p>
   <a href="https://www.cncf.io/projects/wasmcloud/">
@@ -36,7 +40,7 @@ This is the wasmCloud monorepo. Other parts of the project such as documentation
 | --- | --- |
 | [`crates/wash`](./crates/wash/) | **Wasm Shell (`wash`)** — the CLI for scaffolding, building, and publishing WebAssembly components, and for running a local development host. |
 | [`crates/wash-runtime`](./crates/wash-runtime/) | **`wash-runtime`** — the embeddable Rust runtime that powers `wash dev`, the cluster host, and custom embedded hosts. Wraps Wasmtime with a plugin-based capability model. |
-| [`runtime-operator/`](./runtime-operator/) | **Runtime Operator** — Kubernetes operator that reconciles wasmCloud CRDs (`Host`, `Workload`, `WorkloadDeployment`, `WorkloadReplicaSet`, `Artifact`) and schedules workloads onto host pods via NATS. |
+| [`runtime-operator/`](./runtime-operator/) | **Runtime Operator** — Kubernetes operator that reconciles wasmCloud CRDs (`Host`, `Workload`, `WorkloadDeployment`, `WorkloadReplicaSet`, `WorkloadDaemonSet`, `Artifact`) and schedules workloads onto host pods via NATS. |
 | [`runtime-gateway/`](./runtime-gateway/) | **Runtime Gateway** — HTTP gateway that proxies traffic to host pods. *Deprecated as of 2.0.3*; routing is now handled by the operator via EndpointSlices on standard Kubernetes Services. The chart still installs the gateway by default for backwards compatibility (set `gateway.enabled: false` to skip). |
 | [`charts/runtime-operator/`](./charts/runtime-operator/) | Helm chart for installing the operator, host runtime, and (optionally) NATS as a single release. |
 | [`proto/`](./proto/) | Protobuf definitions for control-plane messages exchanged between the operator and hosts over NATS. |
@@ -88,6 +92,7 @@ wash -V
 ```
 
 For details and options, see the [Installation guide](https://wasmcloud.com/docs/installation).
+Verify downloaded binaries, images, and SBOMs with the [Release verification guide](https://wasmcloud.com/docs/verify-releases).
 
 ### wasmCloud on Kubernetes
 
@@ -100,6 +105,14 @@ helm install wasmcloud oci://ghcr.io/wasmcloud/charts/runtime-operator \
 ```
 
 For a local `kind` cluster, the deploy assets and full walkthrough live at [wasmcloud.com/docs/installation](https://wasmcloud.com/docs/installation#install-wasmcloud-on-kubernetes).
+
+`helm upgrade` does not install or update CRDs. Apply the chart's CRDs before upgrading. If a kind a release adds is missing, the operator runs without its controller and restarts itself within 30 seconds of the CRD being applied:
+
+```bash
+helm pull oci://ghcr.io/wasmcloud/charts/runtime-operator --version <version> --untar --untardir /tmp/wasmcloud-chart
+kubectl apply --server-side -f /tmp/wasmcloud-chart/runtime-operator/crds/
+helm upgrade wasmcloud oci://ghcr.io/wasmcloud/charts/runtime-operator --version <version> --namespace wasmcloud
+```
 
 ## Quickstart
 
@@ -255,6 +268,8 @@ Releases ship every two weeks: each Tuesday at 16:00 UTC on the train's cycle, t
 
 ## Project documentation
 
+- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — the parts of wasmCloud, its actors, and what happens when a workload runs
+- [`API.md`](./API.md) — the external interfaces and where each is defined
 - [`CONTRIBUTING.md`](./CONTRIBUTING.md) — how to contribute, code style, and PR conventions
 - [`CONTRIBUTION_LADDER.md`](./CONTRIBUTION_LADDER.md) — contributor → maintainer progression
 - [`GOVERNANCE.md`](./GOVERNANCE.md) — project governance and decision-making

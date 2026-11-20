@@ -33,7 +33,8 @@ Wed–Thu as a buffer for any same-week follow-up patch.
 2. The job opens a `release/vX.Y.Z` branch with a patch-bump (default). It edits the workspace
    `Cargo.toml`, refreshes `Cargo.lock` via `cargo update --workspace` (with a sanity check that
    only workspace member entries change), and bumps `appVersion` in
-   `charts/runtime-operator/Chart.yaml`.
+   `charts/runtime-operator/Chart.yaml`. It then moves the
+   [VEX assessments](vex/README.md) to the new version and lists them in the PR body.
 3. A PR labeled `release-train` is opened; the job enables **rebase auto-merge** (not squash —
    see [Why rebase merge](#why-rebase-merge)) and watches the PR's required checks. If checks
    fail, the job fails loudly with a stage-tagged Slack message to `#release-bot` so a human
@@ -42,9 +43,14 @@ Wed–Thu as a buffer for any same-week follow-up patch.
    exactly `release: vX.Y.Z` (rebase preserves the branch's commit subject; no `(#NNN)`
    PR ref is appended). That subject is what `wash.yml`'s `canary-binaries` job keys off to run
    the matrix release build, and what `release-tag.yml` matches to identify a release commit.
+   The train also requests private parser fuzzing on that exact merge commit.
+   It does not wait for results, and a dispatch failure does not fail the train.
 5. After the PR merges, [`release-tag.yml`](.github/workflows/release-tag.yml) fires via
    `workflow_run` and performs the **build-once-promote** flow:
-   - Verifies HEAD on `main` is a release commit and the workspace version matches.
+   - Pins the merge commit the train recorded, so a later push to `main` can't change what
+     is promoted, and refuses a commit that isn't on `main`. If the train couldn't record
+     the commit, the train fails; dispatch `release-tag.yml` with `sha=<merge-sha>`.
+   - Verifies that commit is a release commit and the workspace version matches.
    - Waits for the canary workflows (`wash`, `runtime-operator`, `runtime-gateway`, `charts`) on
      the merge commit to all conclude `success` — the artifact pipeline has built and tested
      this exact commit.
@@ -56,10 +62,11 @@ Wed–Thu as a buffer for any same-week follow-up patch.
    - **Re-attests** each promoted manifest digest (Sigstore-signed via Fulcio).
    - **Downloads** the canary-binaries artifacts from the wash.yml run that built them, attests
      them, and (after pushing the tag) creates the GitHub Release with those exact binaries.
-   - Pushes the annotated `vX.Y.Z` git tag at the validated merge commit. **The tag is
+   - Signs the annotated `vX.Y.Z` git tag with gitsign, verifies the workflow identity,
+     and pushes it at the validated merge commit. **The tag is
      immutable**: the workflow never force-pushes, and a re-run that finds the tag already on
      origin is a no-op.
-6. After pushing `vX.Y.Z`, `release-tag.yml` also pushes the
+6. After pushing `vX.Y.Z`, `release-tag.yml` also signs, verifies, and pushes the
    `runtime-operator/vX.Y.Z` Go module tag (so module consumers never see it before the
    matching OCI release exists), then creates the GitHub Release with the promoted binaries,
    then dispatches Homebrew and runs winget update inline. All sequenced after canary
@@ -67,6 +74,23 @@ Wed–Thu as a buffer for any same-week follow-up patch.
 7. The tag push triggers the remaining tag-listening workflow: `charts.yml`'s release job
    repackages the chart at `vX.Y.Z` (charts are templated and deterministic, so rebuild is
    acceptable here).
+
+### Private fuzzing
+
+After its PR merges, the release train dispatches a separate run in the private
+[`wasmCloud/security-fuzz`](https://github.com/wasmCloud/security-fuzz) repository.
+It sends the PR's merge commit SHA and a unique request ID, then returns without
+polling. The dispatch step has a two-minute timeout and tolerates errors.
+Neither dispatch failures nor campaign results block promotion. Private logs,
+crash artifacts, generated corpora, and result evidence are available to
+maintainers; public dispatch logs report no findings.
+
+For an authentication failure, check the private repository's Octo STS access
+and release-train trust policy. For a crash or build failure, inspect the private
+run and follow the security process. Deploy reviewed control changes from
+[`fuzz/private/`](fuzz/private/README.md). To retry a failed dispatch or cover a
+manual release, dispatch the private `fuzz.yml` with the full release commit SHA.
+Rerunning `release-tag.yml` does not request fuzzing.
 
 ### Why rebase merge
 
@@ -89,8 +113,9 @@ release-train PRs. The train will:
   auto-merge fires (auto from there)
 
 Maintainers should treat release-train PRs as a normal review item: read the diff (only
-`Cargo.toml`, `Cargo.lock`, and `Chart.yaml` should change), confirm the version bump matches
-expectations, approve. If the PR sits unapproved past the 2h timeout, the train fails with a
+`Cargo.toml`, `Cargo.lock`, `Chart.yaml`, and `vex/wasmcloud.openvex.json` should change),
+confirm the version bump matches expectations, confirm each carried VEX statement still holds
+(see [Release SBOMs](#release-sboms)), approve. If the PR sits unapproved past the 2h timeout, the train fails with a
 Slack page; resolve and re-dispatch.
 
 ### Bumping minor or major
@@ -106,14 +131,24 @@ If `release-train.yml` is broken or the bot can't push, do by hand what the trai
 matrix binary build and is what `release-tag.yml` looks for to identify a release commit.
 
 1. Bump the workspace version in `Cargo.toml` to `X.Y.Z` and `appVersion` in
-   `charts/runtime-operator/Chart.yaml` to the same value. Run `cargo update --workspace`.
+   `charts/runtime-operator/Chart.yaml` to the same value. Run `cargo update --workspace`, then
+   `node .github/scripts/release-vex.mjs --from PREVIOUS --to X.Y.Z`.
 2. Commit with subject `release: vX.Y.Z`. Open a PR, get it reviewed, **rebase-merge**
    to `main` (rebase preserves the subject verbatim; squash-merge would append ` (#NNN)` and
    break `release-tag.yml`'s subject match).
 3. Wait for canary builds on the merge commit to all succeed (`wash`, `runtime-operator`,
    `runtime-gateway`, `charts`, plus `canary-binaries` in `wash.yml`).
+   Also dispatch `fuzz.yml` in `wasmCloud/security-fuzz` with
+   `sha=FULL_RELEASE_COMMIT_SHA` to cover this manual release. Fuzzing runs
+   independently and does not hold up publishing.
 4. Re-run `release-tag.yml` from the Actions tab (**Re-run failed jobs** on the failed
-   workflow_run instance) so it picks up the now-green canaries, or perform its work by hand:
+   workflow_run instance), or dispatch it from `main` with the release commit:
+   ```bash
+   gh workflow run release-tag.yml --ref main -f sha=FULL_RELEASE_COMMIT_SHA
+   ```
+   Replace `FULL_RELEASE_COMMIT_SHA` with the validated release commit.
+   Promotion only runs when the workflow ref is `refs/heads/main`, including manual dispatches.
+   If `release-tag.yml` itself is unavailable, perform its work by hand:
    - Promote the canary OCI images (bare semver, no `v`):
      ```bash
      for img in ghcr.io/wasmcloud/{wash,runtime-gateway,runtime-operator}; do
@@ -122,12 +157,18 @@ matrix binary build and is what `release-tag.yml` looks for to identify a releas
      docker buildx imagetools create --tag ghcr.io/wasmcloud/wash:X.Y.Z-all-features \
        ghcr.io/wasmcloud/wash:sha-<MERGE_SHA>-all-features
      ```
-   - Push the immutable annotated tag and the Go module tag:
+   - Install [gitsign](https://github.com/sigstore/gitsign#installation), then sign and push
+     the immutable annotated tag and the Go module tag:
      ```bash
-     git tag -a vX.Y.Z <MERGE_SHA> -m "Release vX.Y.Z"
-     git tag -a runtime-operator/vX.Y.Z <MERGE_SHA> -m "Release runtime-operator/vX.Y.Z"
+     git config --local gpg.format x509
+     git config --local gpg.x509.program gitsign
+     git tag -s vX.Y.Z <MERGE_SHA> -m "Release vX.Y.Z"
+     git tag -s runtime-operator/vX.Y.Z <MERGE_SHA> -m "Release runtime-operator/vX.Y.Z"
      git push origin vX.Y.Z runtime-operator/vX.Y.Z
      ```
+     Local signing uses the maintainer's OIDC identity. Publish the expected identity and
+     issuer through a trusted project channel, and document this exception in the release
+     notes so users can verify it with the flags in [Verifying release tags](#verifying-release-tags).
    - Download the canary-binaries from the merge commit's `wash.yml` run and create the
      GitHub Release with them attached
      (`gh run download <RUN_ID> --pattern 'wash-*' --dir artifacts/`, then `gh release
@@ -136,7 +177,7 @@ matrix binary build and is what `release-tag.yml` looks for to identify a releas
      `release-tag.yml`.
 5. `charts.yml` repackages and pushes the chart on the `vX.Y.Z` tag push.
 
-Do not bypass step 3 — promoting a digest that hasn't had the canary suite pass defeats the
+Do not bypass canary validation in step 3 — promoting a digest that hasn't passed canary defeats the
 "tested what we're publishing" guarantee.
 
 ## Release artifacts at a glance
@@ -195,19 +236,88 @@ users only ever pull tagged releases, so attesting every main commit's canary wo
 noise (and a pointless mint of Sigstore certificates). When `release-tag.yml` retags the
 canary digest as `X.Y.Z`, it mints a fresh SLSA provenance attestation against the promoted
 manifest digest, signed via Fulcio, linking that digest to the workflow run, source commit,
-and runner.
+and runner. The binaries' provenance bundle is attached to each GitHub Release twice: as
+`wash.sigstore.json`, and as `wash.intoto.jsonl` for tools that look for in-toto provenance by
+that name, such as OpenSSF Scorecard.
 
-Verify any released image with:
+User-facing verification instructions live in the
+[release verification guide](https://wasmcloud.com/docs/verify-releases). It covers binary
+and container provenance, the expected `release-tag.yml` signer workflow, and SPDX SBOM
+verification. Keep consumer commands there.
+
+### Release SBOMs
+
+The release train moves each [VEX assessment](vex/README.md) to the new version with
+`.github/scripts/release-vex.mjs`. It carries a statement for an ignored advisory only while
+`Cargo.lock` still has every dependency version the statement names, and fails the train
+otherwise. When a dependency update fixes an advisory and its `.cargo/audit.toml` ignore is
+removed, the train records the statement as `fixed` for the new release. It cannot tell whether
+the code paths or build features behind a `not_affected` conclusion changed, so approving the
+release PR confirms each statement listed in its body still holds. Between releases,
+`check-vex.mjs` warns on any PR that moves an assessed dependency; reassess it then. `release-tag.yml` checks and stages
+[`vex/wasmcloud.openvex.json`](vex/wasmcloud.openvex.json) before image promotion, attests it with
+`actions/attest`, and attaches it and `wasmcloud.openvex.sigstore.json` to every GitHub Release
+alongside the SBOMs. Release tags and assets retain past assessments.
+
+Before promoting anything, `release-tag.yml` scans the downloaded canary binaries and the
+`linux/amd64` and `linux/arm64` manifests of each image it is about to release, using
+version-pinned Syft (`.github/scripts/release-sboms.mjs`). The shared `setup-syft` action
+uses Anchore's SHA-pinned `download-syft` action to install Syft in the Actions tool cache.
+The binary builds use `cargo-auditable`, and `canary-binaries` checks each binary's embedded
+inventory at build time; the Chainguard Rust builder embeds the same metadata in wash images. No
+binaries or images are rebuilt during promotion.
+
+Each wash target gets an SPDX inventory. The Windows executable and ZIP share an inventory.
+Each image platform gets its own inventory (`<image>-image-linux-<arch>.spdx.json`) and SBOM
+attestation bound to the platform manifest digest, published to GHCR. The index keeps its
+existing build provenance. All SPDX documents and SBOM Sigstore bundles are attached to the
+GitHub Release. Documents are normalized to the release commit time and their download URL, so
+a re-run produces the same bytes.
+
+Missing Rust/Go dependency inventories or unexpected image platforms fail the release before
+any image tag, attestation, or git tag is published. Recovery against older binaries without
+embedded Rust metadata requires new canary artifacts; do not bypass the inventory check. A
+new `canary-binaries` target needs a matching `release-binary-sbom` step; the release fails
+before tagging when one is missing.
+
+Image resolution and promotion live in `.github/scripts/release-images.mjs`. Run the release
+script tests with `node --test .github/scripts/release-*.test.mjs`.
+
+### Verifying release tags
+
+`release-tag.yml` signs new `vX.Y.Z` and `runtime-operator/vX.Y.Z` annotated tags with
+[gitsign](https://github.com/sigstore/gitsign). It uses GitHub Actions OIDC to obtain a
+short-lived Fulcio certificate and records the signature in the Rekor transparency log.
+No long-lived signing-key secret is required. The workflow verifies each new tag's signature,
+certificate identity, and issuer before pushing it.
+
+Install a current gitsign release using its
+[installation instructions](https://github.com/sigstore/gitsign#installation), then fetch and
+verify both tags (replace `vX.Y.Z` with the release version):
+
 ```bash
-gh attestation verify --repo wasmCloud/wasmCloud oci://ghcr.io/wasmcloud/wash:X.Y.Z
-gh attestation verify --repo wasmCloud/wasmCloud oci://ghcr.io/wasmcloud/runtime-gateway:X.Y.Z
-gh attestation verify --repo wasmCloud/wasmCloud oci://ghcr.io/wasmcloud/runtime-operator:X.Y.Z
+git fetch origin tag vX.Y.Z tag runtime-operator/vX.Y.Z
+for tag in vX.Y.Z runtime-operator/vX.Y.Z; do
+  gitsign verify-tag \
+    --certificate-identity https://github.com/wasmCloud/wasmCloud/.github/workflows/release-tag.yml@refs/heads/main \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    "${tag}" || exit 1
+done
 ```
 
-Binaries on the GitHub Release have equivalent attestations (verifiable by digest):
-```bash
-gh attestation verify --repo wasmCloud/wasmCloud ./wash
-```
+Run this in a checkout whose `origin` is `https://github.com/wasmCloud/wasmCloud.git` (or its
+SSH equivalent). Require a successful exit status for each tag. Keep the exact identity and
+issuer checks: plain `git verify-tag` does not validate the expected Sigstore certificate
+claims. GitHub currently displays gitsign signatures as **Unverified** because it does not
+support Sigstore verification; use gitsign to verify them.
+
+Existing tags are never replaced or re-signed. A rerun skips a tag already on origin, so an
+older unsigned tag remains unsigned even if its counterpart is newly signed during recovery.
+After the first release with both signatures verified, record its version here and use it as
+the starting version in the Best Practices badge justification for `version_tags_signed`.
+Confirm the certificate identity against the workflow run before publishing that evidence.
+No first signed release has been recorded yet. Tag signatures cover the source revision;
+verify binary and container attestations separately as described above.
 
 ### When canary fails post-merge
 
@@ -326,6 +436,7 @@ respond by either:
 
 - [ ] All release workflows completed successfully in GitHub Actions
 - [ ] GitHub Release is visible with correct binaries attached
+- [ ] Both release tags pass the signature and identity checks in [Verifying release tags](#verifying-release-tags)
 - [ ] Docker images are available on GHCR
 - [ ] Homebrew tap updated (check [homebrew-wasmcloud](https://github.com/wasmCloud/homebrew-wasmcloud))
 - [ ] Announce the release in [Slack](https://slack.wasmcloud.com) `#announcements`

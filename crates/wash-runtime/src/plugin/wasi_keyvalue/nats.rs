@@ -523,7 +523,7 @@ impl HostPlugin for NatsKeyValue {
             workload_id = component_handle.id(),
             "Adding keyvalue interfaces to linker for workload"
         );
-        let linker = component_handle.linker();
+        let linker = component_handle.linker()?;
 
         bindings::wasi::keyvalue::store::add_to_linker::<_, SharedCtx>(linker, extract_active_ctx)?;
         bindings::wasi::keyvalue::atomics::add_to_linker::<_, SharedCtx>(
@@ -555,6 +555,7 @@ impl HostPlugin for NatsKeyValue {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     //! Tests for the private `get_or_create_bucket` path that `open` relies
     //! on, and for the `collect_key_page` pagination helper `list_keys`
@@ -674,7 +675,7 @@ mod tests {
 
     async fn start_nats_jetstream()
     -> anyhow::Result<(ContainerAsync<GenericImage>, async_nats::Client)> {
-        let container = GenericImage::new("nats", "2.12.8-alpine")
+        let container = GenericImage::new("nats", "2.12.15-alpine")
             .with_exposed_port(4222.tcp())
             .with_wait_for(WaitFor::message_on_stderr("Server is ready"))
             .with_cmd(["-js"])

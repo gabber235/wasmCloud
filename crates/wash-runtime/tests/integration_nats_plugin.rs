@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures::StreamExt as _;
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
@@ -41,7 +43,7 @@ async fn expect_refused(host: &impl HostApi, request: WorkloadStartRequest) -> R
 
 /// A P3 guest exporting the JetStream and core handlers.
 const NATS_HANDLER_WASM: &[u8] = include_bytes!("wasm/nats_async_handler_p3.wasm");
-/// Imports `wasmcloud:nats/core@0.1.2` twice, under `hub` and `leaf`.
+/// Imports `wasmcloud:nats/core@0.1.3` twice, under `hub` and `leaf`.
 const NATS_BRIDGE_WASM: &[u8] = include_bytes!("wasm/nats_implements_p3.wasm");
 
 const STREAM: &str = "TESTS";
@@ -55,12 +57,16 @@ struct Harness {
 }
 
 async fn start_nats() -> Result<Harness> {
+    start_nats_version("2.12.15-alpine", true).await
+}
+
+async fn start_nats_version(version: &str, with_kv: bool) -> Result<Harness> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init()
         .ok();
 
-    let container = GenericImage::new("nats", "2.12.8-alpine")
+    let container = GenericImage::new("nats", version)
         .with_exposed_port(4222.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Server is ready"))
         .with_cmd(["-js"])
@@ -91,13 +97,15 @@ async fn start_nats() -> Result<Harness> {
     .await
     .map_err(|e| anyhow::anyhow!("failed to create stream: {e}"))?;
 
-    js.create_key_value(async_nats::jetstream::kv::Config {
-        bucket: COUNTS_BUCKET.to_string(),
-        history: 10,
-        ..Default::default()
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("failed to create kv bucket: {e}"))?;
+    if with_kv {
+        js.create_key_value(async_nats::jetstream::kv::Config {
+            bucket: COUNTS_BUCKET.to_string(),
+            history: 10,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to create kv bucket: {e}"))?;
+    }
 
     Ok(Harness {
         nats_url,
@@ -109,10 +117,19 @@ async fn start_nats() -> Result<Harness> {
 
 /// Connects once the server is actually accepting, or gives up at `budget`.
 async fn connect_with_retry(url: &str, budget: Duration) -> Result<async_nats::Client> {
+    connect_with_retry_using(url, budget, async_nats::ConnectOptions::new).await
+}
+
+/// As [`connect_with_retry`], connecting with the options `options` builds.
+async fn connect_with_retry_using(
+    url: &str,
+    budget: Duration,
+    options: impl Fn() -> async_nats::ConnectOptions,
+) -> Result<async_nats::Client> {
     let deadline = tokio::time::Instant::now() + budget;
     let mut last: Option<async_nats::ConnectError> = None;
     while tokio::time::Instant::now() < deadline {
-        match async_nats::connect(url).await {
+        match options().connect(url).await {
             Ok(client) => return Ok(client),
             Err(e) => {
                 last = Some(e);
@@ -139,7 +156,7 @@ fn nats_interface(config: &[(&str, &str)]) -> WitInterface {
         ]
         .into_iter()
         .collect(),
-        version: Some(semver::Version::new(0, 1, 2)),
+        version: Some(semver::Version::new(0, 1, 3)),
         config: config
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -164,7 +181,7 @@ fn nats_async_interface(config: &[(&str, &str)]) -> WitInterface {
         ]
         .into_iter()
         .collect(),
-        version: Some(semver::Version::new(0, 1, 2)),
+        version: Some(semver::Version::new(0, 1, 3)),
         config: config
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -253,11 +270,8 @@ async fn start_host_with(declared: PluginBindingSet) -> Result<impl HostApi> {
 }
 
 /// The config map an operator writes for one declared binding.
-fn declared(config: &[(&str, &str)]) -> HashMap<String, String> {
-    config
-        .iter()
-        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-        .collect()
+fn declared(config: &[(&str, &str)]) -> wash_runtime::wit::Config {
+    config.iter().copied().collect()
 }
 
 /// Collects result lines the fixture publishes, up to `count` or the deadline.
@@ -1050,7 +1064,7 @@ async fn a_nakd_message_survives_a_consumer_rebuild() -> Result<()> {
 /// only need core pub/sub, and a second JetStream-enabled server would just be
 /// slower to start.
 async fn start_bare_nats() -> Result<(String, async_nats::Client, ContainerAsync<GenericImage>)> {
-    let container = GenericImage::new("nats", "2.12.8-alpine")
+    let container = GenericImage::new("nats", "2.12.15-alpine")
         .with_exposed_port(4222.tcp())
         .with_wait_for(WaitFor::message_on_stderr("Server is ready"))
         .start()
@@ -1071,7 +1085,7 @@ fn named_nats_interface(name: &str, interfaces: &[&str], config: &[(&str, &str)]
         namespace: "wasmcloud".to_string(),
         package: "nats".to_string(),
         interfaces: interfaces.iter().map(|i| (*i).to_string()).collect(),
-        version: Some(semver::Version::new(0, 1, 2)),
+        version: Some(semver::Version::new(0, 1, 3)),
         config: config
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1968,4 +1982,1041 @@ async fn kv_select_streams_entries_with_values() -> Result<()> {
         "a lapsed timeout-ms must resolve the future with timeout, not ok, got {deadline:?}"
     );
     Ok(())
+}
+
+async fn api_probe(h: &Harness, spec: impl Into<String>) -> Result<String> {
+    let response = timeout(
+        Duration::from_secs(20),
+        h.client.request("test.api", spec.into().into()),
+    )
+    .await??;
+    Ok(String::from_utf8(response.payload.to_vec())?)
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (NATS); run with `cargo test --include-ignored`"]
+async fn jetstream_message_operations_and_timestamps() -> Result<()> {
+    let h = start_nats().await?;
+    let host = start_host().await?;
+    let stream = h.js.get_stream(STREAM).await?;
+    let created = stream.cached_info().created.unix_timestamp_nanos() as u64;
+    let mut config = stream.cached_info().config.clone();
+    let first =
+        h.js.publish("test.orders.mine", "first".into())
+            .await?
+            .await?
+            .sequence;
+    let last =
+        h.js.publish("test.orders.mine", "last".into())
+            .await?
+            .await?
+            .sequence;
+    let other =
+        h.js.publish("other.secret", "secret".into())
+            .await?
+            .await?
+            .sequence;
+    let stored = stream.get_raw_message(last).await?;
+    let stored_at = stored.time.unix_timestamp_nanos() as u64;
+
+    let protected =
+        h.js.create_stream(async_nats::jetstream::stream::Config {
+            name: "PROTECTED".into(),
+            subjects: vec!["test.protected".into()],
+            deny_delete: true,
+            deny_purge: true,
+            ..Default::default()
+        })
+        .await?;
+    let protected_seq =
+        h.js.publish("test.protected", "protected".into())
+            .await?
+            .await?
+            .sequence;
+    let response = host
+        .workload_start(workload_request(
+            "wl-js-api",
+            nats_async_interface(&[
+                ("servers", &h.nats_url),
+                ("subject-allow", "test.>"),
+                ("stream-allow", "TESTS,PROTECTED"),
+                ("stream-delete-allow", "TESTS,PROTECTED"),
+                ("core-subscriptions", "test.api"),
+                ("jetstream-subscriptions", "TESTS:test.orders.push:all"),
+            ]),
+        ))
+        .await?;
+    anyhow::ensure!(
+        response.workload_status.workload_state != WorkloadState::Error,
+        "{:?}",
+        response.workload_status
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let expected = format!("test.orders.mine:{last}:{stored_at}:last");
+    assert_eq!(
+        api_probe(&h, format!("js-api:last:{STREAM}:test.orders.mine")).await?,
+        expected
+    );
+    config.allow_direct = true;
+    h.js.update_stream(config).await?;
+    assert_eq!(
+        api_probe(&h, format!("js-api:at:{STREAM}:{last}")).await?,
+        expected
+    );
+    assert_eq!(
+        api_probe(&h, format!("js-api:created:{STREAM}")).await?,
+        created.to_string()
+    );
+    assert!(
+        api_probe(&h, format!("js-api:last:{STREAM}:test.orders.absent"))
+            .await?
+            .starts_with("not-found:")
+    );
+    assert!(
+        api_probe(&h, format!("js-api:at:{STREAM}:{other}"))
+            .await?
+            .starts_with(&format!("denied:not-granted:message#{other}:"))
+    );
+    assert!(
+        api_probe(&h, format!("js-api:delete:{STREAM}:{other}"))
+            .await?
+            .starts_with(&format!("denied:not-granted:message#{other}:"))
+    );
+    assert!(stream.get_raw_message(other).await.is_ok());
+    for subject in ["test.orders.*", "$KV.secrets.key", "runtime.host.events"] {
+        assert!(
+            api_probe(&h, format!("js-api:last:{STREAM}:{subject}"))
+                .await?
+                .starts_with("denied:")
+        );
+    }
+    for pattern in [
+        ">",
+        "*.orders.>",
+        "$KV.>",
+        "runtime.host.>",
+        "",
+        "test.orders.foo*",
+        "test.orders. bad",
+    ] {
+        assert!(
+            api_probe(&h, format!("js-api:purge:{STREAM}:{pattern}"))
+                .await?
+                .starts_with("denied:"),
+            "{pattern}"
+        );
+    }
+    assert_eq!(
+        api_probe(&h, format!("js-api:purge:{STREAM}:test.orders.mine:1")).await?,
+        "1"
+    );
+    assert!(stream.get_raw_message(first).await.is_err());
+    assert!(stream.get_raw_message(last).await.is_ok());
+    assert_eq!(
+        api_probe(&h, format!("js-api:delete:{STREAM}:{last}")).await?,
+        "ok"
+    );
+    assert!(
+        api_probe(&h, format!("js-api:delete:{STREAM}:{last}"))
+            .await?
+            .starts_with("not-found:")
+    );
+    assert!(
+        api_probe(&h, format!("js-api:at:{STREAM}:{last}"))
+            .await?
+            .starts_with("not-found:")
+    );
+
+    for spec in [
+        format!("js-api:delete:PROTECTED:{protected_seq}"),
+        "js-api:purge:PROTECTED:test.protected".into(),
+    ] {
+        assert!(api_probe(&h, spec).await?.starts_with("jetstream:"));
+    }
+    assert!(protected.get_raw_message(protected_seq).await.is_ok());
+    for subject in ["test.orders.removable.a", "test.orders.removable.b"] {
+        h.js.publish(subject, "remove".into()).await?.await?;
+    }
+    assert_eq!(
+        api_probe(&h, format!("js-api:purge:{STREAM}:test.orders.removable.*")).await?,
+        "2"
+    );
+    assert!(stream.get_raw_message(other).await.is_ok());
+
+    let seq =
+        h.js.publish("test.orders.pull", "clock".into())
+            .await?
+            .await?
+            .sequence;
+    let time = stream
+        .get_raw_message(seq)
+        .await?
+        .time
+        .unix_timestamp_nanos() as u64;
+    stream
+        .create_consumer(async_nats::jetstream::consumer::pull::Config {
+            durable_name: Some("clock".into()),
+            filter_subject: "test.orders.pull".into(),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(
+        api_probe(&h, format!("js-api:pull-time:{STREAM}:clock")).await?,
+        format!("{seq}:{time}")
+    );
+    let mut results = h.client.subscribe("test.results").await?;
+    h.client.flush().await?;
+    let push_seq =
+        h.js.publish("test.orders.push", "stored-time:push".into())
+            .await?
+            .await?
+            .sequence;
+    let push_time = stream
+        .get_raw_message(push_seq)
+        .await?
+        .time
+        .unix_timestamp_nanos() as u64;
+    let result = timeout(Duration::from_secs(10), results.next())
+        .await?
+        .context("missing push timestamp")?;
+    assert_eq!(
+        String::from_utf8(result.payload.to_vec())?,
+        format!("stored-time:push:{push_seq}:{push_time}")
+    );
+    host.workload_stop(wash_runtime::types::WorkloadStopRequest {
+        workload_id: "wl-js-api".into(),
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (NATS); run with `cargo test --include-ignored`"]
+async fn timestamped_reads_preserve_bucket_grants() -> Result<()> {
+    let h = start_nats().await?;
+    let host = start_host().await?;
+    let store = h.js.get_key_value(COUNTS_BUCKET).await?;
+    let allowed = store.put("allowed", "visible".into()).await?;
+    let hidden = store.put("hidden", "secret".into()).await?;
+    let stored = store.stream.get_raw_message(allowed).await?;
+    let stream = &store.stream_name;
+    let subject = format!("$KV.{COUNTS_BUCKET}.allowed");
+    let expected = format!(
+        "{subject}:{allowed}:{}:visible",
+        stored.time.unix_timestamp_nanos()
+    );
+    let private =
+        h.js.create_key_value(async_nats::jetstream::kv::Config {
+            bucket: "private-counts".into(),
+            ..Default::default()
+        })
+        .await?;
+    let private_revision = private.put("key", "private".into()).await?;
+
+    let response = host
+        .workload_start(workload_request(
+            "wl-bucket-reads",
+            nats_async_interface(&[
+                ("servers", &h.nats_url),
+                (
+                    "subject-allow",
+                    "test.api,$KV.test-counts.allowed,$KV.private-counts.>",
+                ),
+                ("bucket-allow", COUNTS_BUCKET),
+                // Broad stream grants cannot bypass the separate bucket grant or
+                // enable destructive stream calls on a bucket's backing stream.
+                ("stream-allow", ">"),
+                ("stream-delete-allow", ">"),
+                ("core-subscriptions", "test.api"),
+            ]),
+        ))
+        .await?;
+    anyhow::ensure!(
+        response.workload_status.workload_state != WorkloadState::Error,
+        "{:?}",
+        response.workload_status
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    for spec in [
+        format!("js-api:last:{stream}:{subject}"),
+        format!("js-api:at:{stream}:{allowed}"),
+    ] {
+        assert_eq!(api_probe(&h, spec).await?, expected);
+    }
+    // Knowing a sequence must not expose the name of a denied subject.
+    assert_eq!(
+        api_probe(&h, format!("js-api:at:{stream}:{hidden}")).await?,
+        format!("denied:not-granted:message#{hidden}:{stream}")
+    );
+    for subject in [
+        "$KV.test-counts.hidden",
+        "$KV.test-counts.*",
+        "$KV.test-counts.>",
+        "$KV.test-counts.allow*",
+        "$KV.test-counts. allowed",
+    ] {
+        assert!(
+            api_probe(&h, format!("js-api:last:{stream}:{subject}"))
+                .await?
+                .starts_with("denied:")
+        );
+    }
+    for spec in [
+        "js-api:last:KV_private-counts:$KV.private-counts.key".to_string(),
+        format!("js-api:at:KV_private-counts:{private_revision}"),
+    ] {
+        assert_eq!(
+            api_probe(&h, spec).await?,
+            "denied:reserved:stream:KV_private-counts"
+        );
+    }
+    for spec in [
+        format!("js-api:purge:{stream}:{subject}"),
+        format!("js-api:delete:{stream}:{allowed}"),
+    ] {
+        assert_eq!(
+            api_probe(&h, spec).await?,
+            format!("denied:reserved:stream:{stream}")
+        );
+    }
+    assert!(store.stream.get_raw_message(allowed).await.is_ok());
+    host.workload_stop(wash_runtime::types::WorkloadStopRequest {
+        workload_id: "wl-bucket-reads".into(),
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (NATS); run with `cargo test --include-ignored`"]
+async fn destructive_stream_calls_require_a_host_owned_ceiling() -> Result<()> {
+    let h = start_nats().await?;
+    let host = start_host_with(
+        PluginBindingSet::new(PLUGIN_NATS_ID)
+            .with_workload_config(WorkloadConfigPolicy::Deny)
+            .with_base(declared(&[
+                ("servers", &h.nats_url),
+                ("subject-allow", "test.>"),
+                ("stream-allow", STREAM),
+            ])),
+    )
+    .await?;
+    let message = expect_refused(
+        &host,
+        workload_request(
+            "wl-escalate-delete",
+            nats_async_interface(&[
+                ("stream-delete-allow", STREAM),
+                ("core-subscriptions", "test.api"),
+            ]),
+        ),
+    )
+    .await?;
+    assert!(message.contains("stream-delete-allow"), "{message}");
+
+    let seq =
+        h.js.publish("test.orders.mine", "keep".into())
+            .await?
+            .await?
+            .sequence;
+    host.workload_start(workload_request(
+        "wl-no-delete",
+        nats_async_interface(&[("core-subscriptions", "test.api")]),
+    ))
+    .await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for spec in [
+        format!("js-api:delete:{STREAM}:{seq}"),
+        format!("js-api:purge:{STREAM}:test.orders.mine"),
+    ] {
+        assert_eq!(
+            api_probe(&h, spec).await?,
+            format!("denied:not-granted:stream:{STREAM}")
+        );
+    }
+    assert!(
+        h.js.get_stream(STREAM)
+            .await?
+            .get_raw_message(seq)
+            .await
+            .is_ok()
+    );
+    host.workload_stop(wash_runtime::types::WorkloadStopRequest {
+        workload_id: "wl-no-delete".into(),
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (NATS); run with `cargo test --include-ignored`"]
+async fn kv_ttl_and_conditional_delete() -> Result<()> {
+    let h = start_nats().await?;
+    let host = start_host().await?;
+    let store = h.js.get_key_value(COUNTS_BUCKET).await?;
+    h.js.create_key_value(async_nats::jetstream::kv::Config {
+        bucket: "no-ttl".into(),
+        ..Default::default()
+    })
+    .await?;
+    let mut config = store.stream.cached_info().config.clone();
+    config.allow_message_ttl = true;
+    h.js.update_stream(config).await?;
+    let old = store.create("lock", "old".into()).await?;
+    let current = store.update("lock", "new".into(), old).await?;
+    host.workload_start(workload_request(
+        "wl-kv-api",
+        nats_async_interface(&[
+            ("servers", &h.nats_url),
+            ("subject-allow", "test.>"),
+            ("bucket-allow", "test-counts,no-ttl"),
+            ("core-subscriptions", "test.api"),
+        ]),
+    ))
+    .await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        api_probe(
+            &h,
+            format!("kv-api:delete-by-revision:{COUNTS_BUCKET}:lock:{old}")
+        )
+        .await?,
+        format!("revision-mismatch:{current}")
+    );
+    // Zero is refused before it reaches the server: there it would match an
+    // absent key and tombstone one that was never written.
+    for key in ["lock", "never-written"] {
+        assert!(
+            api_probe(
+                &h,
+                format!("kv-api:delete-by-revision:{COUNTS_BUCKET}:{key}:0")
+            )
+            .await?
+            .starts_with("jetstream:")
+        );
+    }
+    assert!(store.entry("never-written").await?.is_none());
+    assert_eq!(
+        store.get("lock").await?,
+        Some(bytes::Bytes::from_static(b"new"))
+    );
+    assert_eq!(
+        api_probe(
+            &h,
+            format!("kv-api:delete-by-revision:{COUNTS_BUCKET}:lock:{current}")
+        )
+        .await?,
+        "ok"
+    );
+    assert_eq!(store.get("lock").await?, None);
+    for key in ["fresh", "lock"] {
+        // Cover both a fresh key and recreation over a tombstone. Sending
+        // 1999ms unchanged would let NATS truncate the lease to one second.
+        let revision: u64 = api_probe(&h, format!("kv-api:ttl:{COUNTS_BUCKET}:{key}:1999"))
+            .await?
+            .parse()?;
+        let message = store.stream.get_raw_message(revision).await?;
+        assert_eq!(message.headers.get("Nats-TTL").unwrap().as_str(), "2s");
+        assert_eq!(
+            store.get(key).await?,
+            Some(bytes::Bytes::from_static(b"lease"))
+        );
+        assert!(
+            api_probe(&h, format!("kv-api:ttl:{COUNTS_BUCKET}:{key}:2000"))
+                .await?
+                .starts_with("jetstream:")
+        );
+    }
+    assert!(
+        api_probe(&h, "kv-api:ttl:no-ttl:lock:2000")
+            .await?
+            .starts_with("jetstream:")
+    );
+    for key in ["$JS.API", "*", ">", ".bad", "bad.", "bad key"] {
+        assert!(
+            api_probe(&h, format!("kv-api:ttl:{COUNTS_BUCKET}:{key}:2000"))
+                .await?
+                .starts_with("jetstream:")
+        );
+    }
+    for ttl in [0, 999, u64::MAX] {
+        assert!(
+            api_probe(&h, format!("kv-api:ttl:{COUNTS_BUCKET}:invalid:{ttl}"))
+                .await?
+                .starts_with("jetstream:")
+        );
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(store.get("fresh").await?, None);
+    assert_eq!(store.get("lock").await?, None);
+    host.workload_stop(wash_runtime::types::WorkloadStopRequest {
+        workload_id: "wl-kv-api".into(),
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (NATS); run with `cargo test --include-ignored`"]
+async fn filtered_purge_refuses_servers_with_unsafe_purge_replay() -> Result<()> {
+    let h = start_nats_version("2.9.17-alpine", false).await?;
+    let host = start_host().await?;
+    let seq =
+        h.js.publish("test.orders.mine", "keep".into())
+            .await?
+            .await?
+            .sequence;
+    host.workload_start(workload_request(
+        "wl-old-purge",
+        nats_async_interface(&[
+            ("servers", &h.nats_url),
+            ("subject-allow", "test.>"),
+            ("stream-allow", STREAM),
+            ("stream-delete-allow", STREAM),
+            ("core-subscriptions", "test.api"),
+        ]),
+    ))
+    .await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        api_probe(&h, format!("js-api:purge:{STREAM}:test.orders.mine"))
+            .await?
+            .starts_with("unsupported-by-server:")
+    );
+    assert!(
+        h.js.get_stream(STREAM)
+            .await?
+            .get_raw_message(seq)
+            .await
+            .is_ok()
+    );
+    host.workload_stop(wash_runtime::types::WorkloadStopRequest {
+        workload_id: "wl-old-purge".into(),
+    })
+    .await?;
+    Ok(())
+}
+
+/// A binding that serves the fixture's KV handler.
+fn kv_watch_interface(config: &[(&str, &str)]) -> WitInterface {
+    WitInterface {
+        interfaces: ["types", "core", "kv", "kv-handler"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        ..nats_interface(config)
+    }
+}
+
+/// Writes `key` until its watch reports it, since a fresh watch only sees what
+/// is written after it attaches.
+async fn put_until_reported(
+    bucket: &async_nats::jetstream::kv::Store,
+    sub: &mut async_nats::Subscriber,
+    key: &str,
+    budget: Duration,
+) -> Result<String> {
+    let prefix = format!("kv:watched:{key}:put:");
+    let deadline = tokio::time::Instant::now() + budget;
+    while tokio::time::Instant::now() < deadline {
+        bucket.put(key, "v".into()).await?;
+        if let Some(line) = wait_for_result(sub, &prefix, Duration::from_millis(500)).await {
+            return Ok(line);
+        }
+    }
+    anyhow::bail!("the watch never reported `{key}`")
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (NATS); run with `cargo test --include-ignored`"]
+async fn a_kv_watch_waits_for_its_bucket_and_reports_every_operation() -> Result<()> {
+    let h = start_nats_version("2.12.15-alpine", false).await?;
+    let host = start_host().await?;
+    let mut sub = h.client.subscribe("test.results").await?;
+
+    host.workload_start(workload_request(
+        "wl-kv-watch",
+        kv_watch_interface(&[
+            ("servers", &h.nats_url),
+            ("subject-allow", "test.>"),
+            ("bucket-allow", "watched"),
+            ("kv-watches", "watched:items.>"),
+        ]),
+    ))
+    .await
+    .context("failed to start workload")?;
+
+    // Created only once the watch has found the bucket missing, so it attaches
+    // on a retry.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let bucket =
+        h.js.create_key_value(async_nats::jetstream::kv::Config {
+            bucket: "watched".to_string(),
+            history: 5,
+            ..Default::default()
+        })
+        .await?;
+    put_until_reported(&bucket, &mut sub, "items.a", Duration::from_secs(30)).await?;
+
+    bucket.put("skipped.x", "outside".into()).await?;
+    bucket.put("items.b", "fail:refused".into()).await?;
+    bucket.delete("items.a").await?;
+    bucket.purge("items.b").await?;
+    // One watch delivers in revision order, so every event before the purge
+    // is read here, the skipped key's included had it been delivered.
+    let mut lines = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !lines
+        .iter()
+        .any(|l: &String| l.starts_with("kv:watched:items.b:purge:"))
+    {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match wait_for_result(&mut sub, "kv:", remaining).await {
+            Some(line) => lines.push(line),
+            None => anyhow::bail!("the purge was never delivered, saw {lines:?}"),
+        }
+    }
+    for expected in [
+        "kv:watched:items.b:put:fail:refused",
+        "kv:watched:items.a:delete:",
+    ] {
+        assert!(
+            lines.iter().any(|l| l == expected),
+            "no `{expected}` in {lines:?}"
+        );
+    }
+    assert!(
+        !lines.iter().any(|l| l.contains("skipped.x")),
+        "a key outside the filter was delivered: {lines:?}"
+    );
+
+    host.workload_stop(wash_runtime::types::WorkloadStopRequest {
+        workload_id: "wl-kv-watch".into(),
+    })
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (NATS); run with `cargo test --include-ignored`"]
+async fn replicas_in_a_queue_group_share_one_durable() -> Result<()> {
+    let h = start_nats().await?;
+    let host = start_host().await?;
+    let subscription = format!("{STREAM}:test.orders.>:last-per-subject:workers");
+    let stream = h.js.get_stream(STREAM).await?;
+    let durables = || async {
+        let mut names = stream.consumer_names();
+        let mut out = Vec::new();
+        while let Some(name) = names.next().await {
+            out.push(name?);
+        }
+        anyhow::Ok(out)
+    };
+    // The second replica starts only once the first has created the durable,
+    // so it is the one that attaches, with limits that differ from it.
+    for (workload_id, max_deliver) in [("wl-queue-a", "5"), ("wl-queue-b", "3")] {
+        host.workload_start(workload_request(
+            workload_id,
+            nats_interface(&[
+                ("servers", &h.nats_url),
+                ("subject-allow", "test.>"),
+                ("stream-allow", STREAM),
+                ("bucket-allow", COUNTS_BUCKET),
+                ("max-deliver", max_deliver),
+                ("jetstream-subscriptions", &subscription),
+            ]),
+        ))
+        .await
+        .context("failed to start workload")?;
+        timeout(Duration::from_secs(20), async {
+            while durables().await?.is_empty() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            anyhow::Ok(())
+        })
+        .await??;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let consumers = durables().await?;
+    assert_eq!(
+        consumers.len(),
+        1,
+        "expected one shared durable: {consumers:?}"
+    );
+    assert!(consumers[0].starts_with("workers_"), "{consumers:?}");
+    let info = stream.consumer_info(&consumers[0]).await?;
+    assert_eq!(info.config.max_deliver, 5, "the attach rewrote the durable");
+
+    // With the creator gone, only the replica that attached can deliver.
+    host.workload_stop(wash_runtime::types::WorkloadStopRequest {
+        workload_id: "wl-queue-a".into(),
+    })
+    .await?;
+    assert_eq!(durables().await?, consumers, "the shared durable went away");
+    let mut sub = h.client.subscribe("test.results").await?;
+    for i in 0..4 {
+        publish_to_stream(&h, &format!("test.orders.q{i}"), &format!("queued-{i}")).await?;
+    }
+    let mut handled = std::collections::BTreeSet::new();
+    while handled.len() < 4 {
+        let line = wait_for_result(&mut sub, "handled:queued-", Duration::from_secs(20))
+            .await
+            .with_context(|| format!("only {handled:?} were handled"))?;
+        handled.insert(line.split(':').nth(1).unwrap_or_default().to_string());
+    }
+    assert_eq!(
+        handled.into_iter().collect::<Vec<_>>(),
+        ["queued-0", "queued-1", "queued-2", "queued-3"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (NATS); run with `cargo test --include-ignored`"]
+async fn a_subscription_attaches_once_its_stream_is_provisioned() -> Result<()> {
+    let h = start_nats().await?;
+    let host = start_host().await?;
+    host.workload_start(workload_request(
+        "wl-late-stream",
+        nats_interface(&[
+            ("servers", &h.nats_url),
+            ("subject-allow", "test.>,late.>"),
+            ("stream-allow", format!("{STREAM},LATE").as_str()),
+            ("bucket-allow", COUNTS_BUCKET),
+            ("jetstream-subscriptions", "LATE:late.>:all"),
+        ]),
+    ))
+    .await
+    .context("failed to start workload")?;
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    h.js.create_stream(async_nats::jetstream::stream::Config {
+        name: "LATE".to_string(),
+        subjects: vec!["late.>".to_string()],
+        ..Default::default()
+    })
+    .await?;
+    let mut sub = h.client.subscribe("test.results").await?;
+    // Published before the retry attaches, which `deliver-policy: all` still
+    // delivers whichever side of the attach each one lands on.
+    publish_to_stream(&h, "late.one", "older").await?;
+    publish_to_stream(&h, "late.one", "latest").await?;
+    let mut handled = std::collections::BTreeSet::new();
+    while handled.len() < 2 {
+        let line = wait_for_result(&mut sub, "handled:", Duration::from_secs(30))
+            .await
+            .with_context(|| format!("only {handled:?} were handled from the late stream"))?;
+        handled.insert(line.split(':').nth(1).unwrap_or_default().to_string());
+    }
+    assert_eq!(handled.into_iter().collect::<Vec<_>>(), ["latest", "older"]);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (NATS); run with `cargo test --include-ignored`"]
+async fn a_recreated_kv_bucket_replays_early_writes_during_consumer_recovery() -> Result<()> {
+    let h = start_nats_version("2.12.15-alpine", false).await?;
+    let config = async_nats::jetstream::kv::Config {
+        bucket: "watched".into(),
+        history: 5,
+        ..Default::default()
+    };
+    let bucket = h.js.create_key_value(config.clone()).await?;
+    for _ in 0..64 {
+        bucket.put("padding", "old".into()).await?;
+    }
+
+    // Forward a test domain's API calls, with a gate on consumer creation.
+    let mut api = h.client.subscribe("$JS.RECOVERY.API.>").await?;
+    let (block_creates, create_gate) = tokio::sync::watch::channel(false);
+    let (attempts, mut attempted) = tokio::sync::mpsc::channel(16);
+    h.client.flush().await?;
+    let client = h.client.clone();
+    let proxy = tokio::spawn(async move {
+        while let Some(request) = api.next().await {
+            let Some(reply) = request.reply else {
+                continue;
+            };
+            let operation = request
+                .subject
+                .strip_prefix("$JS.RECOVERY.API.")
+                .context("unexpected API subject")?;
+            let blocked = *create_gate.borrow();
+            let response = if blocked && operation.starts_with("CONSUMER.CREATE.") {
+                let body: serde_json::Value = serde_json::from_slice(&request.payload)?;
+                let _ = attempts.try_send(body);
+                bytes::Bytes::from_static(
+                    br#"{"error":{"code":404,"err_code":10059,"description":"stream not found"}}"#,
+                )
+            } else {
+                client
+                    .request(format!("$JS.API.{operation}"), request.payload)
+                    .await?
+                    .payload
+            };
+            client.publish(reply, response).await?;
+        }
+        anyhow::Ok(())
+    });
+
+    let host = start_host().await?;
+    let mut sub = h.client.subscribe("test.results").await?;
+    host.workload_start(workload_request(
+        "wl-kv-recreated",
+        kv_watch_interface(&[
+            ("servers", &h.nats_url),
+            ("subject-allow", "test.>"),
+            ("bucket-allow", "watched"),
+            ("jetstream-domain", "RECOVERY"),
+            ("kv-watches", "watched:items.>"),
+        ]),
+    ))
+    .await?;
+    put_until_reported(&bucket, &mut sub, "items.ready", Duration::from_secs(30)).await?;
+    let checkpoint = bucket.put("items.checkpoint", "old-head".into()).await?;
+    wait_for_result(
+        &mut sub,
+        "kv:watched:items.checkpoint:put:old-head",
+        Duration::from_secs(20),
+    )
+    .await
+    .context("the old checkpoint was never delivered")?;
+
+    let stream = h.js.get_stream("KV_watched").await?;
+    let mut consumers = stream.consumer_names();
+    let name = consumers
+        .next()
+        .await
+        .context("the watch has no consumer")??;
+    let info = stream.consumer_info(&name).await?;
+    let deliver_subject = info.config.deliver_subject.context("no deliver subject")?;
+
+    // A replacement consumer's heartbeats reset its delivery sequence,
+    // which sends the SDK into its internal recreation loop.
+    block_creates.send_replace(true);
+    stream.delete_consumer(&name).await?;
+    stream
+        .create_consumer(async_nats::jetstream::consumer::push::Config {
+            name: Some(name),
+            deliver_subject,
+            filter_subject: "$KV.watched.items.>".into(),
+            deliver_policy: async_nats::jetstream::consumer::DeliverPolicy::New,
+            ack_policy: async_nats::jetstream::consumer::AckPolicy::None,
+            idle_heartbeat: Duration::from_millis(500),
+            ..Default::default()
+        })
+        .await?;
+    let attempt = timeout(Duration::from_secs(20), attempted.recv())
+        .await
+        .context("the SDK did not retry consumer creation")?
+        .context("the ordered consumer never retried creation")?;
+    assert_eq!(attempt["config"]["opt_start_seq"], checkpoint + 1);
+
+    h.js.delete_key_value("watched").await?;
+    let bucket = h.js.create_key_value(config).await?;
+    for (key, value) in [
+        ("items.first", "early-first"),
+        ("items.second", "early-second"),
+    ] {
+        assert!(bucket.put(key, value.into()).await? < checkpoint);
+    }
+    block_creates.send_replace(false);
+
+    let expected = std::collections::BTreeSet::from([
+        "kv:watched:items.first:put:early-first".to_string(),
+        "kv:watched:items.second:put:early-second".to_string(),
+    ]);
+    let mut delivered = std::collections::BTreeSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while delivered != expected {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let line = wait_for_result(&mut sub, "kv:watched:items.", remaining)
+            .await
+            .with_context(|| format!("early writes were skipped: {delivered:?}"))?;
+        if expected.contains(&line) {
+            delivered.insert(line);
+        }
+    }
+    host.workload_stop(wash_runtime::types::WorkloadStopRequest {
+        workload_id: "wl-kv-recreated".into(),
+    })
+    .await?;
+    proxy.abort();
+    let _ = proxy.await;
+    Ok(())
+}
+
+/// The account an auth callout places the clients it authorizes in.
+const CALLOUT_TARGET_ACCOUNT: &str = "APP";
+
+/// A component granted `$SYS.REQ.USER.AUTH` answers nats-server's auth callout,
+/// and the client the answer vouches for is let in.
+///
+/// The server sends each callout with a reply inbox under `$SYS._INBOX.`, which
+/// no grant names, so the answer only gets out on the reply grant the host
+/// records for that delivery. The fixture relays the request to the test to be
+/// signed, so the issuer key stays out of the component.
+#[tokio::test]
+#[ignore = "requires Docker (NATS); run with `cargo test --include-ignored`"]
+async fn a_component_answers_the_auth_callout() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init()
+        .ok();
+    let issuer = Arc::new(nkeys::KeyPair::new_account());
+    let config = format!(
+        r#"
+accounts {{
+  AUTH {{ users: [ {{ user: auth, password: auth }} ] }}
+  {CALLOUT_TARGET_ACCOUNT} {{}}
+  SYS {{}}
+}}
+system_account: SYS
+authorization {{
+  auth_callout {{
+    issuer: {issuer}
+    auth_users: [ auth ]
+    account: AUTH
+  }}
+}}
+"#,
+        issuer = issuer.public_key()
+    );
+    let container = GenericImage::new("nats", "2.12.15-alpine")
+        .with_exposed_port(4222.tcp())
+        .with_wait_for(WaitFor::message_on_stderr("Server is ready"))
+        .with_copy_to("/etc/nats/callout.conf", config.into_bytes())
+        .with_cmd(["-c", "/etc/nats/callout.conf"])
+        .start()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to start NATS container: {e}"))?;
+    let port = container
+        .get_host_port_ipv4(4222)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to get NATS port: {e}"))?;
+    let nats_url = format!("nats://127.0.0.1:{port}");
+
+    let signer = connect_with_retry_using(&nats_url, Duration::from_secs(30), || {
+        async_nats::ConnectOptions::with_user_and_password("auth".into(), "auth".into())
+    })
+    .await?;
+    let mut requests = signer.subscribe("test.relay").await?;
+    signer.flush().await?;
+    let signing = tokio::spawn({
+        let signer = signer.clone();
+        let issuer = Arc::clone(&issuer);
+        async move {
+            while let Some(request) = requests.next().await {
+                let Some(reply) = request.reply else {
+                    continue;
+                };
+                let answer = authorize(&issuer, &request.payload)?;
+                signer.publish(reply, answer.into()).await?;
+            }
+            anyhow::Ok(())
+        }
+    });
+
+    let host = start_host().await?;
+    let response = host
+        .workload_start(workload_request(
+            "wl-auth-callout",
+            nats_async_interface(&[
+                ("servers", &nats_url),
+                ("username", "auth"),
+                ("password", "auth"),
+                ("subject-allow", "$SYS.REQ.USER.AUTH,test.relay"),
+                ("core-subscriptions", "$SYS.REQ.USER.AUTH"),
+            ]),
+        ))
+        .await
+        .context("failed to start the auth callout workload")?;
+    anyhow::ensure!(
+        response.workload_status.workload_state == WorkloadState::Running,
+        "{:?}",
+        response.workload_status
+    );
+
+    // The bind returns once the server has processed the component's
+    // subscription, so the first callout already has its responder.
+    let client =
+        async_nats::ConnectOptions::with_user_and_password("alice".into(), "secret".into())
+            .connect(&nats_url)
+            .await
+            .context("the component did not authorize a client through the callout")?;
+    let mut echo = client.subscribe("app.ping").await?;
+    client.publish("app.ping", "pong".into()).await?;
+    let delivered = timeout(Duration::from_secs(5), echo.next())
+        .await
+        .context("the authorized client never received its own message")?
+        .context("the authorized client's subscription closed")?;
+    assert_eq!(delivered.payload.as_ref(), b"pong");
+
+    signing.abort();
+    Ok(())
+}
+
+/// The signed authorization response for an auth callout request: it admits
+/// the user the server generated for this connection into
+/// [`CALLOUT_TARGET_ACCOUNT`] without further limits.
+fn authorize(issuer: &nkeys::KeyPair, request: &[u8]) -> Result<String> {
+    let request = std::str::from_utf8(request).context("the callout request is not text")?;
+    let claims: serde_json::Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD.decode(
+            request
+                .split('.')
+                .nth(1)
+                .context("the callout request is not a JWT")?,
+        )?,
+    )?;
+    let user = claims
+        .pointer("/nats/user_nkey")
+        .and_then(serde_json::Value::as_str)
+        .context("the callout request names no user nkey")?;
+    let server = claims
+        .pointer("/nats/server_id/id")
+        .and_then(serde_json::Value::as_str)
+        .context("the callout request names no server")?;
+    let user_jwt = sign_jwt(
+        issuer,
+        serde_json::json!({
+            "sub": user,
+            "aud": CALLOUT_TARGET_ACCOUNT,
+            "name": "callout-user",
+            "nats": {
+                "pub": {}, "sub": {},
+                "subs": -1, "data": -1, "payload": -1,
+                "type": "user", "version": 2,
+            },
+        }),
+    )?;
+    sign_jwt(
+        issuer,
+        serde_json::json!({
+            "sub": user,
+            "aud": server,
+            "nats": { "jwt": user_jwt, "type": "authorization_response", "version": 2 },
+        }),
+    )
+}
+
+/// Encodes `claims` as a NATS JWT issued and signed by `issuer`.
+fn sign_jwt(issuer: &nkeys::KeyPair, claims: serde_json::Value) -> Result<String> {
+    let serde_json::Value::Object(mut claims) = claims else {
+        anyhow::bail!("JWT claims must be an object");
+    };
+    let issued_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    claims.insert("iss".into(), issuer.public_key().into());
+    claims.insert("iat".into(), issued_at.as_secs().into());
+    claims.insert("jti".into(), issued_at.as_nanos().to_string().into());
+    let header = URL_SAFE_NO_PAD.encode(br#"{"typ":"JWT","alg":"ed25519-nkey"}"#);
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?);
+    let signed = format!("{header}.{payload}");
+    let signature = issuer
+        .sign(signed.as_bytes())
+        .map_err(|e| anyhow::anyhow!("failed to sign a JWT: {e}"))?;
+    Ok(format!("{signed}.{}", URL_SAFE_NO_PAD.encode(signature)))
 }

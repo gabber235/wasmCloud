@@ -450,6 +450,26 @@ impl HostPlugin for MultiplexedAsyncBlobstore {
         MULTIPLEXED_ASYNC_BLOBSTORE_ID
     }
 
+    /// Retains the declared ceiling; each bind checks its backend's url
+    /// against it before a connection is opened or reused.
+    fn configure_egress_policy(
+        &self,
+        policy: Arc<crate::plugin::PluginEgressPolicy>,
+    ) -> anyhow::Result<()> {
+        self.mux.configure_egress_policy(policy)
+    }
+
+    /// Same schema as the sync plugin: the blobstore address keys and every
+    /// S3 key are host-owned.
+    fn binding_schema(&self) -> crate::plugin::BindingSchema {
+        crate::plugin::BindingSchema::with_host_owned_keys(
+            crate::plugin::multiplex::BLOBSTORE_HOST_OWNED_KEYS
+                .iter()
+                .copied()
+                .chain(super::multiplexed::host_owned_spellings()),
+        )
+    }
+
     fn world(&self) -> WitWorld {
         WitWorld {
             imports: HashSet::from([WitInterface::from(
@@ -492,7 +512,7 @@ impl HostPlugin for MultiplexedAsyncBlobstore {
         }
 
         let component = item.component().clone();
-        let linker = item.linker();
+        let linker = item.linker()?;
 
         // `blobstore` (create/get/delete container, copy/move) routed per
         // `(implements ..)` label so each label lands on its own backend.
@@ -533,6 +553,7 @@ impl HostPlugin for MultiplexedAsyncBlobstore {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::plugin::wasi_blobstore::InMemoryProvider;
@@ -543,7 +564,7 @@ mod tests {
             package: "blobstore".to_string(),
             interfaces: ["blobstore".to_string()].into_iter().collect(),
             version: None,
-            config: std::collections::HashMap::from([(
+            config: crate::wit::Config::from_iter([(
                 "backend".to_string(),
                 "in-memory".to_string(),
             )]),
@@ -623,4 +644,19 @@ mod tests {
         );
         assert!(plugin.mux.default_for("workload-b").is_some());
     }
+
+    #[test]
+    fn schema_matches_the_sync_plugin() {
+        // The two surfaces route to the same backends, so a key the operator
+        // owns on one must be owned on the other.
+        assert_eq!(
+            MultiplexedAsyncBlobstore::new().binding_schema(),
+            crate::plugin::wasi_blobstore::MultiplexedBlobstore::new().binding_schema()
+        );
+    }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "multiplexed_async_contract_tests.rs"]
+mod contract_tests;

@@ -1,6 +1,6 @@
-//! Real-guest fixture for the `wasmcloud:nats@0.1.2` surface.
+//! Real-guest fixture for the `wasmcloud:nats@0.1.3` surface.
 //!
-//! Both handlers are `async fn`s that await imported NATS calls from inside
+//! Every handler is an `async fn` that awaits imported NATS calls from inside
 //! the delivery — the shape a sync-signature package cannot express, since a
 //! sync export cannot be lifted with the async canonical ABI and cannot await
 //! a P3 import.
@@ -17,6 +17,7 @@ wit_bindgen::generate!({
 
 use exports::wasmcloud::nats::core_handler::Guest as CoreGuest;
 use exports::wasmcloud::nats::jetstream_handler::Guest as JsGuest;
+use exports::wasmcloud::nats::kv_handler::Guest as KvGuest;
 use wasi::clocks::monotonic_clock;
 use wasmcloud::nats::core;
 use wasmcloud::nats::jetstream::{self, MessageHandle};
@@ -59,6 +60,16 @@ const CONC_MARKER: &str = "conc:";
 /// Long enough that a burst published back-to-back is still in flight when the
 /// next delivery arrives, short enough not to pace the test.
 const CONC_NANOS: u64 = 50_000_000; // 50ms
+
+/// Deliveries on a system subject are relayed through this subject, and its
+/// answer goes back on the delivery's `reply-to`.
+///
+/// This stands in for an auth callout responder. The test signs the answer,
+/// because signing is not what the host is under test for; the subscription,
+/// the delivery and the reply to the server's own inbox all go through the host.
+const RELAY_SUBJECT: &str = "test.relay";
+/// How long the relay waits for the test to answer.
+const RELAY_TIMEOUT_MS: u32 = 5_000;
 
 /// Lives in this instance's linear memory and nowhere else: a fresh store per
 /// delivery reads 1 every time, a warm instance counts up.
@@ -133,6 +144,18 @@ impl JsGuest for Component {
         let msg = handle.message();
         let body = String::from_utf8_lossy(&msg.body).to_string();
         let delivery = handle.delivery_count();
+        if let Some(tag) = body.strip_prefix("stored-time:") {
+            return core::publish(message(
+                "test.results",
+                format!(
+                    "stored-time:{tag}:{}:{}",
+                    handle.sequence(),
+                    handle.stored_at_unix_nanos()
+                ),
+            ))
+            .await
+            .map_err(|e| label(&e));
+        }
 
         // Awaiting a P3 import from inside the handler is the whole point of
         // the async package; without it `wasi:clocks@0.3.0` tree-shakes away.
@@ -321,12 +344,121 @@ async fn select_probe(spec: &str) -> String {
     }
 }
 
+async fn js_api_probe(spec: &str) -> Result<String, NatsError> {
+    let parts: Vec<_> = spec.split(':').collect();
+    let op = parts[0];
+    let stream = parts[1].to_string();
+    match op {
+        "last" => {
+            let m = jetstream::get_last_by_subject(stream, parts[2].to_string()).await?;
+            Ok(format!(
+                "{}:{}:{}:{}",
+                m.message.subject,
+                m.message.sequence,
+                m.stored_at_unix_nanos,
+                String::from_utf8_lossy(&m.message.data)
+            ))
+        }
+        "at" => {
+            let m = jetstream::get_by_sequence_at(stream, parts[2].parse().unwrap()).await?;
+            Ok(format!(
+                "{}:{}:{}:{}",
+                m.message.subject,
+                m.message.sequence,
+                m.stored_at_unix_nanos,
+                String::from_utf8_lossy(&m.message.data)
+            ))
+        }
+        "created" => Ok(jetstream::get_stream_created(stream).await?.to_string()),
+        "purge" => Ok(jetstream::purge_subject(
+            stream,
+            parts[2].to_string(),
+            parts.get(3).and_then(|v| v.parse().ok()),
+        )
+        .await?
+        .to_string()),
+        "delete" => jetstream::delete_message(stream, parts[2].parse().unwrap())
+            .await
+            .map(|()| "ok".to_string()),
+        "pull-time" => {
+            let consumer = jetstream::open_pull_consumer(stream, parts[2].to_string()).await?;
+            let batch = consumer.fetch(1, PULL_TIMEOUT_MS).await?;
+            let m = &batch.messages[0];
+            let result = format!("{}:{}", m.sequence(), m.stored_at_unix_nanos());
+            m.ack_sync().await?;
+            Ok(result)
+        }
+        _ => panic!("unknown JS probe"),
+    }
+}
+
+async fn kv_api_probe(spec: &str) -> Result<String, NatsError> {
+    let parts: Vec<_> = spec.split(':').collect();
+    let bucket = kv::open(parts[1].to_string()).await?;
+    match parts[0] {
+        "ttl" => bucket
+            .create_with_ttl(
+                parts[2].to_string(),
+                b"lease".to_vec(),
+                parts[3].parse().unwrap(),
+            )
+            .await
+            .map(|r| r.to_string()),
+        "delete-by-revision" => bucket
+            .delete_by_revision(parts[2].to_string(), parts[3].parse().unwrap())
+            .await
+            .map(|()| "ok".to_string()),
+        _ => panic!("unknown KV probe"),
+    }
+}
+
+/// Answers `msg` on its `reply-to` with what [`RELAY_SUBJECT`] answers for it.
+async fn relay(msg: NatsMessage) -> Result<(), String> {
+    let reply_to = msg
+        .reply_to
+        .ok_or_else(|| format!("a delivery on `{}` has no reply-to", msg.subject))?;
+    let answer = core::request(
+        NatsMessage {
+            subject: RELAY_SUBJECT.to_string(),
+            body: msg.body,
+            reply_to: None,
+            headers: None,
+        },
+        RELAY_TIMEOUT_MS,
+    )
+    .await
+    .map_err(|e| label(&e))?;
+    core::publish(NatsMessage {
+        subject: reply_to,
+        body: answer.body,
+        reply_to: None,
+        headers: None,
+    })
+    .await
+    .map_err(|e| label(&e))
+}
+
 impl CoreGuest for Component {
     /// Echoes onto `reply-to` when there is one — a request/reply round trip
     /// driven entirely from inside an async export.
     async fn handle_message(msg: NatsMessage) -> Result<(), String> {
         monotonic_clock::wait_for(YIELD_NANOS).await;
+        if msg.subject.starts_with("$SYS.") {
+            return relay(msg).await;
+        }
         let body = String::from_utf8_lossy(&msg.body).to_string();
+        if let Some(spec) = body.strip_prefix("js-api:") {
+            let outcome = js_api_probe(spec).await.unwrap_or_else(|e| label(&e));
+            return core::publish(message(&msg.reply_to.unwrap(), outcome))
+                .await
+                .map_err(|e| label(&e));
+        }
+        if let Some(spec) = body.strip_prefix("kv-api:") {
+            let outcome = kv_api_probe(spec).await.unwrap_or_else(|e| label(&e));
+            return core::publish(message(&msg.reply_to.unwrap(), outcome))
+                .await
+                .map_err(|e| label(&e));
+        }
         if let Some(spec) = body.strip_prefix(PULL_MARKER) {
             let outcome = pull_probe(spec).await;
             return js_publish("test.results", outcome)
@@ -364,6 +496,27 @@ impl CoreGuest for Component {
         core::publish(message(&subject, format!("echo:{body}")))
             .await
             .map_err(|e| label(&e))
+    }
+}
+
+impl KvGuest for Component {
+    /// Reports each change on `test.results` before answering, so a refused
+    /// event is still observable. A value starting with `fail:` is refused.
+    async fn handle_event(bucket: String, entry: kv::Entry) -> Result<(), String> {
+        let value = String::from_utf8_lossy(&entry.value).to_string();
+        let operation = match entry.operation {
+            kv::KvOperation::Put => "put",
+            kv::KvOperation::Delete => "delete",
+            kv::KvOperation::Purge => "purge",
+        };
+        let report = format!("kv:{bucket}:{}:{operation}:{value}", entry.key);
+        core::publish(message("test.results", report))
+            .await
+            .map_err(|e| label(&e))?;
+        if value.starts_with(FAIL_MARKER) {
+            return Err(format!("kv handler failed on `{}`", entry.key));
+        }
+        Ok(())
     }
 }
 

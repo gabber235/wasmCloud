@@ -239,6 +239,21 @@ impl HostPlugin for MultiplexedAsyncMessaging {
         MULTIPLEXED_ASYNC_MESSAGING_ID
     }
 
+    /// Retains the declared ceiling; each bind checks its backend's url
+    /// against it before a connection is opened or reused.
+    fn configure_egress_policy(
+        &self,
+        policy: Arc<crate::plugin::PluginEgressPolicy>,
+    ) -> anyhow::Result<()> {
+        self.mux.configure_egress_policy(policy)
+    }
+
+    fn binding_schema(&self) -> crate::plugin::BindingSchema {
+        crate::plugin::multiplex::backend_binding_schema(
+            crate::plugin::multiplex::MESSAGING_HOST_OWNED_KEYS,
+        )
+    }
+
     fn world(&self) -> WitWorld {
         WitWorld {
             imports: HashSet::from([WitInterface::from(
@@ -300,7 +315,7 @@ impl HostPlugin for MultiplexedAsyncMessaging {
         }
 
         let component = item.component().clone();
-        let linker = item.linker();
+        let linker = item.linker()?;
 
         if has_labeled {
             bindings::named_imports::wasmcloud::messaging0_3_0::consumer::add_to_linker::<
@@ -348,10 +363,10 @@ pub(super) fn is_async_version(iface: &WitInterface) -> bool {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
     use crate::plugin::wasmcloud_messaging::{InMemoryMsgProvider, MsgError};
-    use std::collections::HashMap;
 
     fn msg_iface(name: Option<&str>, version: Option<&str>) -> WitInterface {
         WitInterface {
@@ -359,7 +374,10 @@ mod tests {
             package: "messaging".to_string(),
             interfaces: ["consumer".to_string()].into_iter().collect(),
             version: version.map(|v| semver::Version::parse(v).unwrap()),
-            config: HashMap::from([("backend".to_string(), "in-memory".to_string())]),
+            config: crate::wit::Config::from_iter([(
+                "backend".to_string(),
+                "in-memory".to_string(),
+            )]),
             name: name.map(String::from),
         }
     }

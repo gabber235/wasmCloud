@@ -65,8 +65,6 @@ mod conversions {
         Timestamp, TimestampTz,
     };
 
-    include!("conversions.rs");
-
     /// Build a `row` (bare list of values, positionally aligned with the query's
     /// column list) from a tokio-postgres [`Row`].
     ///
@@ -81,6 +79,8 @@ mod conversions {
             })
             .collect()
     }
+
+    include!("conversions.rs");
 }
 
 /// Map a `tokio_postgres::Error` to the WIT `error`.
@@ -88,7 +88,11 @@ mod conversions {
 /// Failures the database reported (with a SQLSTATE) become `query-failed` and
 /// carry the structured [`DbError`] so a guest can branch on `code`; everything
 /// else (connection loss, protocol errors) is reported as `connection-failed`.
+/// A parameter whose value does not match its type is `invalid-params`.
 fn to_wit_error(e: &tokio_postgres::Error) -> Error {
+    if let Some(msg) = super::wrong_type_message(e) {
+        return Error::InvalidParams(msg);
+    }
     match e.as_db_error() {
         Some(db) => Error::QueryFailed(DbError {
             code: db.code().code().to_string(),

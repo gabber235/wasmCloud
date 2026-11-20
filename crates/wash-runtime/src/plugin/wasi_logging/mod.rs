@@ -201,7 +201,7 @@ impl HostPlugin for TracingLogger {
 
         // Add `wasi:logging/logging` to the workload's linker
         bindings::wasi::logging::logging::add_to_linker::<_, SharedCtx>(
-            component_handle.linker(),
+            component_handle.linker()?,
             extract_active_ctx,
         )?;
 
@@ -231,6 +231,7 @@ impl HostPlugin for TracingLogger {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use std::sync::{Arc, Mutex};
 

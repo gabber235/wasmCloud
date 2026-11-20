@@ -3,9 +3,15 @@
 # bench output to a log file under $CARGO_TARGET_DIR so bench-push-results.mjs can
 # archive it next to the bench data.
 #
-# Two harness types share this script:
+# Benchmark families share this script:
 #   - criterion benches (http_invoke, service_http, wasmtime_baseline,
-#     wasmtime_serve) write to $CARGO_TARGET_DIR/criterion/.
+#     wasmtime_serve, ids) write to $CARGO_TARGET_DIR/criterion/.
+#   - density benches (scale_density) write a list of
+#     bench_tools::density::Report to $CARGO_TARGET_DIR/density/<bench>.json,
+#     which `bench-tools jsonl` and `summary` read.
+#   - the pressure bench (memory_pressure) runs through `bench-tools
+#     memory-pressure`, which writes a list of bench_tools::pressure::Report
+#     to $CARGO_TARGET_DIR/pressure/<bench>.json for the same commands.
 #   - gungraun benches (gungraun, gungraun_plugin) write to $CARGO_TARGET_DIR/gungraun/
 #     and are pinned to the isolated CPU (set by hetzner-postinstall.sh
 #     via isolcpus=) so that scheduler interference doesn't leak into
@@ -27,8 +33,43 @@ set -euo pipefail
 # avoid maintaining the bench list in two places.
 bench="${1:?bench name required}"
 
+# Benches that take arguments after the bench name: memory_pressure's runner
+# flags, and scale_density's flavour filters and presets. Any other bench
+# refuses them.
+args_benches="memory_pressure scale_density"
+
+# `run-bench.sh --takes-args <bench>` exits 0 when this script passes
+# arguments on to <bench>, and 1 otherwise, without running anything.
+# bench-run.yml asks before it runs a bench with arguments.
+if [ "$bench" = --takes-args ]; then
+  if [[ " $args_benches " == *" ${2:?bench name required} "* ]]; then
+    exit 0
+  fi
+  exit 1
+fi
+
+# scale_density's presets (`Preset` in benches/scale_density/settings.rs).
+# Each sets its own memory mode and reservation, and refuses the sweep's.
+scale_density_presets="max-scale"
+
+if [ "$#" -gt 1 ] && [[ " $args_benches " != *" $bench "* ]]; then
+  echo "${bench} takes no arguments, got: ${*:2}" >&2
+  exit 1
+fi
+
 # shellcheck disable=SC1091
 . "$HOME/.cargo/env"
+
+# Use the linker installed by provision.yml for every nested fixture build,
+# including on runners registered before install-runner.sh configured Cargo.
+# An explicit caller override still wins. Installing a binary on PATH alone
+# does not replace Rust's older bundled wasm32-wasip2 linker.
+export CARGO_TARGET_WASM32_WASIP2_LINKER="${CARGO_TARGET_WASM32_WASIP2_LINKER:-/usr/local/bin/wasm-component-ld}"
+linker_version="not needed"
+if [[ "$bench" != memory_pressure ]] && ! linker_version=$("$CARGO_TARGET_WASM32_WASIP2_LINKER" --version); then
+  echo "cannot run the fixture linker at ${CARGO_TARGET_WASM32_WASIP2_LINKER}; run ansible-playbook provision.yml --tags wasm-component-ld" >&2
+  exit 1
+fi
 
 : "${CARGO_TARGET_DIR:=/var/lib/bench/target}"
 mkdir -p "$CARGO_TARGET_DIR"
@@ -53,6 +94,7 @@ log="${CARGO_TARGET_DIR}/run-${bench}-${GITHUB_RUN_ID:-local}.log"
   # dispatch ref, so this log header agrees with the emitted data rows.
   echo "ref:    ${WASMCLOUD_BENCH_REF:-${GITHUB_REF_NAME:-?}}"
   echo "ts:     $(date -u +%FT%TZ)"
+  echo "linker: ${linker_version} (${CARGO_TARGET_WASM32_WASIP2_LINKER})"
   echo
 } | tee "$log"
 
@@ -61,7 +103,7 @@ log="${CARGO_TARGET_DIR}/run-${bench}-${GITHUB_RUN_ID:-local}.log"
 # persistent (kept for the *build* cache, not the measurement output).
 # The build cache lives elsewhere in $CARGO_TARGET_DIR and is preserved.
 # Both criterion and gungraun keep "previous run" baseline data we don't use.
-rm -rf "${CARGO_TARGET_DIR}/criterion" "${CARGO_TARGET_DIR}/gungraun"
+rm -rf "${CARGO_TARGET_DIR}/criterion" "${CARGO_TARGET_DIR}/gungraun" "${CARGO_TARGET_DIR}/density" "${CARGO_TARGET_DIR}/pressure"
 
 # Touch the run marker right before invoking cargo so `find -newer "$marker"`
 # in `bench-tools jsonl` picks up exactly the files this run produced.
@@ -73,7 +115,7 @@ touch "$marker"
 # xtask dir because compare-bench.sh checks out arbitrary refs: refs that
 # predate the xtask crate build their fixtures during `cargo bench`
 # themselves, so the explicit step is skipped for them.
-if [ -d xtask ]; then
+if [[ "$bench" != memory_pressure ]] && [ -d xtask ]; then
   echo "building wasm test fixtures via xtask" | tee -a "$log"
   cargo xtask build-fixtures 2>&1 | tee -a "$log"
 fi
@@ -115,14 +157,38 @@ fi
 # gungraun_plugin` behaves identically to CI.
 features=()
 case "$bench" in
+  scale_density)
+    mkdir -p "${CARGO_TARGET_DIR}/density"
+    export WASH_SCALE_REPORT_JSON="${CARGO_TARGET_DIR}/density/${bench}.json"
+    # The published sweep, unless a preset is named.
+    preset=""
+    for arg in "${@:2}"; do
+      if [[ " $scale_density_presets " == *" $arg "* ]]; then
+        preset="$arg"
+      fi
+    done
+    if [ -z "$preset" ]; then
+      # Each mode publishes its own series: enforce keeps the default name,
+      # growth runs as `<flavour>-growth`.
+      export WASH_SCALE_GUEST_MEMORY_MODE="${WASH_SCALE_GUEST_MEMORY_MODE:-enforce,growth}"
+      # Both flavours at reduced memory reservations publish their own series,
+      # `<flavour>-layout<reservation>+<guard>`, using the first mode.
+      export WASH_SCALE_MEMORY_RESERVATION="${WASH_SCALE_MEMORY_RESERVATION:-default,1GiB,256MiB,64MiB}"
+    fi
+    ;;
   gungraun_plugin)
     features=(--features host-component-plugins)
     echo "enabling features: ${features[*]}" | tee -a "$log"
     ;;
 esac
 
-"${prefix[@]}" cargo bench -p wash-runtime "${features[@]}" --bench "$bench" 2>&1 \
-  | tee -a "$log"
+if [[ "$bench" == memory_pressure ]]; then
+  cargo run -p bench-tools --quiet -- memory-pressure --target-dir "$CARGO_TARGET_DIR" "${@:2}" 2>&1 \
+    | tee -a "$log"
+else
+  "${prefix[@]}" cargo bench -p wash-runtime "${features[@]}" --bench "$bench" -- "${@:2}" 2>&1 \
+    | tee -a "$log"
+fi
 
 echo "WASMCLOUD_BENCH_LOG=${log}" >> "${GITHUB_OUTPUT:-/dev/null}"
 echo "WASMCLOUD_BENCH_MARKER=${marker}" >> "${GITHUB_OUTPUT:-/dev/null}"
