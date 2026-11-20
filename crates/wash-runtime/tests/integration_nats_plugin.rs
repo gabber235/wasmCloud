@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures::StreamExt as _;
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
@@ -115,10 +117,19 @@ async fn start_nats_version(version: &str, with_kv: bool) -> Result<Harness> {
 
 /// Connects once the server is actually accepting, or gives up at `budget`.
 async fn connect_with_retry(url: &str, budget: Duration) -> Result<async_nats::Client> {
+    connect_with_retry_using(url, budget, async_nats::ConnectOptions::new).await
+}
+
+/// As [`connect_with_retry`], connecting with the options `options` builds.
+async fn connect_with_retry_using(
+    url: &str,
+    budget: Duration,
+    options: impl Fn() -> async_nats::ConnectOptions,
+) -> Result<async_nats::Client> {
     let deadline = tokio::time::Instant::now() + budget;
     let mut last: Option<async_nats::ConnectError> = None;
     while tokio::time::Instant::now() < deadline {
-        match async_nats::connect(url).await {
+        match options().connect(url).await {
             Ok(client) => return Ok(client),
             Err(e) => {
                 last = Some(e);
@@ -2888,7 +2899,10 @@ authorization {{
         .map_err(|e| anyhow::anyhow!("failed to get NATS port: {e}"))?;
     let nats_url = format!("nats://127.0.0.1:{port}");
 
-    let signer = connect_as(&nats_url, "auth", "auth", Duration::from_secs(30)).await?;
+    let signer = connect_with_retry_using(&nats_url, Duration::from_secs(30), || {
+        async_nats::ConnectOptions::with_user_and_password("auth".into(), "auth".into())
+    })
+    .await?;
     let mut requests = signer.subscribe("test.relay").await?;
     signer.flush().await?;
     let signing = tokio::spawn({
@@ -2907,24 +2921,32 @@ authorization {{
     });
 
     let host = start_host().await?;
-    host.workload_start(workload_request(
-        "wl-auth-callout",
-        nats_async_interface(&[
-            ("servers", &nats_url),
-            ("username", "auth"),
-            ("password", "auth"),
-            ("subject-allow", "$SYS.REQ.USER.AUTH,test.relay"),
-            ("core-subscriptions", "$SYS.REQ.USER.AUTH"),
-        ]),
-    ))
-    .await
-    .context("failed to start the auth callout workload")?;
-
-    // Until the component's subscription is live a callout has no responder
-    // and the connection is refused, so keep knocking.
-    let client = connect_as(&nats_url, "alice", "secret", Duration::from_secs(30))
+    let response = host
+        .workload_start(workload_request(
+            "wl-auth-callout",
+            nats_async_interface(&[
+                ("servers", &nats_url),
+                ("username", "auth"),
+                ("password", "auth"),
+                ("subject-allow", "$SYS.REQ.USER.AUTH,test.relay"),
+                ("core-subscriptions", "$SYS.REQ.USER.AUTH"),
+            ]),
+        ))
         .await
-        .context("the component never authorized a client through the callout")?;
+        .context("failed to start the auth callout workload")?;
+    anyhow::ensure!(
+        response.workload_status.workload_state == WorkloadState::Running,
+        "{:?}",
+        response.workload_status
+    );
+
+    // The bind returns once the server has processed the component's
+    // subscription, so the first callout already has its responder.
+    let client =
+        async_nats::ConnectOptions::with_user_and_password("alice".into(), "secret".into())
+            .connect(&nats_url)
+            .await
+            .context("the component did not authorize a client through the callout")?;
     let mut echo = client.subscribe("app.ping").await?;
     client.publish("app.ping", "pong".into()).await?;
     let delivered = timeout(Duration::from_secs(5), echo.next())
@@ -2937,41 +2959,19 @@ authorization {{
     Ok(())
 }
 
-/// Connects with a user and password once the server accepts them, or gives up
-/// at `budget`.
-async fn connect_as(
-    url: &str,
-    user: &str,
-    password: &str,
-    budget: Duration,
-) -> Result<async_nats::Client> {
-    let deadline = tokio::time::Instant::now() + budget;
-    loop {
-        let attempt =
-            async_nats::ConnectOptions::with_user_and_password(user.into(), password.into())
-                .connect(url)
-                .await;
-        match attempt {
-            Ok(client) => return Ok(client),
-            Err(e) if tokio::time::Instant::now() >= deadline => {
-                return Err(anyhow::anyhow!("{user} never connected to {url}: {e}"));
-            }
-            Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
-        }
-    }
-}
-
 /// The signed authorization response for an auth callout request: it admits
 /// the user the server generated for this connection into
 /// [`CALLOUT_TARGET_ACCOUNT`] without further limits.
 fn authorize(issuer: &nkeys::KeyPair, request: &[u8]) -> Result<String> {
     let request = std::str::from_utf8(request).context("the callout request is not text")?;
-    let claims: serde_json::Value = serde_json::from_slice(&base64url_decode(
-        request
-            .split('.')
-            .nth(1)
-            .context("the callout request is not a JWT")?,
-    )?)?;
+    let claims: serde_json::Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD.decode(
+            request
+                .split('.')
+                .nth(1)
+                .context("the callout request is not a JWT")?,
+        )?,
+    )?;
     let user = claims
         .pointer("/nats/user_nkey")
         .and_then(serde_json::Value::as_str)
@@ -3012,47 +3012,11 @@ fn sign_jwt(issuer: &nkeys::KeyPair, claims: serde_json::Value) -> Result<String
     claims.insert("iss".into(), issuer.public_key().into());
     claims.insert("iat".into(), issued_at.as_secs().into());
     claims.insert("jti".into(), issued_at.as_nanos().to_string().into());
-    let header = base64url_encode(br#"{"typ":"JWT","alg":"ed25519-nkey"}"#);
-    let payload = base64url_encode(&serde_json::to_vec(&claims)?);
+    let header = URL_SAFE_NO_PAD.encode(br#"{"typ":"JWT","alg":"ed25519-nkey"}"#);
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?);
     let signed = format!("{header}.{payload}");
     let signature = issuer
         .sign(signed.as_bytes())
         .map_err(|e| anyhow::anyhow!("failed to sign a JWT: {e}"))?;
-    Ok(format!("{signed}.{}", base64url_encode(&signature)))
-}
-
-const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-/// Unpadded base64url, the encoding JWT segments use.
-fn base64url_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
-        let digits =
-            (0..=chunk.len()).filter_map(|i| BASE64URL.get((n >> (18 - 6 * i) & 63) as usize));
-        out.extend(digits.map(|&digit| char::from(digit)));
-    }
-    out
-}
-
-/// Decodes unpadded base64url.
-fn base64url_decode(text: &str) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(text.len() * 3 / 4);
-    let (mut bits, mut held) = (0u32, 0u32);
-    for c in text.trim_end_matches('=').bytes() {
-        let value = BASE64URL
-            .iter()
-            .position(|&d| d == c)
-            .context("not base64url")?;
-        bits = bits << 6 | value as u32;
-        held += 6;
-        if held >= 8 {
-            held -= 8;
-            out.push((bits >> held) as u8);
-        }
-    }
-    Ok(out)
+    Ok(format!("{signed}.{}", URL_SAFE_NO_PAD.encode(signature)))
 }

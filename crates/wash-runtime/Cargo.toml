@@ -191,6 +191,7 @@ tikv-jemallocator = { workspace = true, optional = true }
 wasi-webgpu-wasmtime = { version = "0.5.2", optional = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
 sha2 = { workspace = true }
 bench-tools = { path = "../bench-tools" }
 tokio = { workspace = true, features = ["full", "test-util"] }
