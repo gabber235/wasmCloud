@@ -40,7 +40,7 @@ An empty or all zero parent span id now makes a root span, as upstream treats it
 
 Logs and metrics use upstream's conversion. Guest warn and error records log at warn and error on the host; lower severities log at debug. Cumulative guest sums add only their growth per guest instance, bounded per instance by series count and bytes.
 
-The fork keeps exporting guest spans whose sampled flag is clear, as it did on 2.10.3. Upstream drops them through its host tracer's sampler.
+The fork hands guest spans whose sampled flag is clear to the component's span processor, as it did on 2.10.3, and the default batch processor exports them. Upstream drops them through its host tracer's sampler. An injected processor that filters on the sampled flag, such as `SimpleSpanProcessor`, still drops them.
 
 ## Ingress shutdown
 
@@ -50,7 +50,7 @@ Upstream instead releases the routes from a detached task after the drain and ke
 
 ## Host policy
 
-System subjects follow normal host subject grants. There is no special `$SYS` prohibition or auth callout exception machinery. Production grants `$SYS.REQ.USER.AUTH` explicitly alongside application subjects. Other system subjects remain unavailable without a matching host grant. Workloads cannot widen those grants when `workloadConfig = deny`.
+System subjects follow normal host subject grants. There is no reserved `$SYS` prefix and no auth callout exception to the grant check. Production grants `$SYS.REQ.USER.AUTH` explicitly alongside application subjects. Other system subjects remain unavailable without a matching host grant. Workloads cannot widen those grants when `workloadConfig = deny`.
 
 A one time reply grant covers a system subject only under `$SYS._INBOX.`, where nats-server puts the reply inbox of a request it sends itself, such as an auth callout. The requester picks the `reply-to`, so without this limit a requester could aim a responder at `$SYS.REQ.SERVER.PING` or any other system request. The server's other reply subject, `$SYS._INBOX_.<server id>`, answers account connection counts between servers and stays reachable only through a host grant.
 
